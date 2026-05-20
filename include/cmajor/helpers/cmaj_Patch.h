@@ -171,6 +171,7 @@ struct Patch
     /// Renders a block using a juce-style single array of input + output audio channels.
     /// For this one, make calls to addMIDIMessage() beforehand to provide the MIDI.
     void process (float* const* audioChannels, uint32_t numFrames, const choc::audio::AudioMIDIBlockDispatcher::HandleMIDIMessageFn&);
+    void process (float* const* inputChannels, float* const* outputChannels, uint32_t numFrames, const choc::audio::AudioMIDIBlockDispatcher::HandleMIDIMessageFn&);
 
     /// Instead of calling process(), if you're performing multiple small chunked render ops
     /// as part of a larger chunk, you can improve performance by calling beginChunkedProcess(),
@@ -2362,9 +2363,15 @@ inline void Patch::addMIDIMessage (int frameIndex, const void* data, uint32_t le
 inline void Patch::process (float* const* audioChannels, uint32_t numFrames,
                             const choc::audio::AudioMIDIBlockDispatcher::HandleMIDIMessageFn& handleMIDIOut)
 {
+    process (audioChannels, audioChannels, numFrames, handleMIDIOut);
+}
+
+inline void Patch::process (float* const* inputChannels, float* const* outputChannels, uint32_t numFrames,
+                            const choc::audio::AudioMIDIBlockDispatcher::HandleMIDIMessageFn& handleMIDIOut)
+{
     beginChunkedProcess();
-    renderer->getPerformer().processWithTimeStampedMIDI (choc::buffer::createChannelArrayView (audioChannels, currentPlaybackParams.numInputChannels, numFrames),
-                                                         choc::buffer::createChannelArrayView (audioChannels, currentPlaybackParams.numOutputChannels, numFrames),
+    renderer->getPerformer().processWithTimeStampedMIDI (choc::buffer::createChannelArrayView (inputChannels, currentPlaybackParams.numInputChannels, numFrames),
+                                                         choc::buffer::createChannelArrayView (outputChannels, currentPlaybackParams.numOutputChannels, numFrames),
                                                          midiMessages.data(), midiMessageTimes.data(), static_cast<uint32_t> (midiMessages.size()),
                                                          handleMIDIOut, true);
     midiMessages.clear();

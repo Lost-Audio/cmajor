@@ -1,0 +1,203 @@
+//
+//  Minimal sidechain routing test patch.
+//
+
+processor SidechainDuck [[ main ]]
+{
+    input stream float32<2> mainIn     [[ name: "Main Input", bus: "Input", role: "main" ]];
+    input stream float32<2> sidechain  [[ name: "Sidechain Input", bus: "Sidechain", role: "sidechain" ]];
+
+    output stream float32<2> out       [[ name: "Output", bus: "Output", role: "main" ]];
+
+    input event float amount           [[ name: "Amount", min: 0.0, max: 1.0, init: 0.95 ]];
+    input event float attackMs         [[ name: "Attack", min: 1.0, max: 80.0, init: 8.0, unit: "ms" ]];
+    input event float releaseMs        [[ name: "Release", min: 20.0, max: 800.0, init: 180.0, unit: "ms" ]];
+    input event float tremoloRateHz    [[ name: "Tremolo Rate", min: 0.1, max: 20.0, init: 4.0, unit: "Hz" ]];
+    input event float tremoloDepth     [[ name: "Tremolo Depth", min: 0.0, max: 100.0, init: 35.0, unit: "%" ]];
+    input event float tremoloSync      [[ name: "Tremolo Sync", boolean ]];
+    input event float tremoloNoteValue [[ name: "Tremolo Note", min: 0, max: 14, init: 9,
+                                           text: "1/64|1/32|1/16T|1/16|1/8T|Dotted 1/16|1/8|1/4T|Dotted 1/8|1/4|Dotted 1/4|1/2|3/4|1 Bar|2 Bars" ]];
+    input event float delayTimeMs      [[ name: "Delay Time", min: 1.0, max: 1500.0, init: 250.0, unit: "ms" ]];
+    input event float delayFeedback    [[ name: "Delay Feedback", min: 0.0, max: 95.0, init: 25.0, unit: "%" ]];
+    input event float delayMix         [[ name: "Delay Mix", min: 0.0, max: 100.0, init: 25.0, unit: "%" ]];
+    input event std::timeline::Tempo tempoIn;
+
+    let maxDelaySamples = int (processor.maxFrequency * 2.0) + 1;
+    let parameterSmoothingSteps = int32 (processor.frequency * 0.030);
+    let delayTimeSmoothingSteps = int32 (processor.frequency * 0.080);
+
+    float currentAmount = 0.95f;
+    float currentAttackMs = 8.0f;
+    float currentReleaseMs = 180.0f;
+    float currentTremoloRateHz = 4.0f;
+    float currentTremoloDepth = 0.35f;
+    float currentDelayTimeMs = 250.0f;
+    float currentDelayFeedback = 0.25f;
+    float currentDelayMix = 0.25f;
+    float currentBPM = 120.0f;
+    int currentTremoloNoteIndex = 9;
+    int delaySamples = 1;
+    bool isTremoloSyncEnabled = false;
+    float attackCoeff = 0.0f;
+    float releaseCoeff = 0.0f;
+    float envelope = 0.0f;
+    float tremoloPhase = 0.0f;
+    float tremoloPhaseDelta = 0.0f;
+    std::smoothing::SmoothedValue smoothAmount, smoothTremoloDepth, smoothDelayFeedback, smoothDelayMix, smoothDelaySamples;
+    float32<2>[maxDelaySamples] delayBuffer;
+    wrap<maxDelaySamples> delayWritePos;
+    float[15] tremoloNoteBeats = float[15] (0.0625f, 0.125f, 0.1666667f, 0.25f, 0.3333333f,
+                                             0.375f, 0.5f, 0.6666667f, 0.75f, 1.0f,
+                                             1.5f, 2.0f, 3.0f, 4.0f, 8.0f);
+
+    float coefficientForTimeMs (float timeMs)
+    {
+        let frames = max (1.0f, float (processor.frequency) * timeMs * 0.001f);
+        return 1.0f - pow (0.001f, 1.0f / frames);
+    }
+
+    void refreshCoefficients()
+    {
+        attackCoeff = coefficientForTimeMs (currentAttackMs);
+        releaseCoeff = coefficientForTimeMs (currentReleaseMs);
+    }
+
+    void refreshTremoloRate()
+    {
+        tremoloPhaseDelta = float (currentTremoloRateHz * processor.period * twoPi);
+    }
+
+    void updateSyncedTremoloRate()
+    {
+        if (currentBPM > 0.0f)
+        {
+            let beats = tremoloNoteBeats.at (currentTremoloNoteIndex);
+            currentTremoloRateHz = currentBPM / (60.0f * beats);
+            refreshTremoloRate();
+        }
+    }
+
+    void refreshDelayTime()
+    {
+        delaySamples = clamp (int (currentDelayTimeMs * processor.frequency / 1000.0f), 1, maxDelaySamples - 1);
+        smoothDelaySamples.setTarget (float32 (delaySamples), delayTimeSmoothingSteps);
+    }
+
+    event amount (float newAmount)
+    {
+        currentAmount = clamp (newAmount, 0.0f, 1.0f);
+        smoothAmount.setTarget (currentAmount, parameterSmoothingSteps);
+    }
+
+    event attackMs (float newAttackMs)
+    {
+        currentAttackMs = newAttackMs;
+        refreshCoefficients();
+    }
+
+    event releaseMs (float newReleaseMs)
+    {
+        currentReleaseMs = newReleaseMs;
+        refreshCoefficients();
+    }
+
+    event tremoloRateHz (float newRateHz)
+    {
+        currentTremoloRateHz = newRateHz;
+
+        if (! isTremoloSyncEnabled)
+            refreshTremoloRate();
+    }
+
+    event tremoloDepth (float newDepth)
+    {
+        currentTremoloDepth = clamp (newDepth, 0.0f, 100.0f) * 0.01f;
+        smoothTremoloDepth.setTarget (currentTremoloDepth, parameterSmoothingSteps);
+    }
+
+    event tremoloSync (float newSync)
+    {
+        isTremoloSyncEnabled = newSync >= 0.5f;
+
+        if (isTremoloSyncEnabled)
+            updateSyncedTremoloRate();
+        else
+            refreshTremoloRate();
+    }
+
+    event tremoloNoteValue (float newNoteValue)
+    {
+        currentTremoloNoteIndex = clamp (int (newNoteValue), 0, 14);
+
+        if (isTremoloSyncEnabled)
+            updateSyncedTremoloRate();
+    }
+
+    event tempoIn (std::timeline::Tempo newTempo)
+    {
+        currentBPM = newTempo.bpm;
+
+        if (isTremoloSyncEnabled)
+            updateSyncedTremoloRate();
+    }
+
+    event delayTimeMs (float newDelayTimeMs)
+    {
+        currentDelayTimeMs = newDelayTimeMs;
+        refreshDelayTime();
+    }
+
+    event delayFeedback (float newDelayFeedback)
+    {
+        currentDelayFeedback = clamp (newDelayFeedback, 0.0f, 95.0f) * 0.01f;
+        smoothDelayFeedback.setTarget (currentDelayFeedback, parameterSmoothingSteps);
+    }
+
+    event delayMix (float newDelayMix)
+    {
+        currentDelayMix = clamp (newDelayMix, 0.0f, 100.0f) * 0.01f;
+        smoothDelayMix.setTarget (currentDelayMix, parameterSmoothingSteps);
+    }
+
+    void main()
+    {
+        refreshCoefficients();
+        refreshTremoloRate();
+        refreshDelayTime();
+        smoothAmount.reset (currentAmount);
+        smoothTremoloDepth.reset (currentTremoloDepth);
+        smoothDelayFeedback.reset (currentDelayFeedback);
+        smoothDelayMix.reset (currentDelayMix);
+        smoothDelaySamples.reset (float32 (delaySamples));
+
+        loop
+        {
+            let amount = smoothAmount.getNext();
+            let tremoloDepth = smoothTremoloDepth.getNext();
+            let delayFeedbackValue = smoothDelayFeedback.getNext();
+            let delayMixValue = smoothDelayMix.getNext();
+            delaySamples = clamp (int (smoothDelaySamples.getNext()), 1, maxDelaySamples - 1);
+
+            let detector = min ((abs (sidechain[0]) + abs (sidechain[1])) * 4.0f, 1.0f);
+            let coeff = detector > envelope ? attackCoeff : releaseCoeff;
+
+            envelope += (detector - envelope) * coeff;
+
+            let gain = 1.0f - envelope * amount;
+            let tremolo = 1.0f - tremoloDepth * (0.5f + 0.5f * sin (tremoloPhase));
+
+            float32<2> dry = mainIn * gain * tremolo;
+            float32<2> delayed = delayBuffer.at (delayWritePos - delaySamples);
+
+            delayBuffer[delayWritePos++] = dry + delayed * delayFeedbackValue;
+
+            float32<2> mixed = dry * (1.0f - delayMixValue) + delayed * delayMixValue;
+
+            out <- mixed;
+
+            tremoloPhase = addModulo2Pi (tremoloPhase, tremoloPhaseDelta);
+
+            advance();
+        }
+    }
+}

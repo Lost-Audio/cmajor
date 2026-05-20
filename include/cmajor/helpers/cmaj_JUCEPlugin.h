@@ -30,7 +30,9 @@
  #undef Status
 #endif
 
+#include <algorithm>
 #include <utility>
+#include <vector>
 #include "../../choc/choc/memory/choc_xxHash.h"
 #include "cmaj_PatchWebView.h"
 #include "cmaj_GeneratedCppEngine.h"
@@ -256,6 +258,9 @@ public:
         if (patchLayouts.isEmpty())
             return suggestedLayouts.isEmpty() || suggestedLayouts.getReference(0).size() == 0;
 
+        if (suggestedLayouts.size() < patchLayouts.size())
+            return false;
+
         for (int i = 0; i < juce::jmin (patchLayouts.size(), suggestedLayouts.size()); ++i)
             if (patchLayouts.getReference(i).defaultLayout.size() != suggestedLayouts.getReference(i).size())
                 return false;
@@ -296,7 +301,13 @@ public:
         if (auto ph = getPlayHead())
             updateTimelineFromPlayhead (*ph);
 
-        auto audioChannels = audio.getArrayOfWritePointers();
+        if (! refreshAudioChannelPointers (audio))
+        {
+            audio.clear();
+            midi.clear();
+            return;
+        }
+
         auto numFrames = static_cast<choc::buffer::FrameCount> (audio.getNumSamples());
 
         for (auto m : midi)
@@ -304,7 +315,7 @@ public:
 
         midi.clear();
 
-        patch->process (audioChannels, numFrames,
+        patch->process (inputChannelPointers.data(), outputChannelPointers.data(), numFrames,
                         [&] (uint32_t frame, choc::midi::ShortMessage m)
                         {
                             midi.addEvent (m.data(), static_cast<int> (m.length()), static_cast<int> (frame));
@@ -338,12 +349,14 @@ public:
         auto layout = getBusesLayout();
 
         return Patch::PlaybackParams (rate, requestedBlockSize,
-                                      static_cast<choc::buffer::ChannelCount> (layout.getMainInputChannels()),
-                                      static_cast<choc::buffer::ChannelCount> (layout.getMainOutputChannels()));
+                                      static_cast<choc::buffer::ChannelCount> (getTotalChannels (layout.inputBuses)),
+                                      static_cast<choc::buffer::ChannelCount> (getTotalChannels (layout.outputBuses)));
     }
 
     void applyRateAndBlockSize (double sampleRate, uint32_t samplesPerBlock)
     {
+        resizeAudioChannelPointerStorage();
+
         if (dllLoadedSuccessfully)
             patch->setPlaybackParams (getPlaybackParams (sampleRate, samplesPerBlock));
     }
@@ -360,6 +373,7 @@ public:
 
 protected:
     uint64_t lastLoadedStateHash = 0;
+    std::vector<float*> inputChannelPointers, outputChannelPointers;
 
     //==============================================================================
     static bool initialiseDLL()
@@ -404,21 +418,137 @@ protected:
     {
         BusesProperties layout;
 
-        uint32_t inputChannelCount = 0, outputChannelCount = 0;
-
-        for (auto& input : inputs)
-            inputChannelCount += input.getNumAudioChannels();
-
-        for (auto& output : outputs)
-            outputChannelCount += output.getNumAudioChannels();
-
-        if (inputChannelCount > 0)
-            layout.addBus (true, "in", juce::AudioChannelSet::canonicalChannelSet ((int) inputChannelCount), true);
-
-        if (outputChannelCount > 0)
-            layout.addBus (false, "out", juce::AudioChannelSet::canonicalChannelSet ((int) outputChannelCount), true);
+        addEndpointAudioBuses (layout, true,  inputs,  "in");
+        addEndpointAudioBuses (layout, false, outputs, "out");
 
         return layout;
+    }
+
+    static int getTotalChannels (const juce::Array<juce::AudioChannelSet>& buses)
+    {
+        int total = 0;
+
+        for (auto& bus : buses)
+            total += bus.size();
+
+        return total;
+    }
+
+    static bool hasAudioBusAnnotation (const EndpointDetails& endpoint)
+    {
+        return endpoint.annotation.isObject()
+            && (endpoint.annotation.hasObjectMember ("bus")
+                || endpoint.annotation.hasObjectMember ("role"));
+    }
+
+    static bool hasAnyAudioBusAnnotation (const EndpointDetailsList& endpoints)
+    {
+        for (auto& endpoint : endpoints)
+            if (endpoint.getNumAudioChannels() != 0 && hasAudioBusAnnotation (endpoint))
+                return true;
+
+        return false;
+    }
+
+    static juce::String getAudioBusName (const EndpointDetails& endpoint, bool isInput, const char* defaultName)
+    {
+        if (endpoint.annotation.isObject())
+        {
+            auto busName = endpoint.annotation["bus"].toString();
+
+            if (! busName.empty())
+                return busName;
+
+            auto role = endpoint.annotation["role"].toString();
+
+            if (role == "sidechain" || role == "sideChain" || role == "aux")
+                return "Sidechain";
+
+            if (role == "main")
+                return isInput ? "Input" : "Output";
+        }
+
+        return defaultName;
+    }
+
+    static void addEndpointAudioBuses (BusesProperties& layout, bool isInput, const EndpointDetailsList& endpoints, const char* defaultName)
+    {
+        struct AudioBusGroup
+        {
+            juce::String name;
+            uint32_t channelCount = 0;
+        };
+
+        if (! hasAnyAudioBusAnnotation (endpoints))
+        {
+            uint32_t channelCount = 0;
+
+            for (auto& endpoint : endpoints)
+                channelCount += endpoint.getNumAudioChannels();
+
+            if (channelCount != 0)
+                layout.addBus (isInput, defaultName, juce::AudioChannelSet::canonicalChannelSet ((int) channelCount), true);
+
+            return;
+        }
+
+        std::vector<AudioBusGroup> busGroups;
+
+        for (auto& endpoint : endpoints)
+        {
+            auto channelCount = endpoint.getNumAudioChannels();
+
+            if (channelCount == 0)
+                continue;
+
+            auto busName = getAudioBusName (endpoint, isInput, defaultName);
+            auto bus = std::find_if (busGroups.begin(), busGroups.end(),
+                                     [&] (const AudioBusGroup& group) { return group.name == busName; });
+
+            if (bus == busGroups.end())
+                bus = busGroups.insert (busGroups.end(), AudioBusGroup { busName, 0 });
+
+            bus->channelCount += channelCount;
+        }
+
+        for (auto& bus : busGroups)
+            layout.addBus (isInput, bus.name, juce::AudioChannelSet::canonicalChannelSet ((int) bus.channelCount), true);
+    }
+
+    void resizeAudioChannelPointerStorage()
+    {
+        inputChannelPointers.resize  (static_cast<size_t> (getTotalNumInputChannels()));
+        outputChannelPointers.resize (static_cast<size_t> (getTotalNumOutputChannels()));
+    }
+
+    bool refreshAudioChannelPointers (juce::AudioBuffer<float>& audio)
+    {
+        if (inputChannelPointers.size()  != static_cast<size_t> (getTotalNumInputChannels())
+            || outputChannelPointers.size() != static_cast<size_t> (getTotalNumOutputChannels()))
+            return false;
+
+        size_t inputIndex = 0;
+
+        for (int bus = 0; bus < getBusCount (true); ++bus)
+        {
+            auto busBuffer = getBusBuffer (audio, true, bus);
+
+            for (int channel = 0; channel < busBuffer.getNumChannels(); ++channel)
+                inputChannelPointers[inputIndex++] = busBuffer.getWritePointer (channel);
+        }
+
+        size_t outputIndex = 0;
+
+        for (int bus = 0; bus < getBusCount (false); ++bus)
+        {
+            auto busBuffer = getBusBuffer (audio, false, bus);
+
+            for (int channel = 0; channel < busBuffer.getNumChannels(); ++channel)
+                outputChannelPointers[outputIndex++] = busBuffer.getWritePointer (channel);
+        }
+
+        return inputIndex == inputChannelPointers.size()
+            && outputIndex == outputChannelPointers.size();
     }
 
     void unload (const std::string& message, bool isError)
@@ -1127,8 +1257,9 @@ public:
     static BusesProperties getBusLayout()
     {
         BusesProperties layout;
-        layout.addBus (true,  "Input",  juce::AudioChannelSet::stereo(), true);
-        layout.addBus (false, "Output", juce::AudioChannelSet::stereo(), true);
+        layout.addBus (true,  "Input",     juce::AudioChannelSet::stereo(), true);
+        layout.addBus (true,  "Sidechain", juce::AudioChannelSet::stereo(), true);
+        layout.addBus (false, "Output",    juce::AudioChannelSet::stereo(), true);
         return layout;
     }
 
