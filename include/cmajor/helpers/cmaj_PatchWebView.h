@@ -52,6 +52,8 @@ struct PatchWebView  : public PatchView
 
 private:
     std::unique_ptr<choc::ui::WebView> webview;
+    // FEATHER: Tracks HTML text-entry focus so spacebar transport passthrough
+    // can stay enabled without stealing spaces typed into patch UI fields.
     bool textInputFocused = false;
     std::optional<choc::ui::WebView::Options::Resource> onRequest (const std::string&);
     void createBindings();
@@ -103,12 +105,15 @@ inline PatchWebView::PatchWebView (Patch& p, const PatchManifest::View& view)
             return {};
         });
 
+        // FEATHER: JS focus tracking feeds native spacebar passthrough.
         boundOK = w.bind ("cmaj_setTextInputFocus", [this] (const choc::value::ValueView& args) -> choc::value::Value
         {
             textInputFocused = args.isArray() && args.size() != 0 && args[0].getWithDefault<bool> (false);
             return {};
         }) && boundOK;
 
+        // FEATHER: Prevent the browser from consuming host transport spacebar
+        // shortcuts unless the user is typing into an editable element.
         static constexpr auto keyboardFocusScript = R"(
             (() => {
                 const isTextInput = element =>
@@ -171,6 +176,8 @@ inline bool PatchWebView::isTextInputFocused() const
 
 inline void PatchWebView::reload()
 {
+    // FEATHER: A reload drops DOM focus; keep the native passthrough predicate
+    // conservative until JS reports the next focused editable element.
     textInputFocused = false;
     getWebView().evaluateJavascript ("document.location.reload()");
 }
