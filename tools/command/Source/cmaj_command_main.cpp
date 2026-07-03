@@ -140,6 +140,8 @@ CODE_GEN_TARGETS
 cmaj create [opts] <folder> Creates a folder containing files for a new empty patch
 
     --name="name"           Provides a name for the patch
+    --ui=svelte|generic|none
+                            // FEATHER: Selects the scaffolded patch UI. Defaults to svelte.
 
 cmaj unit-test              Runs internal unit tests.
 
