@@ -1,6 +1,12 @@
 .DS_Store
 build
 .claude
+<<<<<<< HEAD
 # FEATHER: fork-local build & orchestration dirs
 build-plugin/
 .feather/
+=======
+# FEATHER: MCP server local artifacts
+tools/mcp/node_modules/
+tools/mcp/dist/
+>>>>>>> feature/mcp-server
