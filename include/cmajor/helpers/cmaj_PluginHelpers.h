@@ -32,6 +32,8 @@
 #include <istream>
 #include <memory>
 #include <optional>
+#include <unordered_map>
+#include <utility>
 
 namespace cmaj::plugin
 {
@@ -160,6 +162,69 @@ inline cmaj::PatchManifest::View findDefaultViewForPatch (const cmaj::Patch& pat
 }
 
 //==============================================================================
+struct WebViewParkingWindow
+{
+    WebViewParkingWindow()
+    {
+      #if CHOC_WINDOWS
+        static constexpr const char* className = "CmajorWebViewParkingWindow";
+        static bool classRegistered = false;
+
+        if (! classRegistered)
+        {
+            WNDCLASSA wc = {};
+            wc.lpfnWndProc = +[] (HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) -> LRESULT
+            {
+                (void) hwnd;
+                (void) msg;
+                (void) wParam;
+                (void) lParam;
+                return DefWindowProc (hwnd, msg, wParam, lParam);
+            };
+            wc.hInstance = GetModuleHandle (nullptr);
+            wc.lpszClassName = className;
+
+            RegisterClassA (&wc);
+            classRegistered = true;
+        }
+
+        hwnd = CreateWindowExA (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                                className,
+                                "Cmajor WebView Parking",
+                                WS_POPUP,
+                                -100, -100, 1, 1,
+                                nullptr, nullptr,
+                                GetModuleHandle (nullptr),
+                                nullptr);
+      #endif
+    }
+
+    ~WebViewParkingWindow()
+    {
+      #if CHOC_WINDOWS
+        if (hwnd != nullptr)
+            DestroyWindow (hwnd);
+      #endif
+    }
+
+    WebViewParkingWindow (const WebViewParkingWindow&) = delete;
+    WebViewParkingWindow& operator= (const WebViewParkingWindow&) = delete;
+
+    void* getHandle() const
+    {
+      #if CHOC_WINDOWS
+        return hwnd;
+      #else
+        return nullptr;
+      #endif
+    }
+
+  #if CHOC_WINDOWS
+    HWND hwnd = nullptr;
+  #endif
+};
+
+//==============================================================================
 inline bool addChildView (void* parent, void* child)
 {
   #if CHOC_OSX
@@ -182,6 +247,132 @@ inline bool addChildView (void* parent, void* child)
     (void) child;
     // TODO: support linux
     return false;
+  #endif
+}
+
+inline bool removeChildView (void* child)
+{
+    if (child == nullptr)
+        return false;
+
+  #if CHOC_OSX
+    try
+    {
+        choc::objc::call<void> ((id) child, "removeFromSuperview");
+        return true;
+    }
+    catch (...) {}
+
+    return false;
+  #elif CHOC_WINDOWS
+    ShowWindow (static_cast<HWND> (child), SW_HIDE);
+    return SetParent (static_cast<HWND> (child), nullptr) != nullptr;
+  #else
+    (void) child;
+    // TODO: support linux
+    return false;
+  #endif
+}
+
+inline bool parkChildView (WebViewParkingWindow& parkingWindow, void* child)
+{
+    if (child == nullptr)
+        return false;
+
+  #if CHOC_WINDOWS
+    if (auto* parkingHandle = static_cast<HWND> (parkingWindow.getHandle()))
+    {
+        if (SetParent (static_cast<HWND> (child), parkingHandle) == nullptr)
+            return false;
+
+        ShowWindow (static_cast<HWND> (child), SW_HIDE);
+        return true;
+    }
+
+    return removeChildView (child);
+  #else
+    (void) parkingWindow;
+    return removeChildView (child);
+  #endif
+}
+
+#if CHOC_WINDOWS
+struct SpacebarPassthroughState
+{
+    WNDPROC previousWndProc = nullptr;
+    std::function<bool()> shouldPassSpaceToHost;
+};
+
+inline std::unordered_map<HWND, SpacebarPassthroughState>& getSpacebarPassthroughStates()
+{
+    static std::unordered_map<HWND, SpacebarPassthroughState> states;
+    return states;
+}
+
+inline LRESULT CALLBACK spacebarPassthroughWndProc (HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    auto& states = getSpacebarPassthroughStates();
+    const auto state = states.find (hwnd);
+
+    if (state != states.end())
+    {
+        const auto isSpaceKeyMessage = (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN
+                                     || msg == WM_KEYUP   || msg == WM_SYSKEYUP)
+                                    && wParam == VK_SPACE;
+
+        if (isSpaceKeyMessage && state->second.shouldPassSpaceToHost && state->second.shouldPassSpaceToHost())
+        {
+            if (auto parent = GetParent (hwnd))
+                PostMessage (parent, msg, wParam, lParam);
+
+            return 0;
+        }
+
+        if (state->second.previousWndProc != nullptr)
+            return CallWindowProc (state->second.previousWndProc, hwnd, msg, wParam, lParam);
+    }
+
+    return DefWindowProc (hwnd, msg, wParam, lParam);
+}
+#endif
+
+inline void installSpacebarPassthrough (void* view, std::function<bool()> shouldPassSpaceToHost)
+{
+    if (view == nullptr)
+        return;
+
+  #if CHOC_WINDOWS
+    auto hwnd = static_cast<HWND> (view);
+    auto& state = getSpacebarPassthroughStates()[hwnd];
+    state.shouldPassSpaceToHost = std::move (shouldPassSpaceToHost);
+
+    if (state.previousWndProc == nullptr)
+        state.previousWndProc = reinterpret_cast<WNDPROC> (SetWindowLongPtr (hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR> (spacebarPassthroughWndProc)));
+  #else
+    (void) view;
+    (void) shouldPassSpaceToHost;
+  #endif
+}
+
+inline void uninstallSpacebarPassthrough (void* view)
+{
+    if (view == nullptr)
+        return;
+
+  #if CHOC_WINDOWS
+    auto hwnd = static_cast<HWND> (view);
+    auto& states = getSpacebarPassthroughStates();
+    auto state = states.find (hwnd);
+
+    if (state != states.end())
+    {
+        if (state->second.previousWndProc != nullptr)
+            SetWindowLongPtr (hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR> (state->second.previousWndProc));
+
+        states.erase (state);
+    }
+  #else
+    (void) view;
   #endif
 }
 

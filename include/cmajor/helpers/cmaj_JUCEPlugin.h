@@ -34,6 +34,7 @@
 #include <utility>
 #include <vector>
 #include "../../choc/choc/memory/choc_xxHash.h"
+#include "cmaj_PluginHelpers.h"
 #include "cmaj_PatchWebView.h"
 #include "cmaj_GeneratedCppEngine.h"
 
@@ -110,6 +111,12 @@ public:
     ~JUCEPluginBase() override
     {
         patch->patchChanged = [] {};
+        detachPatchWebViewFromEditor();
+
+        if (patchWebView != nullptr)
+            cmaj::plugin::uninstallSpacebarPassthrough (patchWebView->getWebView().getViewHandle());
+
+        patchWebView.reset();
         patch->unload();
         patch.reset();
     }
@@ -557,6 +564,7 @@ protected:
         {
             patch->unload();
             setStatusMessage (message, isError);
+            updatePatchWebViewForCurrentPatch (false);
         }
     }
 
@@ -572,6 +580,8 @@ protected:
         changes.nonParameterStateChanged = true;
 
         setLatencySamples (newLatency);
+        if (getActiveEditor() == nullptr)
+            updatePatchWebViewForCurrentPatch (true);
         notifyEditorPatchChanged();
         updateHostDisplay (changes);
 
@@ -585,6 +595,10 @@ protected:
         {
             statusMessage = newMessage;
             isStatusMessageError = isError;
+
+            if (patchWebView != nullptr && ! statusMessage.empty())
+                patchWebView->setStatusMessage (statusMessage);
+
             notifyEditorStatusMessageChanged();
         }
     }
@@ -1035,16 +1049,196 @@ protected:
 
     std::vector<Parameter*> parameters;
 
+    static constexpr int defaultEditorWidth = 500, defaultEditorHeight = 400;
+
+    cmaj::PatchManifest::View derivePatchViewSize() const
+    {
+        auto view = cmaj::PatchManifest::View
+        {
+            choc::json::create ("width", lastEditorWidth,
+                                "height", lastEditorHeight)
+        };
+
+        if (auto manifest = patch->getManifest())
+            if (auto v = manifest->findDefaultView())
+                if (lastEditorWidth == 0 && lastEditorHeight == 0)
+                    view = *v;
+
+        if (view.getWidth()  == 0)  view.view.setMember ("width", defaultEditorWidth);
+        if (view.getHeight() == 0)  view.view.setMember ("height", defaultEditorHeight);
+
+        return view;
+    }
+
+    cmaj::PatchWebView& getOrCreatePatchWebView()
+    {
+        if (patchWebView != nullptr && ! patchWebView->isViewOf (*patch))
+        {
+            detachPatchWebViewFromEditor();
+            cmaj::plugin::uninstallSpacebarPassthrough (patchWebView->getWebView().getViewHandle());
+            patchWebView.reset();
+        }
+
+        if (patchWebView == nullptr)
+        {
+            patchWebView = std::make_unique<cmaj::PatchWebView> (*patch, derivePatchViewSize());
+
+            cmaj::plugin::installSpacebarPassthrough (patchWebView->getWebView().getViewHandle(),
+                [this]
+                {
+                    return patchWebView != nullptr && ! patchWebView->isTextInputFocused();
+                });
+        }
+
+        return *patchWebView;
+    }
+
+    void updatePatchWebViewForCurrentPatch (bool forceReload)
+    {
+        if (patchWebView == nullptr)
+            return;
+
+        if (static_cast<DerivedType&> (*this).isViewVisible())
+        {
+            patchWebView->setActive (true);
+            patchWebView->update (derivePatchViewSize());
+
+            if (forceReload)
+                patchWebView->reload();
+        }
+        else
+        {
+            patchWebView->setActive (false);
+
+            if (! statusMessage.empty())
+                patchWebView->setStatusMessage (statusMessage);
+        }
+    }
+
+    void detachPatchWebViewFromEditor()
+    {
+        if (patchWebView != nullptr)
+            cmaj::plugin::parkChildView (patchWebViewParkingWindow, patchWebView->getWebView().getViewHandle());
+    }
+
+    cmaj::plugin::WebViewParkingWindow patchWebViewParkingWindow;
+    std::unique_ptr<cmaj::PatchWebView> patchWebView;
+
+    static std::unique_ptr<juce::Component> createPersistentWebViewHolder (choc::ui::WebView& webView)
+    {
+      #if JUCE_WINDOWS
+        struct Holder  : public juce::Component
+        {
+            Holder (choc::ui::WebView& v)
+                : hwnd (static_cast<HWND> (v.getViewHandle())),
+                  movementWatcher (*this)
+            {
+            }
+
+            ~Holder() override
+            {
+                detachFromPeer();
+            }
+
+            void paint (juce::Graphics&) override {}
+
+        private:
+            struct MovementWatcher  : public juce::ComponentMovementWatcher
+            {
+                MovementWatcher (Holder& h) : juce::ComponentMovementWatcher (&h), holder (h) {}
+
+                void componentMovedOrResized (bool, bool) override  { holder.updateNativeBounds(); }
+                void componentPeerChanged() override                { holder.updateNativeParent(); }
+                void componentVisibilityChanged() override          { holder.updateNativeParent(); }
+
+                Holder& holder;
+            };
+
+            void updateNativeParent()
+            {
+                if (hwnd == nullptr)
+                    return;
+
+                auto* peer = isShowing() ? getTopLevelComponent()->getPeer() : nullptr;
+                auto peerWindow = peer != nullptr ? static_cast<HWND> (peer->getNativeHandle()) : nullptr;
+
+                if (currentPeerWindow != peerWindow)
+                {
+                    detachFromPeer();
+                    currentPeerWindow = peerWindow;
+
+                    if (currentPeerWindow != nullptr)
+                    {
+                        auto windowFlags = GetWindowLongPtr (hwnd, GWL_STYLE);
+                        using FlagType = decltype (windowFlags);
+
+                        windowFlags &= ~static_cast<FlagType> (WS_POPUP);
+                        windowFlags |= static_cast<FlagType> (WS_CHILD);
+
+                        SetWindowLongPtr (hwnd, GWL_STYLE, windowFlags);
+                        SetParent (hwnd, currentPeerWindow);
+                    }
+                }
+
+                ShowWindow (hwnd, currentPeerWindow != nullptr ? SW_SHOWNA : SW_HIDE);
+                updateNativeBounds();
+            }
+
+            void updateNativeBounds()
+            {
+                if (hwnd == nullptr || currentPeerWindow == nullptr)
+                    return;
+
+                if (auto* peer = getTopLevelComponent()->getPeer())
+                {
+                    auto area = (peer->getAreaCoveredBy (*this).toFloat() * peer->getPlatformScaleFactor()).getSmallestIntegerContainer();
+                    SetWindowPos (hwnd, nullptr, area.getX(), area.getY(), area.getWidth(), area.getHeight(),
+                                  SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER);
+                    InvalidateRect (hwnd, nullptr, TRUE);
+                }
+            }
+
+            void detachFromPeer()
+            {
+                if (hwnd != nullptr && currentPeerWindow != nullptr)
+                {
+                    ShowWindow (hwnd, SW_HIDE);
+                    SetParent (hwnd, nullptr);
+                }
+
+                currentPeerWindow = nullptr;
+            }
+
+            HWND hwnd = nullptr;
+            HWND currentPeerWindow = nullptr;
+            MovementWatcher movementWatcher;
+
+            JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (Holder)
+        };
+
+        return std::make_unique<Holder> (webView);
+      #else
+        return choc::ui::createJUCEWebViewHolder (webView);
+      #endif
+    }
+
     //==============================================================================
     //==============================================================================
     struct Editor  : public juce::AudioProcessorEditor
     {
         Editor (DerivedType& p)
-            : juce::AudioProcessorEditor (p), owner (p),
-              patchWebView (std::make_unique<cmaj::PatchWebView> (*p.patch, derivePatchViewSize (p)))
+            : juce::AudioProcessorEditor (p), owner (p)
         {
-            patchWebViewHolder = choc::ui::createJUCEWebViewHolder (patchWebView->getWebView());
-            patchWebViewHolder->setSize ((int) patchWebView->width, (int) patchWebView->height);
+            auto& view = owner.getOrCreatePatchWebView();
+
+            if constexpr (DerivedType::isPrecompiled)
+                patchWebViewHolder = createPersistentWebViewHolder (view.getWebView());
+            else
+                patchWebViewHolder = choc::ui::createJUCEWebViewHolder (view.getWebView());
+
+            patchWebViewHolder->setSize ((int) view.width, (int) view.height);
+            patchWebViewHolder->setWantsKeyboardFocus (false);
+            patchWebViewHolder->setMouseClickGrabsKeyboardFocus (false);
 
             setResizeLimits (250, 160, 32768, 32768);
 
@@ -1074,61 +1268,44 @@ protected:
         {
             owner.editorBeingDeleted (this);
             setLookAndFeel (nullptr);
+            removeChildComponent (patchWebViewHolder.get());
             patchWebViewHolder.reset();
-            patchWebView.reset();
+            owner.detachPatchWebViewFromEditor();
         }
 
         void statusMessageChanged()
         {
             owner.refreshExtraComp (extraComp.get());
-            patchWebView->setStatusMessage (owner.statusMessage);
-        }
 
-        static cmaj::PatchManifest::View derivePatchViewSize (const DerivedType& owner)
-        {
-            auto view = cmaj::PatchManifest::View
-            {
-                choc::json::create ("width", owner.lastEditorWidth,
-                                    "height", owner.lastEditorHeight)
-            };
-
-            if (auto manifest = owner.patch->getManifest())
-                if (auto v = manifest->findDefaultView())
-                    if (owner.lastEditorWidth == 0 && owner.lastEditorHeight == 0)
-                        view = *v;
-
-            if (view.getWidth()  == 0)  view.view.setMember ("width", defaultWidth);
-            if (view.getHeight() == 0)  view.view.setMember ("height", defaultHeight);
-
-            return view;
+            if (owner.patchWebView != nullptr && ! owner.statusMessage.empty())
+                owner.patchWebView->setStatusMessage (owner.statusMessage);
         }
 
         void onPatchChanged (bool forceReload = true)
         {
             if (owner.isViewVisible())
             {
-                patchWebView->setActive (true);
-                patchWebView->update (derivePatchViewSize (owner));
-                patchWebViewHolder->setSize ((int) patchWebView->width, (int) patchWebView->height);
+                auto& view = owner.getOrCreatePatchWebView();
+                view.setActive (true);
+                view.update (owner.derivePatchViewSize());
+                patchWebViewHolder->setSize ((int) view.width, (int) view.height);
 
-                setResizable (patchWebView->resizable, false);
+                setResizable (view.resizable, false);
 
                 addAndMakeVisible (*patchWebViewHolder);
                 childBoundsChanged (nullptr);
             }
             else
             {
-                removeChildComponent (patchWebViewHolder.get());
-
-                patchWebView->setActive (false);
                 patchWebViewHolder->setVisible (false);
+                removeChildComponent (patchWebViewHolder.get());
+                owner.detachPatchWebViewFromEditor();
 
-                setSize (defaultWidth, defaultHeight);
+                setSize (defaultEditorWidth, defaultEditorHeight);
                 setResizable (true, false);
             }
 
-            if (forceReload)
-                patchWebView->reload();
+            owner.updatePatchWebViewForCurrentPatch (forceReload);
         }
 
         void childBoundsChanged (Component*) override
@@ -1171,13 +1348,10 @@ protected:
         //==============================================================================
         DerivedType& owner;
 
-        std::unique_ptr<cmaj::PatchWebView> patchWebView;
         std::unique_ptr<juce::Component> patchWebViewHolder, extraComp;
 
         juce::LookAndFeel_V4 lookAndFeel;
         bool isResizing = false;
-
-        static constexpr int defaultWidth = 500, defaultHeight = 400;
 
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (Editor)
     };

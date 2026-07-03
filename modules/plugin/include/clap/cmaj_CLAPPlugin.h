@@ -159,6 +159,12 @@ struct Plugin::Impl
     Impl& operator= (const Impl&) = delete;
     Impl& operator= (Impl&&) = delete;
 
+    ~Impl()
+    {
+        if (webview != nullptr)
+            cmaj::plugin::uninstallSpacebarPassthrough (webview->getWebView().getViewHandle());
+    }
+
     void update (const std::filesystem::path& nextPathToManifest)
     {
         if (! blockRestartRequests)
@@ -316,8 +322,8 @@ private:
 
     struct ViewHolder
     {
-        ViewHolder (cmaj::Patch& patchToUse, std::optional<double> initialScaleFactorToUse)
-            : webview (std::make_unique<cmaj::PatchWebView> (patchToUse, findDefaultViewForPatch (patchToUse)))
+        ViewHolder (cmaj::PatchWebView& webviewToUse, std::optional<double> initialScaleFactorToUse)
+            : webview (webviewToUse)
         {
             if (initialScaleFactorToUse)
                 setScaleFactor (*initialScaleFactorToUse);
@@ -339,21 +345,21 @@ private:
 
         Size size() const
         {
-            return { scaled (webview->width),
-                     scaled (webview->height) };
+            return { scaled (webview.width),
+                     scaled (webview.height) };
         }
 
         bool setSize (const Size& sizeToUse)
         {
-            webview->width  = unscaled (sizeToUse.width);
-            webview->height = unscaled (sizeToUse.height);
+            webview.width  = unscaled (sizeToUse.width);
+            webview.height = unscaled (sizeToUse.height);
 
             return updateNativeViewSize();
         }
 
         bool resizable() const
         {
-            return webview->resizable;
+            return webview.resizable;
         }
 
         bool setParent (void* parent)
@@ -365,7 +371,7 @@ private:
         }
 
     private:
-        void* nativeViewHandle() const                  { return webview->getWebView().getViewHandle(); }
+        void* nativeViewHandle() const                  { return webview.getWebView().getViewHandle(); }
         uint32_t scaled (uint32_t x) const              { return scaleFactor ? toIntegerPixel (*scaleFactor * x) : x; }
         uint32_t unscaled (uint32_t x) const            { return scaleFactor ? toIntegerPixel (*inverseScaleFactor * x) : x; }
         static uint32_t toIntegerPixel (double x)       { return static_cast<uint32_t> (0.5 + x); }
@@ -377,13 +383,62 @@ private:
             return cmaj::plugin::setViewSize (nativeViewHandle(), width, height);
         }
 
-        std::unique_ptr<cmaj::PatchWebView> webview;
+        cmaj::PatchWebView& webview;
         std::optional<double> scaleFactor;
         std::optional<double> inverseScaleFactor;
     };
 
     std::optional<double> cachedViewScaleFactor; // workaround Bitwig only passing the scale factor the first time the view is shown
+    cmaj::plugin::WebViewParkingWindow webviewParkingWindow;
+    std::unique_ptr<cmaj::PatchWebView> webview;
     std::optional<ViewHolder> editor;
+
+    cmaj::PatchWebView& getOrCreatePatchWebView()
+    {
+        if (webview != nullptr && ! webview->isViewOf (patch))
+        {
+            cmaj::plugin::uninstallSpacebarPassthrough (webview->getWebView().getViewHandle());
+            webview.reset();
+        }
+
+        if (webview == nullptr)
+        {
+            webview = std::make_unique<cmaj::PatchWebView> (patch, findDefaultViewForPatch (patch));
+
+            cmaj::plugin::installSpacebarPassthrough (webview->getWebView().getViewHandle(),
+                [this]
+                {
+                    return webview != nullptr && ! webview->isTextInputFocused();
+                });
+        }
+
+        return *webview;
+    }
+
+    void updatePatchWebViewForLoadedPatch (bool forceReload)
+    {
+        if (webview == nullptr)
+            return;
+
+        webview->setActive (patch.isPlayable());
+
+        if (patch.isPlayable())
+        {
+            webview->update (findDefaultViewForPatch (patch));
+
+            if (editor)
+                editor->setSize (editor->size());
+
+            if (forceReload)
+                webview->reload();
+        }
+    }
+
+    void detachEditorToParking()
+    {
+        if (webview != nullptr)
+            cmaj::plugin::parkChildView (webviewParkingWindow, webview->getWebView().getViewHandle());
+    }
 
     bool loadPatch (const std::filesystem::path& pathToManifest, FrequencyAndBlockSize frequencyAndBlockSize)
     {
@@ -420,6 +475,8 @@ private:
 
         if (! patch.isPlayable())
             return {};
+
+        updatePatchWebViewForLoadedPatch (true);
 
         flattenedInputChannelsScratchBuffer.resize (sumTotalChannelsAcrossAudioEndpoints (patch.getInputEndpoints()));
         flattenedOutputChannelsScratchBuffer.resize (sumTotalChannelsAcrossAudioEndpoints (patch.getOutputEndpoints()));
@@ -1402,13 +1459,16 @@ inline bool Plugin::Impl::clapGui_getPreferredApi (const char** api, bool* float
 
 inline bool Plugin::Impl::clapGui_create (const char*, bool)
 {
-    editor = ViewHolder (patch, cachedViewScaleFactor);
+    editor.reset();
+    editor.emplace (getOrCreatePatchWebView(), cachedViewScaleFactor);
+    updatePatchWebViewForLoadedPatch (false);
     return true;
 }
 
 inline void Plugin::Impl::clapGui_destroy()
 {
-    editor = {};
+    detachEditorToParking();
+    editor.reset();
 }
 
 inline bool Plugin::Impl::clapGui_setScale (double scaleFactor)

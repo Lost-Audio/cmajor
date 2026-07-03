@@ -39,6 +39,7 @@ struct PatchWebView  : public PatchView
     choc::ui::WebView& getWebView();
 
     void setStatusMessage (const std::string& newMessage);
+    bool isTextInputFocused() const;
 
     /// Provides a chunk of javascript that goes in a function which is run before the
     /// view element is added to its parent element.
@@ -51,6 +52,7 @@ struct PatchWebView  : public PatchView
 
 private:
     std::unique_ptr<choc::ui::WebView> webview;
+    bool textInputFocused = false;
     std::optional<choc::ui::WebView::Options::Resource> onRequest (const std::string&);
     void createBindings();
 };
@@ -101,6 +103,42 @@ inline PatchWebView::PatchWebView (Patch& p, const PatchManifest::View& view)
             return {};
         });
 
+        boundOK = w.bind ("cmaj_setTextInputFocus", [this] (const choc::value::ValueView& args) -> choc::value::Value
+        {
+            textInputFocused = args.isArray() && args.size() != 0 && args[0].getWithDefault<bool> (false);
+            return {};
+        }) && boundOK;
+
+        static constexpr auto keyboardFocusScript = R"(
+            (() => {
+                const isTextInput = element =>
+                {
+                    if (! element)
+                        return false;
+
+                    const tagName = element.tagName;
+                    return tagName === "INPUT" || tagName === "TEXTAREA" || element.isContentEditable;
+                };
+
+                const updateTextInputFocus = () =>
+                    window.cmaj_setTextInputFocus?.(isTextInput (document.activeElement));
+
+                window.addEventListener ("focusin", updateTextInputFocus, true);
+                window.addEventListener ("focusout", () => setTimeout (updateTextInputFocus, 0), true);
+                window.addEventListener ("keydown", event =>
+                {
+                    if ((event.code === "Space" || event.key === " ") && ! isTextInput (document.activeElement))
+                        event.preventDefault();
+                }, true);
+
+                updateTextInputFocus();
+            })();
+        )";
+
+        const auto scriptAdded = w.addInitScript (keyboardFocusScript);
+        (void) scriptAdded;
+        w.evaluateJavascript (keyboardFocusScript);
+
         (void) boundOK;
         CMAJ_ASSERT (boundOK);
     };
@@ -126,8 +164,14 @@ inline void PatchWebView::setStatusMessage (const std::string& newMessage)
     getWebView().evaluateJavascript ("window.setStatusMessage (" + choc::json::getEscapedQuotedString (newMessage) + ")");
 }
 
+inline bool PatchWebView::isTextInputFocused() const
+{
+    return textInputFocused;
+}
+
 inline void PatchWebView::reload()
 {
+    textInputFocused = false;
     getWebView().evaluateJavascript ("document.location.reload()");
 }
 
