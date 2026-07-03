@@ -32,11 +32,14 @@
 #include <functional>
 #include <istream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include "../../choc/choc/gui/choc_WebView.h"
 
 namespace cmaj::plugin
 {
@@ -275,61 +278,83 @@ struct WebViewParkingWindow
 
 //==============================================================================
 #if CHOC_WINDOWS
-// FEATHER: Thread-local CBT destroy watching lets a parked WebView detach before
-// the host/JUCE editor native window is destroyed. This mirrors the reference
-// implementation without depending on JUCE's WebBrowserComponent.
+// FEATHER: CBT destroy watching lets a parked WebView detach before the
+// host/JUCE editor native window is destroyed. The registry is process-wide so
+// a cross-thread editor teardown can remove callbacks before their owner dies.
 struct NativeWindowDestroyHookEntry
 {
     void* owner = nullptr;
     std::function<void()> onDestroy;
+    DWORD threadID = 0;
 };
 
 struct NativeWindowDestroyHookRegistry
 {
-    HHOOK hook = nullptr;
+    std::mutex mutex;
+    std::unordered_map<DWORD, HHOOK> hooksByThread;
     std::unordered_map<HWND, std::vector<NativeWindowDestroyHookEntry>> trackedWindows;
 };
 
 inline NativeWindowDestroyHookRegistry& getNativeWindowDestroyHookRegistry()
 {
-    static thread_local NativeWindowDestroyHookRegistry registry;
+    static NativeWindowDestroyHookRegistry registry;
     return registry;
 }
 
-inline void maybeRemoveNativeWindowDestroyHook()
+inline bool nativeWindowDestroyThreadHasTrackedWindows (const NativeWindowDestroyHookRegistry& registry, DWORD threadID)
 {
-    auto& registry = getNativeWindowDestroyHookRegistry();
+    for (const auto& window : registry.trackedWindows)
+        for (const auto& entry : window.second)
+            if (entry.threadID == threadID)
+                return true;
 
-    if (registry.hook != nullptr && registry.trackedWindows.empty())
+    return false;
+}
+
+inline void maybeRemoveNativeWindowDestroyHook (NativeWindowDestroyHookRegistry& registry, DWORD threadID)
+{
+    auto found = registry.hooksByThread.find (threadID);
+
+    if (found != registry.hooksByThread.end() && ! nativeWindowDestroyThreadHasTrackedWindows (registry, threadID))
     {
-        UnhookWindowsHookEx (registry.hook);
-        registry.hook = nullptr;
+        UnhookWindowsHookEx (found->second);
+        registry.hooksByThread.erase (found);
     }
 }
 
 inline LRESULT CALLBACK nativeWindowDestroyHookProc (int code, WPARAM wParam, LPARAM lParam)
 {
     auto& registry = getNativeWindowDestroyHookRegistry();
+    const auto threadID = GetCurrentThreadId();
+    HHOOK hook = nullptr;
+    std::vector<NativeWindowDestroyHookEntry> callbacks;
 
-    if (code == HCBT_DESTROYWND)
     {
-        auto destroyedWindow = reinterpret_cast<HWND> (wParam);
-        auto found = registry.trackedWindows.find (destroyedWindow);
+        std::lock_guard<std::mutex> lock (registry.mutex);
 
-        if (found != registry.trackedWindows.end())
+        if (auto foundHook = registry.hooksByThread.find (threadID); foundHook != registry.hooksByThread.end())
+            hook = foundHook->second;
+
+        if (code == HCBT_DESTROYWND)
         {
-            auto callbacks = std::move (found->second);
-            registry.trackedWindows.erase (found);
+            auto destroyedWindow = reinterpret_cast<HWND> (wParam);
+            auto found = registry.trackedWindows.find (destroyedWindow);
 
-            for (auto& entry : callbacks)
-                if (entry.onDestroy)
-                    entry.onDestroy();
+            if (found != registry.trackedWindows.end())
+            {
+                callbacks = std::move (found->second);
+                registry.trackedWindows.erase (found);
 
-            maybeRemoveNativeWindowDestroyHook();
+                maybeRemoveNativeWindowDestroyHook (registry, threadID);
+            }
         }
     }
 
-    return CallNextHookEx (registry.hook, code, wParam, lParam);
+    for (auto& entry : callbacks)
+        if (entry.onDestroy)
+            entry.onDestroy();
+
+    return CallNextHookEx (hook, code, wParam, lParam);
 }
 
 inline void watchNativeWindowDestroy (void* owner, HWND hwnd, std::function<void()> onDestroy)
@@ -338,12 +363,22 @@ inline void watchNativeWindowDestroy (void* owner, HWND hwnd, std::function<void
         return;
 
     auto& registry = getNativeWindowDestroyHookRegistry();
+    const auto threadID = GetWindowThreadProcessId (hwnd, nullptr);
 
-    if (registry.hook == nullptr)
-        registry.hook = SetWindowsHookEx (WH_CBT, nativeWindowDestroyHookProc, nullptr, GetCurrentThreadId());
-
-    if (registry.hook == nullptr)
+    if (threadID == 0)
         return;
+
+    std::lock_guard<std::mutex> lock (registry.mutex);
+
+    if (registry.hooksByThread.find (threadID) == registry.hooksByThread.end())
+    {
+        auto hook = SetWindowsHookEx (WH_CBT, nativeWindowDestroyHookProc, nullptr, threadID);
+
+        if (hook == nullptr)
+            return;
+
+        registry.hooksByThread[threadID] = hook;
+    }
 
     auto& entries = registry.trackedWindows[hwnd];
 
@@ -353,10 +388,11 @@ inline void watchNativeWindowDestroy (void* owner, HWND hwnd, std::function<void
     if (existing != entries.end())
     {
         existing->onDestroy = std::move (onDestroy);
+        existing->threadID = threadID;
         return;
     }
 
-    entries.push_back ({ owner, std::move (onDestroy) });
+    entries.push_back ({ owner, std::move (onDestroy), threadID });
 }
 
 inline void unwatchNativeWindowDestroy (void* owner, HWND hwnd)
@@ -365,12 +401,19 @@ inline void unwatchNativeWindowDestroy (void* owner, HWND hwnd)
         return;
 
     auto& registry = getNativeWindowDestroyHookRegistry();
+    std::lock_guard<std::mutex> lock (registry.mutex);
     auto found = registry.trackedWindows.find (hwnd);
 
     if (found == registry.trackedWindows.end())
         return;
 
+    std::vector<DWORD> affectedThreadIDs;
     auto& entries = found->second;
+
+    for (const auto& entry : entries)
+        if (entry.owner == owner)
+            affectedThreadIDs.push_back (entry.threadID);
+
     entries.erase (std::remove_if (entries.begin(), entries.end(),
                                    [owner] (const auto& entry) { return entry.owner == owner; }),
                    entries.end());
@@ -378,7 +421,8 @@ inline void unwatchNativeWindowDestroy (void* owner, HWND hwnd)
     if (entries.empty())
         registry.trackedWindows.erase (found);
 
-    maybeRemoveNativeWindowDestroyHook();
+    for (auto threadID : affectedThreadIDs)
+        maybeRemoveNativeWindowDestroyHook (registry, threadID);
 }
 
 inline void unwatchAllNativeWindowDestroy (void* owner)
@@ -387,10 +431,17 @@ inline void unwatchAllNativeWindowDestroy (void* owner)
         return;
 
     auto& registry = getNativeWindowDestroyHookRegistry();
+    std::lock_guard<std::mutex> lock (registry.mutex);
+    std::vector<DWORD> affectedThreadIDs;
 
     for (auto i = registry.trackedWindows.begin(); i != registry.trackedWindows.end();)
     {
         auto& entries = i->second;
+
+        for (const auto& entry : entries)
+            if (entry.owner == owner)
+                affectedThreadIDs.push_back (entry.threadID);
+
         entries.erase (std::remove_if (entries.begin(), entries.end(),
                                        [owner] (const auto& entry) { return entry.owner == owner; }),
                        entries.end());
@@ -401,7 +452,8 @@ inline void unwatchAllNativeWindowDestroy (void* owner)
             ++i;
     }
 
-    maybeRemoveNativeWindowDestroyHook();
+    for (auto threadID : affectedThreadIDs)
+        maybeRemoveNativeWindowDestroyHook (registry, threadID);
 }
 #endif
 
@@ -503,83 +555,126 @@ inline bool parkChildView (WebViewParkingWindow& parkingWindow, void* child)
   #endif
 }
 
-#if CHOC_WINDOWS
-struct SpacebarPassthroughState
+inline bool isNativeChildViewAttachedToParentChain (void* parent, void* child)
 {
-    WNDPROC previousWndProc = nullptr;
-    std::function<bool()> shouldPassSpaceToHost;
-};
-
-inline std::unordered_map<HWND, SpacebarPassthroughState>& getSpacebarPassthroughStates()
-{
-    static std::unordered_map<HWND, SpacebarPassthroughState> states;
-    return states;
-}
-
-inline LRESULT CALLBACK spacebarPassthroughWndProc (HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
-{
-    auto& states = getSpacebarPassthroughStates();
-    const auto state = states.find (hwnd);
-
-    if (state != states.end())
-    {
-        const auto isSpaceKeyMessage = (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN
-                                     || msg == WM_KEYUP   || msg == WM_SYSKEYUP)
-                                    && wParam == VK_SPACE;
-
-        if (isSpaceKeyMessage && state->second.shouldPassSpaceToHost && state->second.shouldPassSpaceToHost())
-        {
-            if (auto parent = GetParent (hwnd))
-                PostMessage (parent, msg, wParam, lParam);
-
-            return 0;
-        }
-
-        if (state->second.previousWndProc != nullptr)
-            return CallWindowProc (state->second.previousWndProc, hwnd, msg, wParam, lParam);
-    }
-
-    return DefWindowProc (hwnd, msg, wParam, lParam);
-}
-#endif
-
-inline void installSpacebarPassthrough (void* view, std::function<bool()> shouldPassSpaceToHost)
-{
-    if (view == nullptr)
-        return;
+    if (parent == nullptr || child == nullptr)
+        return false;
 
   #if CHOC_WINDOWS
-    auto hwnd = static_cast<HWND> (view);
-    auto& state = getSpacebarPassthroughStates()[hwnd];
-    state.shouldPassSpaceToHost = std::move (shouldPassSpaceToHost);
+    auto parentHwnd = static_cast<HWND> (parent);
+    auto childHwnd = static_cast<HWND> (child);
 
-    if (state.previousWndProc == nullptr)
-        state.previousWndProc = reinterpret_cast<WNDPROC> (SetWindowLongPtr (hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR> (spacebarPassthroughWndProc)));
+    if (! IsWindow (parentHwnd) || ! IsWindow (childHwnd))
+        return false;
+
+    for (auto hwnd = GetParent (childHwnd); hwnd != nullptr; hwnd = GetParent (hwnd))
+        if (hwnd == parentHwnd)
+            return true;
+
+    return false;
   #else
-    (void) view;
-    (void) shouldPassSpaceToHost;
+    return true;
   #endif
 }
 
-inline void uninstallSpacebarPassthrough (void* view)
+#if CHOC_WINDOWS
+inline LPARAM makeSpacebarPassthroughLParam (bool keyDown, bool repeated)
 {
-    if (view == nullptr)
-        return;
+    constexpr auto scanCode = 0x39u;
+    auto flags = 1u | (scanCode << 16);
 
+    if (repeated || ! keyDown)
+        flags |= 1u << 30;
+
+    if (! keyDown)
+        flags |= 1u << 31;
+
+    return static_cast<LPARAM> (flags);
+}
+#endif
+
+inline bool installSpacebarPassthrough (choc::ui::WebView& webView, std::function<bool()> shouldPassSpaceToHost)
+{
   #if CHOC_WINDOWS
-    auto hwnd = static_cast<HWND> (view);
-    auto& states = getSpacebarPassthroughStates();
-    auto state = states.find (hwnd);
+    auto hwnd = static_cast<HWND> (webView.getViewHandle());
 
-    if (state != states.end())
+    if (hwnd == nullptr)
+        return false;
+
+    // FEATHER: WebView2 key events target transient Chrome_WidgetWin child
+    // HWNDs, so subclassing the outer WebView HWND misses spacebar input.
+    // A page-level bridge survives WebView2 child churn and reloads.
+    static constexpr auto bridgeScript = R"(
+        (() => {
+            if (window.__cmajSpacebarPassthroughInstalled)
+                return;
+
+            window.__cmajSpacebarPassthroughInstalled = true;
+
+            const isTextInput = element =>
+            {
+                if (! element)
+                    return false;
+
+                const tagName = element.tagName;
+                return tagName === "INPUT" || tagName === "TEXTAREA" || element.isContentEditable;
+            };
+
+            const passSpacebarToHost = event =>
+            {
+                if (event.code !== "Space" && event.key !== " ")
+                    return;
+
+                if (isTextInput (document.activeElement))
+                    return;
+
+                event.preventDefault();
+                event.stopPropagation();
+                window.cmaj_passSpacebarToHost?.(event.type, event.repeat === true);
+            };
+
+            window.addEventListener ("keydown", passSpacebarToHost, true);
+            window.addEventListener ("keyup", passSpacebarToHost, true);
+        })();
+    )";
+
+    if (! webView.bind ("cmaj_passSpacebarToHost",
+            [hwnd, shouldPassSpaceToHost = std::move (shouldPassSpaceToHost)] (const choc::value::ValueView& args) -> choc::value::Value
+            {
+                if (shouldPassSpaceToHost && ! shouldPassSpaceToHost())
+                    return {};
+
+                const auto eventType = args.isArray() && args.size() != 0 ? args[0].toString() : std::string {};
+                const auto isKeyUp = eventType == "keyup";
+                const auto repeated = args.isArray() && args.size() > 1 && args[1].getWithDefault<bool> (false);
+
+                if (auto parent = GetParent (hwnd))
+                    PostMessage (parent, isKeyUp ? WM_KEYUP : WM_KEYDOWN,
+                                 VK_SPACE, makeSpacebarPassthroughLParam (! isKeyUp, repeated));
+
+                return {};
+            }))
     {
-        if (state->second.previousWndProc != nullptr)
-            SetWindowLongPtr (hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR> (state->second.previousWndProc));
-
-        states.erase (state);
+        return false;
     }
+
+    const auto scriptAdded = webView.addInitScript (bridgeScript);
+    (void) scriptAdded;
+    webView.evaluateJavascript (bridgeScript);
+    return true;
   #else
-    (void) view;
+    (void) webView;
+    (void) shouldPassSpaceToHost;
+    return true;
+  #endif
+}
+
+inline void uninstallSpacebarPassthrough (choc::ui::WebView& webView)
+{
+  #if CHOC_WINDOWS
+    webView.unbind ("cmaj_passSpacebarToHost");
+  #else
+    (void) webView;
   #endif
 }
 

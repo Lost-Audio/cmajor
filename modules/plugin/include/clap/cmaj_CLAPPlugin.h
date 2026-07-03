@@ -170,9 +170,6 @@ struct Plugin::Impl
       #if CHOC_WINDOWS
         untrackGuiParentWindow();
       #endif
-
-        if (webview != nullptr)
-            cmaj::plugin::uninstallSpacebarPassthrough (webview->getWebView().getViewHandle());
     }
 
     void update (const std::filesystem::path& nextPathToManifest)
@@ -435,6 +432,7 @@ private:
 
         void* parent() const                             { return currentParent; }
         cmaj::PatchWebView& getPatchWebView() const      { return webview; }
+        bool isNativeViewAttached() const                { return cmaj::plugin::isNativeChildViewAttachedToParentChain (currentParent, nativeViewHandle()); }
 
         void* nativeViewHandle() const                  { return webview.getWebView().getViewHandle(); }
 
@@ -477,6 +475,8 @@ private:
     std::unique_ptr<cmaj::PatchWebView> editorOwnedWebView;
     std::optional<ViewHolder> editor;
     std::string webviewIdentity;
+    bool persistentSpacebarPassthroughInstalled = false;
+    bool editorOwnedSpacebarPassthroughInstalled = false;
     void* lastGuiParent = nullptr;
     std::shared_ptr<GuiAttachProbe> guiAttachProbe = std::make_shared<GuiAttachProbe>();
     GuiAttachState guiAttachState = GuiAttachState::detached;
@@ -518,7 +518,7 @@ private:
             guiSoftRecoveryAttempted = false;
             guiHardRecoveryAttempted = false;
 
-            cmaj::plugin::installSpacebarPassthrough (webview->getWebView().getViewHandle(),
+            persistentSpacebarPassthroughInstalled = cmaj::plugin::installSpacebarPassthrough (webview->getWebView(),
                 [this]
                 {
                     return webview != nullptr && ! webview->isTextInputFocused();
@@ -533,7 +533,7 @@ private:
         destroyEditorOwnedWebView();
         editorOwnedWebView = std::make_unique<cmaj::PatchWebView> (patch, findDefaultViewForPatch (patch));
 
-        cmaj::plugin::installSpacebarPassthrough (editorOwnedWebView->getWebView().getViewHandle(),
+        editorOwnedSpacebarPassthroughInstalled = cmaj::plugin::installSpacebarPassthrough (editorOwnedWebView->getWebView(),
             [this]
             {
                 return editorOwnedWebView != nullptr && ! editorOwnedWebView->isTextInputFocused();
@@ -546,9 +546,11 @@ private:
     {
         if (editorOwnedWebView != nullptr)
         {
-            cmaj::plugin::uninstallSpacebarPassthrough (editorOwnedWebView->getWebView().getViewHandle());
+            cmaj::plugin::uninstallSpacebarPassthrough (editorOwnedWebView->getWebView());
             editorOwnedWebView.reset();
         }
+
+        editorOwnedSpacebarPassthroughInstalled = false;
     }
 
     void destroyPersistentWebView()
@@ -556,11 +558,38 @@ private:
         if (webview != nullptr)
         {
             parkWebView (*webview);
-            cmaj::plugin::uninstallSpacebarPassthrough (webview->getWebView().getViewHandle());
+            cmaj::plugin::uninstallSpacebarPassthrough (webview->getWebView());
             webview.reset();
         }
 
         webviewIdentity.clear();
+        persistentSpacebarPassthroughInstalled = false;
+    }
+
+    void installSpacebarPassthrough (cmaj::PatchWebView& view)
+    {
+        if (webview.get() == std::addressof (view))
+        {
+            if (persistentSpacebarPassthroughInstalled)
+                return;
+
+            persistentSpacebarPassthroughInstalled = cmaj::plugin::installSpacebarPassthrough (view.getWebView(),
+                [this]
+                {
+                    return webview != nullptr && ! webview->isTextInputFocused();
+                });
+        }
+        else if (editorOwnedWebView.get() == std::addressof (view))
+        {
+            if (editorOwnedSpacebarPassthroughInstalled)
+                return;
+
+            editorOwnedSpacebarPassthroughInstalled = cmaj::plugin::installSpacebarPassthrough (view.getWebView(),
+                [this]
+                {
+                    return editorOwnedWebView != nullptr && ! editorOwnedWebView->isTextInputFocused();
+                });
+        }
     }
 
     cmaj::PatchWebView* getActiveGuiWebView() const
@@ -573,7 +602,25 @@ private:
 
     void updatePatchWebViewForLoadedPatch (bool forceReload)
     {
-        if (! shouldUsePersistentGuiView())
+        const auto usePersistentView = shouldUsePersistentGuiView();
+        const auto nextPersistentIdentity = usePersistentView ? cmaj::plugin::getPersistentViewIdentity (patch) : std::string {};
+        const auto persistentIdentityChanged = usePersistentView && webview != nullptr && webviewIdentity != nextPersistentIdentity;
+
+        if (editor)
+        {
+            const auto editorUsesExpectedView = usePersistentView
+                ? std::addressof (editor->getPatchWebView()) == webview.get()
+                : std::addressof (editor->getPatchWebView()) == editorOwnedWebView.get();
+
+            if (persistentIdentityChanged || ! editorUsesExpectedView)
+            {
+                const auto parent = editor->parent() != nullptr ? editor->parent() : lastGuiParent;
+                recreateEditorWebViewAfterHardRecovery (parent);
+                return;
+            }
+        }
+
+        if (! usePersistentView)
         {
             destroyPersistentWebView();
 
@@ -641,6 +688,8 @@ private:
         if (view == nullptr)
             return;
 
+        installSpacebarPassthrough (*view);
+
         guiAttachProbe->pingOK.store (false);
         guiAttachHealthStartMs = getMillisecondsNow();
         guiAttachState = recoveryAttempt ? GuiAttachState::recovering : GuiAttachState::attaching;
@@ -675,9 +724,14 @@ private:
         editor->refreshNativeAttachment (false);
 
         if (guiAttachState == GuiAttachState::attached)
-            return;
+        {
+            if (! editor->isNativeViewAttached())
+                startGuiAttachHealthProbe (true);
 
-        if (guiAttachProbe->pingOK.load())
+            return;
+        }
+
+        if (guiAttachProbe->pingOK.load() && editor->isNativeViewAttached())
         {
             guiAttachState = GuiAttachState::attached;
             guiSoftRecoveryAttempted = false;
@@ -738,11 +792,13 @@ private:
 
         if (shouldUsePersistentGuiView())
         {
+            destroyEditorOwnedWebView();
             destroyPersistentWebView();
             view = std::addressof (getOrCreatePatchWebView());
         }
         else
         {
+            destroyPersistentWebView();
             view = std::addressof (createEditorOwnedPatchWebView());
         }
 
@@ -1770,6 +1826,9 @@ inline void Plugin::Impl::clapParameters_flush (const clap_input_events_t* input
 // clap_plugin_gui_t
 inline bool Plugin::Impl::clapGui_isApiSupported (const char* api, bool floating)
 {
+    if (api == nullptr)
+        return false;
+
   #if CHOC_OSX
     return ! floating && std::string_view (api) == CLAP_WINDOW_API_COCOA;
   #elif CHOC_WINDOWS
@@ -1802,8 +1861,11 @@ inline bool Plugin::Impl::clapGui_getPreferredApi (const char** api, bool* float
   #endif
 }
 
-inline bool Plugin::Impl::clapGui_create (const char*, bool)
+inline bool Plugin::Impl::clapGui_create (const char* api, bool floating)
 {
+    if (! clapGui_isApiSupported (api, floating))
+        return false;
+
     editor.reset();
 
     cmaj::PatchWebView* view = nullptr;
