@@ -424,6 +424,7 @@ The repository follows the CHOC library C++ coding style. Key guidelines:
 
     void TestHost::nextFunction()
     ```
+
   - Bad:
     ```cpp
     bool TestHost::verifyProperties(const TestResult::PluginInfo& discovered,
@@ -434,3 +435,14 @@ The repository follows the CHOC library C++ coding style. Key guidelines:
     }
     void TestHost::nextFunction()
     ```
+
+## Feather fork rules (Lost Audio)
+
+This is Lost Audio's internal Cmajor fork, not a public product.
+Read `FEATHER-MODS.md` before modifying helpers, plugin wrappers, or embedded assets.
+After changing helper/plugin wrapper sources or embedded web assets, run `python tools/scripts/create_embedded_files.py`.
+Generated embedded files must not be hand-edited or hand-merged.
+Keep LF line endings; do not introduce CRLF on Windows.
+Any Feather edit inside an upstream-owned file needs a nearby `// FEATHER:` marker comment.
+Prefer new files over upstream file edits when the fork behaviour can be isolated.
+All implementation goes through the Codex/orchestrator workflow; git operations are performed by the orchestrator.
