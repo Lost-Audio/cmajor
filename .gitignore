@@ -1,3 +1,6 @@
 .DS_Store
 build
 .claude
+# FEATHER: fork-local build & orchestration dirs
+build-plugin/
+.feather/
