@@ -33,6 +33,7 @@
 #include <istream>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -281,11 +282,107 @@ struct WebViewParkingWindow
 // FEATHER: CBT destroy watching lets a parked WebView detach before the
 // host/JUCE editor native window is destroyed. The registry is process-wide so
 // a cross-thread editor teardown can remove callbacks before their owner dies.
+struct NativeWindowDestroyHookLifetimeToken
+{
+    bool tryBeginCallback()
+    {
+        std::lock_guard<std::mutex> lock (mutex);
+
+        if (! alive)
+            return false;
+
+        ++callbacksInFlight;
+        ++callbacksInFlightByThread[GetCurrentThreadId()];
+        return true;
+    }
+
+    void endCallback()
+    {
+        std::lock_guard<std::mutex> lock (mutex);
+
+        if (callbacksInFlight != 0)
+            --callbacksInFlight;
+
+        const auto threadID = GetCurrentThreadId();
+
+        if (auto found = callbacksInFlightByThread.find (threadID); found != callbacksInFlightByThread.end())
+        {
+            if (found->second > 1)
+                --found->second;
+            else
+                callbacksInFlightByThread.erase (found);
+        }
+
+        if (callbacksInFlight == 0)
+            callbacksDrained.notify_all();
+    }
+
+    void cancelAndWait()
+    {
+        std::unique_lock<std::mutex> lock (mutex);
+        alive = false;
+
+        // FEATHER: callbacks call unwatch while detaching. If a callback cancels
+        // its own registration, do not wait on itself.
+        if (callbacksInFlightByThread.find (GetCurrentThreadId()) != callbacksInFlightByThread.end())
+            return;
+
+        callbacksDrained.wait (lock, [this] { return callbacksInFlight == 0; });
+    }
+
+private:
+    std::mutex mutex;
+    std::condition_variable callbacksDrained;
+    bool alive = true;
+    uint32_t callbacksInFlight = 0;
+    std::unordered_map<DWORD, uint32_t> callbacksInFlightByThread;
+};
+
+struct NativeWindowDestroyHookCallbackScope
+{
+    explicit NativeWindowDestroyHookCallbackScope (std::shared_ptr<NativeWindowDestroyHookLifetimeToken> tokenToUse)
+        : token (std::move (tokenToUse))
+    {
+        if (token != nullptr && token->tryBeginCallback())
+            active = true;
+    }
+
+    ~NativeWindowDestroyHookCallbackScope()
+    {
+        if (! active)
+            return;
+
+        token->endCallback();
+    }
+
+    NativeWindowDestroyHookCallbackScope (const NativeWindowDestroyHookCallbackScope&) = delete;
+    NativeWindowDestroyHookCallbackScope& operator= (const NativeWindowDestroyHookCallbackScope&) = delete;
+
+    explicit operator bool() const { return active; }
+
+    std::shared_ptr<NativeWindowDestroyHookLifetimeToken> token;
+    bool active = false;
+};
+
+inline std::shared_ptr<NativeWindowDestroyHookLifetimeToken> createNativeWindowDestroyHookLifetimeToken()
+{
+    return std::make_shared<NativeWindowDestroyHookLifetimeToken>();
+}
+
+inline void cancelNativeWindowDestroyHookCallbacks (const std::shared_ptr<NativeWindowDestroyHookLifetimeToken>& lifetime)
+{
+    if (lifetime != nullptr)
+        lifetime->cancelAndWait();
+}
+
 struct NativeWindowDestroyHookEntry
 {
     void* owner = nullptr;
     std::function<void()> onDestroy;
+    std::weak_ptr<NativeWindowDestroyHookLifetimeToken> ownerLifetime;
+    std::shared_ptr<NativeWindowDestroyHookLifetimeToken> registrationLifetime;
     DWORD threadID = 0;
+    uint64_t generation = 0;
 };
 
 struct NativeWindowDestroyHookRegistry
@@ -293,6 +390,7 @@ struct NativeWindowDestroyHookRegistry
     std::mutex mutex;
     std::unordered_map<DWORD, HHOOK> hooksByThread;
     std::unordered_map<HWND, std::vector<NativeWindowDestroyHookEntry>> trackedWindows;
+    uint64_t nextGeneration = 1;
 };
 
 inline NativeWindowDestroyHookRegistry& getNativeWindowDestroyHookRegistry()
@@ -351,15 +449,28 @@ inline LRESULT CALLBACK nativeWindowDestroyHookProc (int code, WPARAM wParam, LP
     }
 
     for (auto& entry : callbacks)
-        if (entry.onDestroy)
+    {
+        auto ownerLifetime = entry.ownerLifetime.lock();
+
+        if (ownerLifetime == nullptr || entry.registrationLifetime == nullptr)
+            continue;
+
+        NativeWindowDestroyHookCallbackScope ownerCallback (std::move (ownerLifetime));
+        NativeWindowDestroyHookCallbackScope registrationCallback (entry.registrationLifetime);
+
+        if (ownerCallback && registrationCallback && entry.onDestroy)
             entry.onDestroy();
+    }
 
     return CallNextHookEx (hook, code, wParam, lParam);
 }
 
-inline void watchNativeWindowDestroy (void* owner, HWND hwnd, std::function<void()> onDestroy)
+inline void watchNativeWindowDestroy (void* owner, HWND hwnd,
+                                      const std::shared_ptr<NativeWindowDestroyHookLifetimeToken>& ownerLifetime,
+                                      const std::shared_ptr<NativeWindowDestroyHookLifetimeToken>& registrationLifetime,
+                                      std::function<void()> onDestroy)
 {
-    if (owner == nullptr || hwnd == nullptr)
+    if (owner == nullptr || hwnd == nullptr || ownerLifetime == nullptr || registrationLifetime == nullptr)
         return;
 
     auto& registry = getNativeWindowDestroyHookRegistry();
@@ -388,11 +499,14 @@ inline void watchNativeWindowDestroy (void* owner, HWND hwnd, std::function<void
     if (existing != entries.end())
     {
         existing->onDestroy = std::move (onDestroy);
+        existing->ownerLifetime = ownerLifetime;
+        existing->registrationLifetime = registrationLifetime;
         existing->threadID = threadID;
+        existing->generation = registry.nextGeneration++;
         return;
     }
 
-    entries.push_back ({ owner, std::move (onDestroy), threadID });
+    entries.push_back ({ owner, std::move (onDestroy), ownerLifetime, registrationLifetime, threadID, registry.nextGeneration++ });
 }
 
 inline void unwatchNativeWindowDestroy (void* owner, HWND hwnd)
@@ -401,28 +515,40 @@ inline void unwatchNativeWindowDestroy (void* owner, HWND hwnd)
         return;
 
     auto& registry = getNativeWindowDestroyHookRegistry();
-    std::lock_guard<std::mutex> lock (registry.mutex);
-    auto found = registry.trackedWindows.find (hwnd);
-
-    if (found == registry.trackedWindows.end())
-        return;
-
     std::vector<DWORD> affectedThreadIDs;
-    auto& entries = found->second;
+    std::vector<std::shared_ptr<NativeWindowDestroyHookLifetimeToken>> cancelledRegistrations;
 
-    for (const auto& entry : entries)
-        if (entry.owner == owner)
-            affectedThreadIDs.push_back (entry.threadID);
+    {
+        std::lock_guard<std::mutex> lock (registry.mutex);
+        auto found = registry.trackedWindows.find (hwnd);
 
-    entries.erase (std::remove_if (entries.begin(), entries.end(),
-                                   [owner] (const auto& entry) { return entry.owner == owner; }),
-                   entries.end());
+        if (found == registry.trackedWindows.end())
+            return;
 
-    if (entries.empty())
-        registry.trackedWindows.erase (found);
+        auto& entries = found->second;
 
-    for (auto threadID : affectedThreadIDs)
-        maybeRemoveNativeWindowDestroyHook (registry, threadID);
+        for (const auto& entry : entries)
+        {
+            if (entry.owner == owner)
+            {
+                affectedThreadIDs.push_back (entry.threadID);
+                cancelledRegistrations.push_back (entry.registrationLifetime);
+            }
+        }
+
+        entries.erase (std::remove_if (entries.begin(), entries.end(),
+                                       [owner] (const auto& entry) { return entry.owner == owner; }),
+                       entries.end());
+
+        if (entries.empty())
+            registry.trackedWindows.erase (found);
+
+        for (auto threadID : affectedThreadIDs)
+            maybeRemoveNativeWindowDestroyHook (registry, threadID);
+    }
+
+    for (auto& registration : cancelledRegistrations)
+        cancelNativeWindowDestroyHookCallbacks (registration);
 }
 
 inline void unwatchAllNativeWindowDestroy (void* owner)
@@ -431,29 +557,41 @@ inline void unwatchAllNativeWindowDestroy (void* owner)
         return;
 
     auto& registry = getNativeWindowDestroyHookRegistry();
-    std::lock_guard<std::mutex> lock (registry.mutex);
     std::vector<DWORD> affectedThreadIDs;
+    std::vector<std::shared_ptr<NativeWindowDestroyHookLifetimeToken>> cancelledRegistrations;
 
-    for (auto i = registry.trackedWindows.begin(); i != registry.trackedWindows.end();)
     {
-        auto& entries = i->second;
+        std::lock_guard<std::mutex> lock (registry.mutex);
 
-        for (const auto& entry : entries)
-            if (entry.owner == owner)
-                affectedThreadIDs.push_back (entry.threadID);
+        for (auto i = registry.trackedWindows.begin(); i != registry.trackedWindows.end();)
+        {
+            auto& entries = i->second;
 
-        entries.erase (std::remove_if (entries.begin(), entries.end(),
-                                       [owner] (const auto& entry) { return entry.owner == owner; }),
-                       entries.end());
+            for (const auto& entry : entries)
+            {
+                if (entry.owner == owner)
+                {
+                    affectedThreadIDs.push_back (entry.threadID);
+                    cancelledRegistrations.push_back (entry.registrationLifetime);
+                }
+            }
 
-        if (entries.empty())
-            i = registry.trackedWindows.erase (i);
-        else
-            ++i;
+            entries.erase (std::remove_if (entries.begin(), entries.end(),
+                                           [owner] (const auto& entry) { return entry.owner == owner; }),
+                           entries.end());
+
+            if (entries.empty())
+                i = registry.trackedWindows.erase (i);
+            else
+                ++i;
+        }
+
+        for (auto threadID : affectedThreadIDs)
+            maybeRemoveNativeWindowDestroyHook (registry, threadID);
     }
 
-    for (auto threadID : affectedThreadIDs)
-        maybeRemoveNativeWindowDestroyHook (registry, threadID);
+    for (auto& registration : cancelledRegistrations)
+        cancelNativeWindowDestroyHookCallbacks (registration);
 }
 #endif
 

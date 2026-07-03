@@ -162,6 +162,10 @@ struct Plugin::Impl
 
     ~Impl()
     {
+      #if CHOC_WINDOWS
+        cmaj::plugin::cancelNativeWindowDestroyHookCallbacks (nativeWindowDestroyHookLifetime);
+      #endif
+
         detachEditorToParking();
         editor.reset();
         destroyEditorOwnedWebView();
@@ -487,6 +491,8 @@ private:
 
   #if CHOC_WINDOWS
     HWND trackedGuiParentWindow = nullptr;
+    std::shared_ptr<cmaj::plugin::NativeWindowDestroyHookLifetimeToken> nativeWindowDestroyHookLifetime = cmaj::plugin::createNativeWindowDestroyHookLifetimeToken();
+    std::shared_ptr<cmaj::plugin::NativeWindowDestroyHookLifetimeToken> trackedGuiParentWindowDestroyHookRegistration;
   #endif
 
     static uint64_t getMillisecondsNow()
@@ -821,8 +827,10 @@ private:
 
         untrackGuiParentWindow();
         trackedGuiParentWindow = hwnd;
+        trackedGuiParentWindowDestroyHookRegistration = cmaj::plugin::createNativeWindowDestroyHookLifetimeToken();
 
-        cmaj::plugin::watchNativeWindowDestroy (this, hwnd,
+        cmaj::plugin::watchNativeWindowDestroy (this, hwnd, nativeWindowDestroyHookLifetime,
+            trackedGuiParentWindowDestroyHookRegistration,
             [this]
             {
                 // FEATHER: Host-native parent is going away before CLAP destroy;
@@ -833,9 +841,13 @@ private:
 
     void untrackGuiParentWindow()
     {
+        auto registration = trackedGuiParentWindowDestroyHookRegistration;
+
         if (trackedGuiParentWindow != nullptr)
             cmaj::plugin::unwatchNativeWindowDestroy (this, trackedGuiParentWindow);
 
+        cmaj::plugin::cancelNativeWindowDestroyHookCallbacks (registration);
+        trackedGuiParentWindowDestroyHookRegistration.reset();
         trackedGuiParentWindow = nullptr;
     }
   #endif

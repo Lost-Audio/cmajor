@@ -112,6 +112,10 @@ public:
 
     ~JUCEPluginBase() override
     {
+      #if JUCE_WINDOWS
+        cmaj::plugin::cancelNativeWindowDestroyHookCallbacks (nativeWindowDestroyHookLifetime);
+      #endif
+
         patch->patchChanged = [] {};
         patch->statusChanged = [] (const Patch::Status&) {};
         // FEATHER: Park and then destroy the processor-owned WebView before the
@@ -1264,8 +1268,10 @@ protected:
 
         untrackPatchWebViewEditorNativeWindow();
         trackedPatchWebViewEditorWindow = hwnd;
+        trackedPatchWebViewEditorWindowDestroyHookRegistration = cmaj::plugin::createNativeWindowDestroyHookLifetimeToken();
 
-        cmaj::plugin::watchNativeWindowDestroy (this, hwnd,
+        cmaj::plugin::watchNativeWindowDestroy (this, hwnd, nativeWindowDestroyHookLifetime,
+            trackedPatchWebViewEditorWindowDestroyHookRegistration,
             [this]
             {
                 // FEATHER: Last-chance native detach before JUCE/host destroys
@@ -1276,9 +1282,13 @@ protected:
 
     void untrackPatchWebViewEditorNativeWindow()
     {
+        auto registration = trackedPatchWebViewEditorWindowDestroyHookRegistration;
+
         if (trackedPatchWebViewEditorWindow != nullptr)
             cmaj::plugin::unwatchNativeWindowDestroy (this, trackedPatchWebViewEditorWindow);
 
+        cmaj::plugin::cancelNativeWindowDestroyHookCallbacks (registration);
+        trackedPatchWebViewEditorWindowDestroyHookRegistration.reset();
         trackedPatchWebViewEditorWindow = nullptr;
     }
   #endif
@@ -1295,6 +1305,8 @@ protected:
     static constexpr uint32_t patchWebViewAttachHealthTimeoutMs = 3000;
 
   #if JUCE_WINDOWS
+    std::shared_ptr<cmaj::plugin::NativeWindowDestroyHookLifetimeToken> nativeWindowDestroyHookLifetime = cmaj::plugin::createNativeWindowDestroyHookLifetimeToken();
+    std::shared_ptr<cmaj::plugin::NativeWindowDestroyHookLifetimeToken> trackedPatchWebViewEditorWindowDestroyHookRegistration;
     HWND trackedPatchWebViewEditorWindow = nullptr;
   #endif
 
