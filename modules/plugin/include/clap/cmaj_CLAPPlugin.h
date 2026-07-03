@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -158,6 +159,22 @@ struct Plugin::Impl
     Impl (Impl&&) = delete;
     Impl& operator= (const Impl&) = delete;
     Impl& operator= (Impl&&) = delete;
+
+    ~Impl()
+    {
+      #if CHOC_WINDOWS
+        cmaj::plugin::cancelNativeWindowDestroyHookCallbacks (nativeWindowDestroyHookLifetime);
+      #endif
+
+        detachEditorToParking();
+        editor.reset();
+        destroyEditorOwnedWebView();
+        destroyPersistentWebView();
+
+      #if CHOC_WINDOWS
+        untrackGuiParentWindow();
+      #endif
+    }
 
     void update (const std::filesystem::path& nextPathToManifest)
     {
@@ -316,11 +333,17 @@ private:
 
     struct ViewHolder
     {
-        ViewHolder (cmaj::Patch& patchToUse, std::optional<double> initialScaleFactorToUse)
-            : webview (std::make_unique<cmaj::PatchWebView> (patchToUse, findDefaultViewForPatch (patchToUse)))
+        ViewHolder (Impl& ownerToUse, cmaj::PatchWebView& webviewToUse, std::optional<double> initialScaleFactorToUse)
+            : owner (ownerToUse),
+              webview (webviewToUse)
         {
             if (initialScaleFactorToUse)
                 setScaleFactor (*initialScaleFactorToUse);
+        }
+
+        ~ViewHolder()
+        {
+            detachToParking();
         }
 
         struct Size
@@ -339,33 +362,85 @@ private:
 
         Size size() const
         {
-            return { scaled (webview->width),
-                     scaled (webview->height) };
+            return { scaled (webview.width),
+                     scaled (webview.height) };
         }
 
         bool setSize (const Size& sizeToUse)
         {
-            webview->width  = unscaled (sizeToUse.width);
-            webview->height = unscaled (sizeToUse.height);
+            webview.width  = unscaled (sizeToUse.width);
+            webview.height = unscaled (sizeToUse.height);
 
             return updateNativeViewSize();
         }
 
         bool resizable() const
         {
-            return webview->resizable;
+            return webview.resizable;
         }
 
         bool setParent (void* parent)
         {
-            if (! cmaj::plugin::addChildView (parent, nativeViewHandle()))
+            if (parent == nullptr)
                 return false;
+
+            if (currentParent != parent)
+            {
+                detachToParking();
+                currentParent = parent;
+                owner.lastGuiParent = parent;
+
+                if (! cmaj::plugin::addChildView (parent, nativeViewHandle()))
+                {
+                    currentParent = nullptr;
+                    return false;
+                }
+
+              #if CHOC_WINDOWS
+                owner.trackGuiParentWindow (static_cast<HWND> (parent));
+              #endif
+
+                owner.startGuiAttachHealthProbe (false);
+            }
 
             return updateNativeViewSize();
         }
 
+        void detachToParking()
+        {
+            if (currentParent == nullptr)
+                return;
+
+          #if CHOC_WINDOWS
+            owner.untrackGuiParentWindow();
+          #endif
+
+            currentParent = nullptr;
+            owner.parkWebView (webview);
+            owner.markGuiDetached();
+        }
+
+        void refreshNativeAttachment (bool recoveryAttempt)
+        {
+            if (currentParent == nullptr)
+                return;
+
+            if (cmaj::plugin::addChildView (currentParent, nativeViewHandle()))
+            {
+                updateNativeViewSize();
+
+                if (recoveryAttempt)
+                    owner.startGuiAttachHealthProbe (true);
+            }
+        }
+
+        void* parent() const                             { return currentParent; }
+        cmaj::PatchWebView& getPatchWebView() const      { return webview; }
+        bool isNativeViewAttached() const                { return cmaj::plugin::isNativeChildViewAttachedToParentChain (currentParent, nativeViewHandle()); }
+
+        void* nativeViewHandle() const                  { return webview.getWebView().getViewHandle(); }
+
     private:
-        void* nativeViewHandle() const                  { return webview->getWebView().getViewHandle(); }
         uint32_t scaled (uint32_t x) const              { return scaleFactor ? toIntegerPixel (*scaleFactor * x) : x; }
         uint32_t unscaled (uint32_t x) const            { return scaleFactor ? toIntegerPixel (*inverseScaleFactor * x) : x; }
         static uint32_t toIntegerPixel (double x)       { return static_cast<uint32_t> (0.5 + x); }
@@ -377,13 +452,405 @@ private:
             return cmaj::plugin::setViewSize (nativeViewHandle(), width, height);
         }
 
-        std::unique_ptr<cmaj::PatchWebView> webview;
+        Impl& owner;
+        cmaj::PatchWebView& webview;
+        void* currentParent = nullptr;
         std::optional<double> scaleFactor;
         std::optional<double> inverseScaleFactor;
     };
 
+    enum class GuiAttachState
+    {
+        detached,
+        attaching,
+        attached,
+        recovering
+    };
+
+    struct GuiAttachProbe
+    {
+        std::atomic<uint32_t> generation { 0 };
+        std::atomic<bool> pingOK { false };
+    };
+
     std::optional<double> cachedViewScaleFactor; // workaround Bitwig only passing the scale factor the first time the view is shown
+    cmaj::plugin::WebViewParkingWindow webviewParkingWindow;
+    std::unique_ptr<cmaj::PatchWebView> webview;
+    std::unique_ptr<cmaj::PatchWebView> editorOwnedWebView;
     std::optional<ViewHolder> editor;
+    std::string webviewIdentity;
+    bool persistentSpacebarPassthroughInstalled = false;
+    bool editorOwnedSpacebarPassthroughInstalled = false;
+    void* lastGuiParent = nullptr;
+    std::shared_ptr<GuiAttachProbe> guiAttachProbe = std::make_shared<GuiAttachProbe>();
+    GuiAttachState guiAttachState = GuiAttachState::detached;
+    uint64_t guiAttachHealthStartMs = 0;
+    bool guiSoftRecoveryAttempted = false;
+    bool guiHardRecoveryAttempted = false;
+    static constexpr uint64_t guiAttachHealthTimeoutMs = 3000;
+
+  #if CHOC_WINDOWS
+    HWND trackedGuiParentWindow = nullptr;
+    std::shared_ptr<cmaj::plugin::NativeWindowDestroyHookLifetimeToken> nativeWindowDestroyHookLifetime = cmaj::plugin::createNativeWindowDestroyHookLifetimeToken();
+    std::shared_ptr<cmaj::plugin::NativeWindowDestroyHookLifetimeToken> trackedGuiParentWindowDestroyHookRegistration;
+  #endif
+
+    static uint64_t getMillisecondsNow()
+    {
+        return static_cast<uint64_t> (std::chrono::duration_cast<std::chrono::milliseconds> (
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
+
+    bool shouldUsePersistentGuiView() const
+    {
+        return cmaj::plugin::shouldUsePersistentView (patch);
+    }
+
+    cmaj::PatchWebView& getOrCreatePatchWebView()
+    {
+        CMAJ_ASSERT (shouldUsePersistentGuiView());
+
+        const auto nextIdentity = cmaj::plugin::getPersistentViewIdentity (patch);
+
+        if (webview != nullptr && webviewIdentity != nextIdentity)
+            destroyPersistentWebView();
+
+        if (webview == nullptr)
+        {
+            // FEATHER: CLAP persistent view mirrors the JUCE processor-owned
+            // lifetime: recreate only when the loaded patch/view identity changes.
+            webview = std::make_unique<cmaj::PatchWebView> (patch, findDefaultViewForPatch (patch));
+            webviewIdentity = nextIdentity;
+            guiSoftRecoveryAttempted = false;
+            guiHardRecoveryAttempted = false;
+
+            persistentSpacebarPassthroughInstalled = cmaj::plugin::installSpacebarPassthrough (webview->getWebView(),
+                [this]
+                {
+                    return webview != nullptr && ! webview->isTextInputFocused();
+                });
+        }
+
+        return *webview;
+    }
+
+    cmaj::PatchWebView& createEditorOwnedPatchWebView()
+    {
+        destroyEditorOwnedWebView();
+        editorOwnedWebView = std::make_unique<cmaj::PatchWebView> (patch, findDefaultViewForPatch (patch));
+
+        editorOwnedSpacebarPassthroughInstalled = cmaj::plugin::installSpacebarPassthrough (editorOwnedWebView->getWebView(),
+            [this]
+            {
+                return editorOwnedWebView != nullptr && ! editorOwnedWebView->isTextInputFocused();
+            });
+
+        return *editorOwnedWebView;
+    }
+
+    void destroyEditorOwnedWebView()
+    {
+        if (editorOwnedWebView != nullptr)
+        {
+            cmaj::plugin::uninstallSpacebarPassthrough (editorOwnedWebView->getWebView());
+            editorOwnedWebView.reset();
+        }
+
+        editorOwnedSpacebarPassthroughInstalled = false;
+    }
+
+    void destroyPersistentWebView()
+    {
+        if (webview != nullptr)
+        {
+            parkWebView (*webview);
+            cmaj::plugin::uninstallSpacebarPassthrough (webview->getWebView());
+            webview.reset();
+        }
+
+        webviewIdentity.clear();
+        persistentSpacebarPassthroughInstalled = false;
+    }
+
+    void installSpacebarPassthrough (cmaj::PatchWebView& view)
+    {
+        if (webview.get() == std::addressof (view))
+        {
+            if (persistentSpacebarPassthroughInstalled)
+                return;
+
+            persistentSpacebarPassthroughInstalled = cmaj::plugin::installSpacebarPassthrough (view.getWebView(),
+                [this]
+                {
+                    return webview != nullptr && ! webview->isTextInputFocused();
+                });
+        }
+        else if (editorOwnedWebView.get() == std::addressof (view))
+        {
+            if (editorOwnedSpacebarPassthroughInstalled)
+                return;
+
+            editorOwnedSpacebarPassthroughInstalled = cmaj::plugin::installSpacebarPassthrough (view.getWebView(),
+                [this]
+                {
+                    return editorOwnedWebView != nullptr && ! editorOwnedWebView->isTextInputFocused();
+                });
+        }
+    }
+
+    cmaj::PatchWebView* getActiveGuiWebView() const
+    {
+        if (editor)
+            return std::addressof (editor->getPatchWebView());
+
+        return shouldUsePersistentGuiView() ? webview.get() : editorOwnedWebView.get();
+    }
+
+    void updatePatchWebViewForLoadedPatch (bool forceReload)
+    {
+        const auto usePersistentView = shouldUsePersistentGuiView();
+        const auto nextPersistentIdentity = usePersistentView ? cmaj::plugin::getPersistentViewIdentity (patch) : std::string {};
+        const auto persistentIdentityChanged = usePersistentView && webview != nullptr && webviewIdentity != nextPersistentIdentity;
+
+        if (editor)
+        {
+            const auto editorUsesExpectedView = usePersistentView
+                ? std::addressof (editor->getPatchWebView()) == webview.get()
+                : std::addressof (editor->getPatchWebView()) == editorOwnedWebView.get();
+
+            if (persistentIdentityChanged || ! editorUsesExpectedView)
+            {
+                const auto parent = editor->parent() != nullptr ? editor->parent() : lastGuiParent;
+                recreateEditorWebViewAfterHardRecovery (parent);
+                return;
+            }
+        }
+
+        if (! usePersistentView)
+        {
+            destroyPersistentWebView();
+
+            if (editorOwnedWebView != nullptr)
+                updatePatchWebViewInstance (*editorOwnedWebView, forceReload);
+
+            return;
+        }
+
+        destroyEditorOwnedWebView();
+
+        if (webview != nullptr && webviewIdentity != cmaj::plugin::getPersistentViewIdentity (patch))
+            destroyPersistentWebView();
+
+        if (webview == nullptr && editor)
+        {
+            recreateEditorWebViewAfterHardRecovery (lastGuiParent);
+            return;
+        }
+
+        if (webview != nullptr)
+            updatePatchWebViewInstance (*webview, forceReload);
+    }
+
+    void updatePatchWebViewInstance (cmaj::PatchWebView& view, bool forceReload)
+    {
+        view.setActive (patch.isPlayable());
+
+        if (! patch.isPlayable())
+            return;
+
+        view.update (findDefaultViewForPatch (patch));
+
+        if (editor && std::addressof (editor->getPatchWebView()) == std::addressof (view))
+            editor->setSize (editor->size());
+
+        if (forceReload)
+            view.reload();
+    }
+
+    void detachEditorToParking()
+    {
+        if (editor)
+            editor->detachToParking();
+        else if (auto* view = getActiveGuiWebView())
+            parkWebView (*view);
+    }
+
+    void parkWebView (cmaj::PatchWebView& view)
+    {
+        cmaj::plugin::parkChildView (webviewParkingWindow, view.getWebView().getViewHandle());
+    }
+
+    void markGuiDetached()
+    {
+        guiAttachProbe->pingOK.store (false);
+        guiAttachHealthStartMs = 0;
+        guiAttachState = GuiAttachState::detached;
+    }
+
+    void startGuiAttachHealthProbe (bool recoveryAttempt)
+    {
+        auto* view = getActiveGuiWebView();
+
+        if (view == nullptr)
+            return;
+
+        installSpacebarPassthrough (*view);
+
+        guiAttachProbe->pingOK.store (false);
+        guiAttachHealthStartMs = getMillisecondsNow();
+        guiAttachState = recoveryAttempt ? GuiAttachState::recovering : GuiAttachState::attaching;
+
+        const auto generation = guiAttachProbe->generation.fetch_add (1) + 1;
+        auto probe = guiAttachProbe;
+
+        view->getWebView().evaluateJavascript ("1",
+            [probe, generation] (const std::string& error, const choc::value::ValueView&)
+            {
+                if (error.empty() && probe->generation.load() == generation)
+                    probe->pingOK.store (true);
+            });
+
+        requestMainThreadCallback();
+    }
+
+    void requestMainThreadCallback()
+    {
+        if (host.request_callback != nullptr)
+            host.request_callback (std::addressof (host));
+    }
+
+    void tickGuiAttachHealth()
+    {
+        if (! editor)
+            return;
+
+        if (guiAttachState == GuiAttachState::detached)
+            return;
+
+        editor->refreshNativeAttachment (false);
+
+        if (guiAttachState == GuiAttachState::attached)
+        {
+            if (! editor->isNativeViewAttached())
+                startGuiAttachHealthProbe (true);
+
+            return;
+        }
+
+        if (guiAttachProbe->pingOK.load() && editor->isNativeViewAttached())
+        {
+            guiAttachState = GuiAttachState::attached;
+            guiSoftRecoveryAttempted = false;
+            guiHardRecoveryAttempted = false;
+            return;
+        }
+
+        if (guiAttachHealthStartMs == 0)
+            return;
+
+        const auto elapsedMs = getMillisecondsNow() - guiAttachHealthStartMs;
+
+        if (elapsedMs < guiAttachHealthTimeoutMs)
+        {
+            requestMainThreadCallback();
+            return;
+        }
+
+        const auto parent = editor->parent() != nullptr ? editor->parent() : lastGuiParent;
+
+        if (! guiSoftRecoveryAttempted)
+        {
+            guiSoftRecoveryAttempted = true;
+            guiAttachState = GuiAttachState::recovering;
+            editor->detachToParking();
+
+            if (parent != nullptr)
+                editor->setParent (parent);
+
+            requestMainThreadCallback();
+            return;
+        }
+
+        if (! guiHardRecoveryAttempted)
+        {
+            guiHardRecoveryAttempted = true;
+            guiAttachState = GuiAttachState::recovering;
+            recreateEditorWebViewAfterHardRecovery (parent);
+            requestMainThreadCallback();
+            return;
+        }
+
+        startGuiAttachHealthProbe (true);
+    }
+
+    void recreateEditorWebViewAfterHardRecovery (void* parent)
+    {
+        std::optional<ViewHolder::Size> previousSize;
+
+        if (editor)
+        {
+            previousSize = editor->size();
+            editor->detachToParking();
+            editor.reset();
+        }
+
+        cmaj::PatchWebView* view = nullptr;
+
+        if (shouldUsePersistentGuiView())
+        {
+            destroyEditorOwnedWebView();
+            destroyPersistentWebView();
+            view = std::addressof (getOrCreatePatchWebView());
+        }
+        else
+        {
+            destroyPersistentWebView();
+            view = std::addressof (createEditorOwnedPatchWebView());
+        }
+
+        editor.emplace (*this, *view, cachedViewScaleFactor);
+
+        if (previousSize)
+            editor->setSize (*previousSize);
+
+        if (parent != nullptr)
+            editor->setParent (parent);
+
+        updatePatchWebViewInstance (*view, false);
+    }
+
+  #if CHOC_WINDOWS
+    void trackGuiParentWindow (HWND hwnd)
+    {
+        if (trackedGuiParentWindow == hwnd)
+            return;
+
+        untrackGuiParentWindow();
+        trackedGuiParentWindow = hwnd;
+        trackedGuiParentWindowDestroyHookRegistration = cmaj::plugin::createNativeWindowDestroyHookLifetimeToken();
+
+        cmaj::plugin::watchNativeWindowDestroy (this, hwnd, nativeWindowDestroyHookLifetime,
+            trackedGuiParentWindowDestroyHookRegistration,
+            [this]
+            {
+                // FEATHER: Host-native parent is going away before CLAP destroy;
+                // park the WebView so WebView2 is not destroyed with the parent.
+                detachEditorToParking();
+            });
+    }
+
+    void untrackGuiParentWindow()
+    {
+        auto registration = trackedGuiParentWindowDestroyHookRegistration;
+
+        if (trackedGuiParentWindow != nullptr)
+            cmaj::plugin::unwatchNativeWindowDestroy (this, trackedGuiParentWindow);
+
+        cmaj::plugin::cancelNativeWindowDestroyHookCallbacks (registration);
+        trackedGuiParentWindowDestroyHookRegistration.reset();
+        trackedGuiParentWindow = nullptr;
+    }
+  #endif
 
     bool loadPatch (const std::filesystem::path& pathToManifest, FrequencyAndBlockSize frequencyAndBlockSize)
     {
@@ -420,6 +887,8 @@ private:
 
         if (! patch.isPlayable())
             return {};
+
+        updatePatchWebViewForLoadedPatch (true);
 
         flattenedInputChannelsScratchBuffer.resize (sumTotalChannelsAcrossAudioEndpoints (patch.getInputEndpoints()));
         flattenedOutputChannelsScratchBuffer.resize (sumTotalChannelsAcrossAudioEndpoints (patch.getOutputEndpoints()));
@@ -1157,6 +1626,7 @@ inline void Plugin::Impl::dispatchEvent (const clap_event_header_t& eventHeader)
 
 inline void Plugin::Impl::clapPlugin_onMainThread()
 {
+    tickGuiAttachHealth();
 }
 
 // clap_plugin_audio_ports_t
@@ -1368,6 +1838,9 @@ inline void Plugin::Impl::clapParameters_flush (const clap_input_events_t* input
 // clap_plugin_gui_t
 inline bool Plugin::Impl::clapGui_isApiSupported (const char* api, bool floating)
 {
+    if (api == nullptr)
+        return false;
+
   #if CHOC_OSX
     return ! floating && std::string_view (api) == CLAP_WINDOW_API_COCOA;
   #elif CHOC_WINDOWS
@@ -1400,15 +1873,40 @@ inline bool Plugin::Impl::clapGui_getPreferredApi (const char** api, bool* float
   #endif
 }
 
-inline bool Plugin::Impl::clapGui_create (const char*, bool)
+inline bool Plugin::Impl::clapGui_create (const char* api, bool floating)
 {
-    editor = ViewHolder (patch, cachedViewScaleFactor);
+    if (! clapGui_isApiSupported (api, floating))
+        return false;
+
+    editor.reset();
+
+    cmaj::PatchWebView* view = nullptr;
+
+    if (shouldUsePersistentGuiView())
+    {
+        destroyEditorOwnedWebView();
+        view = std::addressof (getOrCreatePatchWebView());
+    }
+    else
+    {
+        // FEATHER: "persistentView": false restores per-editor CLAP GUI
+        // lifetime; the WebView is destroyed in clapGui_destroy().
+        destroyPersistentWebView();
+        view = std::addressof (createEditorOwnedPatchWebView());
+    }
+
+    editor.emplace (*this, *view, cachedViewScaleFactor);
+    updatePatchWebViewInstance (*view, false);
     return true;
 }
 
 inline void Plugin::Impl::clapGui_destroy()
 {
-    editor = {};
+    detachEditorToParking();
+    editor.reset();
+
+    if (! shouldUsePersistentGuiView())
+        destroyEditorOwnedWebView();
 }
 
 inline bool Plugin::Impl::clapGui_setScale (double scaleFactor)
@@ -1452,6 +1950,9 @@ inline bool Plugin::Impl::clapGui_setSize (uint32_t width, uint32_t height)
 
 inline bool Plugin::Impl::clapGui_setParent (const clap_window_t* window)
 {
+    if (window == nullptr || ! editor)
+        return false;
+
     const auto toNativeHandle = [] (const auto* w)
     {
       #if CHOC_OSX
@@ -1464,7 +1965,7 @@ inline bool Plugin::Impl::clapGui_setParent (const clap_window_t* window)
       #endif
     };
 
-    return editor && editor->setParent (toNativeHandle (window));
+    return editor->setParent (toNativeHandle (window));
 }
 
 inline bool Plugin::Impl::clapGui_setTransient (const clap_window_t*)

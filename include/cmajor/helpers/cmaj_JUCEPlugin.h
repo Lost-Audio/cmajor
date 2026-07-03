@@ -31,9 +31,12 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
+#include <cstdint>
 #include <utility>
 #include <vector>
 #include "../../choc/choc/memory/choc_xxHash.h"
+#include "cmaj_PluginHelpers.h"
 #include "cmaj_PatchWebView.h"
 #include "cmaj_GeneratedCppEngine.h"
 
@@ -93,7 +96,7 @@ public:
             executeOrDeferToMessageThread ([this] { handlePatchChange(); });
         };
 
-        patch->statusChanged = [this] (const auto& s) { setStatusMessage (s.statusMessage, s.messageList.hasErrors()); };
+        patch->statusChanged = [this] (const auto& s) { setStatusMessageAsync (s.statusMessage, s.messageList.hasErrors()); };
 
         patch->handleOutputEvent = [this] (uint64_t frame, std::string_view endpointID, const choc::value::ValueView& v)
         {
@@ -109,7 +112,15 @@ public:
 
     ~JUCEPluginBase() override
     {
+      #if JUCE_WINDOWS
+        cmaj::plugin::cancelNativeWindowDestroyHookCallbacks (nativeWindowDestroyHookLifetime);
+      #endif
+
         patch->patchChanged = [] {};
+        patch->statusChanged = [] (const Patch::Status&) {};
+        // FEATHER: Park and then destroy the processor-owned WebView before the
+        // parking native window member is torn down.
+        destroyPatchWebView();
         patch->unload();
         patch.reset();
     }
@@ -557,6 +568,7 @@ protected:
         {
             patch->unload();
             setStatusMessage (message, isError);
+            updatePatchWebViewForCurrentPatch (false);
         }
     }
 
@@ -572,6 +584,8 @@ protected:
         changes.nonParameterStateChanged = true;
 
         setLatencySamples (newLatency);
+        if (getActiveEditor() == nullptr)
+            updatePatchWebViewForCurrentPatch (true);
         notifyEditorPatchChanged();
         updateHostDisplay (changes);
 
@@ -581,12 +595,40 @@ protected:
 
     void setStatusMessage (const std::string& newMessage, bool isError)
     {
+        if (! juce::MessageManager::getInstance()->isThisTheMessageThread())
+        {
+            setStatusMessageAsync (newMessage, isError);
+            return;
+        }
+
         if (statusMessage != newMessage || isStatusMessageError != isError)
         {
             statusMessage = newMessage;
             isStatusMessageError = isError;
+
+            deliverStatusMessageToPatchWebView();
             notifyEditorStatusMessageChanged();
         }
+    }
+
+    void setStatusMessageAsync (std::string newMessage, bool isError)
+    {
+        if (juce::MessageManager::getInstance()->isThisTheMessageThread())
+        {
+            setStatusMessage (newMessage, isError);
+            return;
+        }
+
+        auto m = std::make_unique<StatusMessageMessage>();
+        m->message = std::move (newMessage);
+        m->isError = isError;
+        postMessage (m.release());
+    }
+
+    void deliverStatusMessageToPatchWebView()
+    {
+        if (patchWebView != nullptr && ! statusMessage.empty())
+            patchWebView->setStatusMessage (statusMessage);
     }
 
     void notifyEditorStatusMessageChanged()
@@ -777,10 +819,18 @@ protected:
         juce::ValueTree newState;
     };
 
+    struct StatusMessageMessage  : public juce::Message
+    {
+        std::string message;
+        bool isError = false;
+    };
+
     void handleMessage (const juce::Message& message) override
     {
-        if (auto m = dynamic_cast<const NewStateMessage*> (&message))
-            setNewState (const_cast<NewStateMessage*> (m)->newState);
+        if (auto newStateMessage = dynamic_cast<const NewStateMessage*> (&message))
+            setNewState (const_cast<NewStateMessage*> (newStateMessage)->newState);
+        else if (auto statusMessageUpdate = dynamic_cast<const StatusMessageMessage*> (&message))
+            setStatusMessage (statusMessageUpdate->message, statusMessageUpdate->isError);
     }
 
     void handleOutputEvent (uint64_t, std::string_view endpointID, const choc::value::ValueView& value)
@@ -1035,17 +1085,432 @@ protected:
 
     std::vector<Parameter*> parameters;
 
+    static constexpr int defaultEditorWidth = 500, defaultEditorHeight = 400;
+
+    cmaj::PatchManifest::View derivePatchViewSize() const
+    {
+        auto view = cmaj::PatchManifest::View
+        {
+            choc::json::create ("width", lastEditorWidth,
+                                "height", lastEditorHeight)
+        };
+
+        if (auto manifest = patch->getManifest())
+            if (auto v = manifest->findDefaultView())
+                if (lastEditorWidth == 0 && lastEditorHeight == 0)
+                    view = *v;
+
+        if (view.getWidth()  == 0)  view.view.setMember ("width", defaultEditorWidth);
+        if (view.getHeight() == 0)  view.view.setMember ("height", defaultEditorHeight);
+
+        return view;
+    }
+
+    bool shouldUsePersistentPatchWebView() const
+    {
+        return cmaj::plugin::shouldUsePersistentView (*patch);
+    }
+
+    cmaj::PatchWebView& getOrCreatePatchWebView()
+    {
+        CMAJ_ASSERT (shouldUsePersistentPatchWebView());
+
+        const auto nextIdentity = cmaj::plugin::getPersistentViewIdentity (*patch);
+
+        if (patchWebView != nullptr && patchWebViewIdentity != nextIdentity)
+            destroyPatchWebView();
+
+        if (patchWebView == nullptr)
+        {
+            // FEATHER: Processor-owned WebView. This is reused while the same
+            // patch rebuilds, and recreated only when the manifest/view identity changes.
+            patchWebView = std::make_unique<cmaj::PatchWebView> (*patch, derivePatchViewSize());
+            patchWebViewIdentity = nextIdentity;
+            patchWebViewSoftRecoveryAttempted = false;
+            patchWebViewHardRecoveryAttempted = false;
+
+            patchWebViewSpacebarPassthroughInstalled = cmaj::plugin::installSpacebarPassthrough (patchWebView->getWebView(),
+                [this]
+                {
+                    return patchWebView != nullptr && ! patchWebView->isTextInputFocused();
+                });
+        }
+
+        return *patchWebView;
+    }
+
+    void updatePatchWebViewForCurrentPatch (bool forceReload)
+    {
+        if (! shouldUsePersistentPatchWebView())
+        {
+            destroyPatchWebView();
+            return;
+        }
+
+        if (patchWebView != nullptr && patchWebViewIdentity != cmaj::plugin::getPersistentViewIdentity (*patch))
+            destroyPatchWebView();
+
+        if (patchWebView == nullptr)
+            return;
+
+        if (static_cast<DerivedType&> (*this).isViewVisible())
+        {
+            patchWebView->setActive (true);
+            patchWebView->update (derivePatchViewSize());
+
+            if (forceReload)
+                patchWebView->reload();
+        }
+        else
+        {
+            patchWebView->setActive (false);
+
+            if (! statusMessage.empty())
+                patchWebView->setStatusMessage (statusMessage);
+        }
+    }
+
+    enum class PatchWebViewAttachState
+    {
+        detached,
+        attaching,
+        attached,
+        recovering
+    };
+
+    struct PatchWebViewAttachProbe
+    {
+        std::atomic<uint32_t> generation { 0 };
+        std::atomic<bool> pingOK { false };
+    };
+
+    void clearPatchWebViewAttachHealthState()
+    {
+        patchWebViewAttachProbe->pingOK.store (false);
+        patchWebViewAttachHealthStartMs = 0;
+    }
+
+    void startPatchWebViewAttachHealthProbe (bool recoveryAttempt)
+    {
+        if (patchWebView == nullptr)
+            return;
+
+        installPersistentPatchWebViewSpacebarPassthrough();
+
+        patchWebViewAttachProbe->pingOK.store (false);
+        patchWebViewAttachHealthStartMs = juce::Time::getMillisecondCounter();
+        patchWebViewAttachState = recoveryAttempt ? PatchWebViewAttachState::recovering
+                                                  : PatchWebViewAttachState::attaching;
+
+        const auto generation = patchWebViewAttachProbe->generation.fetch_add (1) + 1;
+        auto probe = patchWebViewAttachProbe;
+
+        const auto accepted = patchWebView->getWebView().evaluateJavascript ("1",
+            [probe, generation] (const std::string& error, const choc::value::ValueView&)
+            {
+                if (error.empty() && probe->generation.load() == generation)
+                    probe->pingOK.store (true);
+            });
+
+        if (! accepted)
+            patchWebViewAttachHealthStartMs = juce::Time::getMillisecondCounter();
+    }
+
+    void markPatchWebViewNativeAttached (bool recoveryAttempt)
+    {
+        startPatchWebViewAttachHealthProbe (recoveryAttempt);
+    }
+
+    void detachPatchWebViewFromEditor()
+    {
+        clearPatchWebViewAttachHealthState();
+        patchWebViewAttachState = PatchWebViewAttachState::detached;
+
+      #if JUCE_WINDOWS
+        untrackPatchWebViewEditorNativeWindow();
+      #endif
+
+        if (patchWebView != nullptr)
+            cmaj::plugin::parkChildView (patchWebViewParkingWindow, patchWebView->getWebView().getViewHandle());
+    }
+
+    void destroyPatchWebView()
+    {
+        detachPatchWebViewFromEditor();
+
+        if (patchWebView != nullptr)
+        {
+            cmaj::plugin::uninstallSpacebarPassthrough (patchWebView->getWebView());
+            patchWebView.reset();
+        }
+
+        patchWebViewIdentity.clear();
+        patchWebViewSpacebarPassthroughInstalled = false;
+    }
+
+    void installPersistentPatchWebViewSpacebarPassthrough()
+    {
+        if (patchWebView == nullptr || patchWebViewSpacebarPassthroughInstalled)
+            return;
+
+        patchWebViewSpacebarPassthroughInstalled = cmaj::plugin::installSpacebarPassthrough (patchWebView->getWebView(),
+            [this]
+            {
+                return patchWebView != nullptr && ! patchWebView->isTextInputFocused();
+            });
+    }
+
+  #if JUCE_WINDOWS
+    void trackPatchWebViewEditorNativeWindow (HWND hwnd)
+    {
+        if (trackedPatchWebViewEditorWindow == hwnd)
+            return;
+
+        untrackPatchWebViewEditorNativeWindow();
+        trackedPatchWebViewEditorWindow = hwnd;
+        trackedPatchWebViewEditorWindowDestroyHookRegistration = cmaj::plugin::createNativeWindowDestroyHookLifetimeToken();
+
+        cmaj::plugin::watchNativeWindowDestroy (this, hwnd, nativeWindowDestroyHookLifetime,
+            trackedPatchWebViewEditorWindowDestroyHookRegistration,
+            [this]
+            {
+                // FEATHER: Last-chance native detach before JUCE/host destroys
+                // the editor HWND and takes the WebView2 child down with it.
+                detachPatchWebViewFromEditor();
+            });
+    }
+
+    void untrackPatchWebViewEditorNativeWindow()
+    {
+        auto registration = trackedPatchWebViewEditorWindowDestroyHookRegistration;
+
+        if (trackedPatchWebViewEditorWindow != nullptr)
+            cmaj::plugin::unwatchNativeWindowDestroy (this, trackedPatchWebViewEditorWindow);
+
+        cmaj::plugin::cancelNativeWindowDestroyHookCallbacks (registration);
+        trackedPatchWebViewEditorWindowDestroyHookRegistration.reset();
+        trackedPatchWebViewEditorWindow = nullptr;
+    }
+  #endif
+
+    cmaj::plugin::WebViewParkingWindow patchWebViewParkingWindow;
+    std::unique_ptr<cmaj::PatchWebView> patchWebView;
+    std::string patchWebViewIdentity;
+    std::shared_ptr<PatchWebViewAttachProbe> patchWebViewAttachProbe = std::make_shared<PatchWebViewAttachProbe>();
+    PatchWebViewAttachState patchWebViewAttachState = PatchWebViewAttachState::detached;
+    uint32_t patchWebViewAttachHealthStartMs = 0;
+    bool patchWebViewSoftRecoveryAttempted = false;
+    bool patchWebViewHardRecoveryAttempted = false;
+    bool patchWebViewSpacebarPassthroughInstalled = false;
+    static constexpr uint32_t patchWebViewAttachHealthTimeoutMs = 3000;
+
+  #if JUCE_WINDOWS
+    std::shared_ptr<cmaj::plugin::NativeWindowDestroyHookLifetimeToken> nativeWindowDestroyHookLifetime = cmaj::plugin::createNativeWindowDestroyHookLifetimeToken();
+    std::shared_ptr<cmaj::plugin::NativeWindowDestroyHookLifetimeToken> trackedPatchWebViewEditorWindowDestroyHookRegistration;
+    HWND trackedPatchWebViewEditorWindow = nullptr;
+  #endif
+
+    struct PersistentWebViewHolderBase  : public juce::Component
+    {
+        virtual void refreshNativeAttachment (bool recoveryAttempt) = 0;
+        virtual void detachNativeView() = 0;
+        virtual bool isNativeViewAttached() const = 0;
+    };
+
+    static std::unique_ptr<PersistentWebViewHolderBase> createPersistentWebViewHolder (DerivedType& owner, choc::ui::WebView& webView)
+    {
+      #if JUCE_WINDOWS || JUCE_MAC || defined (__APPLE__)
+        struct Holder  : public PersistentWebViewHolderBase
+        {
+            Holder (DerivedType& p, choc::ui::WebView& v)
+                : owner (p),
+                  nativeView (v.getViewHandle()),
+                  movementWatcher (*this)
+            {
+            }
+
+            ~Holder() override
+            {
+                detachNativeView();
+            }
+
+            void paint (juce::Graphics&) override {}
+
+            void refreshNativeAttachment (bool recoveryAttempt) override
+            {
+                updateNativeParent (recoveryAttempt);
+                updateNativeBounds();
+            }
+
+            void detachNativeView() override
+            {
+                if (nativeView == nullptr || currentPeerWindow == nullptr)
+                    return;
+
+              #if JUCE_WINDOWS
+                owner.untrackPatchWebViewEditorNativeWindow();
+              #endif
+
+                currentPeerWindow = nullptr;
+                owner.detachPatchWebViewFromEditor();
+            }
+
+            bool isNativeViewAttached() const override
+            {
+              #if JUCE_WINDOWS
+                return cmaj::plugin::isNativeChildViewAttachedToParentChain (currentPeerWindow, nativeView);
+              #else
+                return nativeView != nullptr && currentPeerWindow != nullptr;
+              #endif
+            }
+
+        private:
+            struct MovementWatcher  : public juce::ComponentMovementWatcher
+            {
+                MovementWatcher (Holder& h) : juce::ComponentMovementWatcher (&h), holder (h) {}
+
+                void componentMovedOrResized (bool, bool) override  { holder.updateNativeBounds(); }
+                void componentPeerChanged() override                { holder.refreshNativeAttachment (false); }
+                void componentVisibilityChanged() override          { holder.refreshNativeAttachment (false); }
+
+                Holder& holder;
+            };
+
+            void updateNativeParent (bool recoveryAttempt)
+            {
+                if (nativeView == nullptr)
+                    return;
+
+                auto* peer = isShowing() ? getTopLevelComponent()->getPeer() : nullptr;
+                auto* peerWindow = peer != nullptr ? peer->getNativeHandle() : nullptr;
+
+                if (currentPeerWindow == peerWindow
+                      && (peerWindow == nullptr || isNativeViewAttached()))
+                {
+                    return;
+                }
+
+                detachNativeView();
+                currentPeerWindow = peerWindow;
+
+                if (currentPeerWindow == nullptr)
+                    return;
+
+              #if JUCE_WINDOWS
+                auto hwnd = static_cast<HWND> (nativeView);
+                auto windowFlags = GetWindowLongPtr (hwnd, GWL_STYLE);
+                using FlagType = decltype (windowFlags);
+
+                windowFlags &= ~static_cast<FlagType> (WS_POPUP);
+                windowFlags |= static_cast<FlagType> (WS_CHILD);
+                SetWindowLongPtr (hwnd, GWL_STYLE, windowFlags);
+
+                if (! cmaj::plugin::addChildView (currentPeerWindow, nativeView))
+                {
+                    currentPeerWindow = nullptr;
+                    return;
+                }
+
+                owner.trackPatchWebViewEditorNativeWindow (static_cast<HWND> (currentPeerWindow));
+              #else
+                // FEATHER: TODO(mac-validate) verify this direct NSView reparent
+                // against JUCE's NSViewComponent behavior in AU and VST3 hosts.
+                if (! cmaj::plugin::addChildView (currentPeerWindow, nativeView))
+                {
+                    currentPeerWindow = nullptr;
+                    return;
+                }
+              #endif
+
+                owner.markPatchWebViewNativeAttached (recoveryAttempt);
+            }
+
+            void updateNativeBounds()
+            {
+                if (nativeView == nullptr || currentPeerWindow == nullptr)
+                    return;
+
+                if (auto* peer = getTopLevelComponent()->getPeer())
+                {
+                    auto area = peer->getAreaCoveredBy (*this);
+
+                  #if JUCE_WINDOWS
+                    area = (area.toFloat() * peer->getPlatformScaleFactor()).getSmallestIntegerContainer();
+                  #else
+                    // FEATHER: TODO(mac-validate) confirm AppKit point coordinates
+                    // match JUCE's getAreaCoveredBy() output for plugin editor peers.
+                  #endif
+
+                    cmaj::plugin::setViewFrame (nativeView, area.getX(), area.getY(),
+                                                static_cast<uint32_t> (std::max (1, area.getWidth())),
+                                                static_cast<uint32_t> (std::max (1, area.getHeight())));
+
+                  #if JUCE_WINDOWS
+                    InvalidateRect (static_cast<HWND> (nativeView), nullptr, TRUE);
+                  #endif
+                }
+            }
+
+            DerivedType& owner;
+            void* nativeView = nullptr;
+            void* currentPeerWindow = nullptr;
+            MovementWatcher movementWatcher;
+
+            JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (Holder)
+        };
+
+        return std::make_unique<Holder> (owner, webView);
+      #else
+        struct Holder  : public PersistentWebViewHolderBase
+        {
+            Holder (DerivedType& p, choc::ui::WebView& v)
+                : owner (p),
+                  child (choc::ui::createJUCEWebViewHolder (v))
+            {
+                if (child != nullptr)
+                    addAndMakeVisible (*child);
+            }
+
+            ~Holder() override { detachNativeView(); }
+
+            void resized() override
+            {
+                if (child != nullptr)
+                    child->setBounds (getLocalBounds());
+            }
+
+            void refreshNativeAttachment (bool recoveryAttempt) override
+            {
+                owner.markPatchWebViewNativeAttached (recoveryAttempt);
+            }
+
+            void detachNativeView() override
+            {
+                child.reset();
+                owner.detachPatchWebViewFromEditor();
+            }
+
+            bool isNativeViewAttached() const override
+            {
+                return child != nullptr && child->isShowing();
+            }
+
+            DerivedType& owner;
+            std::unique_ptr<juce::Component> child;
+        };
+
+        return std::make_unique<Holder> (owner, webView);
+      #endif
+    }
+
     //==============================================================================
     //==============================================================================
-    struct Editor  : public juce::AudioProcessorEditor
+    struct Editor  : public juce::AudioProcessorEditor,
+                     private juce::Timer
     {
         Editor (DerivedType& p)
-            : juce::AudioProcessorEditor (p), owner (p),
-              patchWebView (std::make_unique<cmaj::PatchWebView> (*p.patch, derivePatchViewSize (p)))
+            : juce::AudioProcessorEditor (p), owner (p)
         {
-            patchWebViewHolder = choc::ui::createJUCEWebViewHolder (patchWebView->getWebView());
-            patchWebViewHolder->setSize ((int) patchWebView->width, (int) patchWebView->height);
-
             setResizeLimits (250, 160, 32768, 32768);
 
             lookAndFeel.setColour (juce::TextEditor::outlineColourId, juce::Colours::transparentBlack);
@@ -1057,6 +1522,8 @@ protected:
                         lookAndFeel.setColour (juce::ResizableWindow::backgroundColourId, juce::Colour::fromString (colour));
 
             setLookAndFeel (&lookAndFeel);
+
+            bindPatchWebViewHolder (false);
 
             extraComp = owner.createExtraComponent();
 
@@ -1072,68 +1539,204 @@ protected:
 
         ~Editor() override
         {
+            stopTimer();
             owner.editorBeingDeleted (this);
             setLookAndFeel (nullptr);
+            detachAndResetPatchWebViewHolder();
+            destroyLocalPatchWebView();
+        }
+
+        void bindPatchWebViewHolder (bool forceNewLocalView)
+        {
+            const auto usePersistent = owner.shouldUsePersistentPatchWebView();
+            const auto persistentIdentityChanged = usePersistent
+                                                && owner.patchWebView != nullptr
+                                                && owner.patchWebViewIdentity != cmaj::plugin::getPersistentViewIdentity (*owner.patch);
+
+            if (patchWebViewHolder != nullptr
+                  && usingPersistentView == usePersistent
+                  && ! persistentIdentityChanged
+                  && !(forceNewLocalView && ! usePersistent))
+            {
+                return;
+            }
+
+            detachAndResetPatchWebViewHolder();
+
+            usingPersistentView = usePersistent;
+
+            if (usingPersistentView)
+            {
+                destroyLocalPatchWebView();
+                auto& view = owner.getOrCreatePatchWebView();
+                patchWebViewHolder = createPersistentWebViewHolder (owner, view.getWebView());
+                configurePatchWebViewHolder (view);
+                startTimerHz (30);
+            }
+            else
+            {
+                // FEATHER: "persistentView": false restores upstream semantics:
+                // the editor owns the PatchWebView and closing the editor destroys it.
+                destroyLocalPatchWebView();
+                localPatchWebView = std::make_unique<cmaj::PatchWebView> (*owner.patch, owner.derivePatchViewSize());
+                installSpacebarPassthrough (*localPatchWebView);
+                patchWebViewHolder = choc::ui::createJUCEWebViewHolder (localPatchWebView->getWebView());
+                configurePatchWebViewHolder (*localPatchWebView);
+                owner.destroyPatchWebView();
+                startTimerHz (30);
+            }
+        }
+
+        void configurePatchWebViewHolder (cmaj::PatchWebView& view)
+        {
+            if (patchWebViewHolder == nullptr)
+                return;
+
+            patchWebViewHolder->setSize ((int) view.width, (int) view.height);
+            patchWebViewHolder->setWantsKeyboardFocus (false);
+            patchWebViewHolder->setMouseClickGrabsKeyboardFocus (false);
+        }
+
+        void installSpacebarPassthrough (cmaj::PatchWebView& view)
+        {
+            if (localPatchWebViewSpacebarPassthroughInstalled)
+                return;
+
+            localPatchWebViewSpacebarPassthroughInstalled = cmaj::plugin::installSpacebarPassthrough (view.getWebView(),
+                [this, &view]
+                {
+                    return localPatchWebView.get() == std::addressof (view) && ! view.isTextInputFocused();
+                });
+        }
+
+        void destroyLocalPatchWebView()
+        {
+            if (localPatchWebView != nullptr)
+            {
+                cmaj::plugin::uninstallSpacebarPassthrough (localPatchWebView->getWebView());
+                localPatchWebView.reset();
+            }
+
+            localPatchWebViewSpacebarPassthroughInstalled = false;
+        }
+
+        void detachAndResetPatchWebViewHolder()
+        {
+            if (auto* persistentHolder = getPersistentHolder())
+                persistentHolder->detachNativeView();
+            else if (usingPersistentView)
+                owner.detachPatchWebViewFromEditor();
+
+            removeChildComponent (patchWebViewHolder.get());
             patchWebViewHolder.reset();
-            patchWebView.reset();
         }
 
         void statusMessageChanged()
         {
             owner.refreshExtraComp (extraComp.get());
-            patchWebView->setStatusMessage (owner.statusMessage);
-        }
 
-        static cmaj::PatchManifest::View derivePatchViewSize (const DerivedType& owner)
-        {
-            auto view = cmaj::PatchManifest::View
-            {
-                choc::json::create ("width", owner.lastEditorWidth,
-                                    "height", owner.lastEditorHeight)
-            };
-
-            if (auto manifest = owner.patch->getManifest())
-                if (auto v = manifest->findDefaultView())
-                    if (owner.lastEditorWidth == 0 && owner.lastEditorHeight == 0)
-                        view = *v;
-
-            if (view.getWidth()  == 0)  view.view.setMember ("width", defaultWidth);
-            if (view.getHeight() == 0)  view.view.setMember ("height", defaultHeight);
-
-            return view;
+            if (! owner.statusMessage.empty())
+                if (auto* view = getCurrentPatchWebView())
+                    view->setStatusMessage (owner.statusMessage);
         }
 
         void onPatchChanged (bool forceReload = true)
         {
+            bindPatchWebViewHolder (forceReload && ! owner.shouldUsePersistentPatchWebView());
+
+            if (patchWebViewHolder == nullptr)
+                return;
+
             if (owner.isViewVisible())
             {
-                patchWebView->setActive (true);
-                patchWebView->update (derivePatchViewSize (owner));
-                patchWebViewHolder->setSize ((int) patchWebView->width, (int) patchWebView->height);
+                auto& view = getOrCreateCurrentPatchWebView (forceReload);
+                view.setActive (true);
+                view.update (owner.derivePatchViewSize());
+                patchWebViewHolder->setSize ((int) view.width, (int) view.height);
 
-                setResizable (patchWebView->resizable, false);
+                setResizable (view.resizable, false);
 
                 addAndMakeVisible (*patchWebViewHolder);
                 childBoundsChanged (nullptr);
             }
             else
             {
+                patchWebViewHolder->setVisible (false);
                 removeChildComponent (patchWebViewHolder.get());
 
-                patchWebView->setActive (false);
-                patchWebViewHolder->setVisible (false);
+                if (usingPersistentView)
+                    owner.detachPatchWebViewFromEditor();
+                else if (localPatchWebView != nullptr)
+                    localPatchWebView->setActive (false);
 
-                setSize (defaultWidth, defaultHeight);
+                setSize (defaultEditorWidth, defaultEditorHeight);
                 setResizable (true, false);
             }
 
-            if (forceReload)
-                patchWebView->reload();
+            if (usingPersistentView)
+                owner.updatePatchWebViewForCurrentPatch (forceReload);
+            else if (forceReload && localPatchWebView != nullptr)
+                localPatchWebView->reload();
+        }
+
+        cmaj::PatchWebView& getOrCreateCurrentPatchWebView (bool forceReload)
+        {
+            if (usingPersistentView)
+                return owner.getOrCreatePatchWebView();
+
+            (void) forceReload;
+
+            if (localPatchWebView == nullptr)
+            {
+                bindPatchWebViewHolder (true);
+                CMAJ_ASSERT (localPatchWebView != nullptr);
+            }
+
+            return *localPatchWebView;
+        }
+
+        cmaj::PatchWebView* getCurrentPatchWebView() const
+        {
+            return usingPersistentView ? owner.patchWebView.get() : localPatchWebView.get();
+        }
+
+        PersistentWebViewHolderBase* getPersistentHolder() const
+        {
+            return dynamic_cast<PersistentWebViewHolderBase*> (patchWebViewHolder.get());
+        }
+
+        void recreatePersistentPatchWebViewAfterHardRecovery()
+        {
+            if (! usingPersistentView)
+                return;
+
+            detachAndResetPatchWebViewHolder();
+            owner.destroyPatchWebView();
+
+            auto& view = owner.getOrCreatePatchWebView();
+            patchWebViewHolder = createPersistentWebViewHolder (owner, view.getWebView());
+            configurePatchWebViewHolder (view);
+
+            if (owner.isViewVisible())
+                addAndMakeVisible (*patchWebViewHolder);
+
+            resized();
+
+            if (auto* persistentHolder = getPersistentHolder())
+                persistentHolder->refreshNativeAttachment (true);
+        }
+
+        void timerCallback() override
+        {
+            if (usingPersistentView)
+                owner.tickPatchWebViewAttachHealth (*this);
+            else if (localPatchWebView != nullptr)
+                installSpacebarPassthrough (*localPatchWebView);
         }
 
         void childBoundsChanged (Component*) override
         {
-            if (! isResizing && patchWebViewHolder->isVisible())
+            if (! isResizing && patchWebViewHolder != nullptr && patchWebViewHolder->isVisible())
                 setSize (std::max (50, patchWebViewHolder->getWidth()),
                          std::max (50, patchWebViewHolder->getHeight() + DerivedType::extraCompHeight));
         }
@@ -1145,7 +1748,7 @@ protected:
 
             auto r = getLocalBounds();
 
-            if (patchWebViewHolder->isVisible())
+            if (patchWebViewHolder != nullptr && patchWebViewHolder->isVisible())
             {
                 patchWebViewHolder->setBounds (r.removeFromTop (getHeight() - DerivedType::extraCompHeight));
                 r.removeFromTop (4);
@@ -1155,6 +1758,9 @@ protected:
                     owner.lastEditorWidth = patchWebViewHolder->getWidth();
                     owner.lastEditorHeight = patchWebViewHolder->getHeight();
                 }
+
+                if (auto* persistentHolder = getPersistentHolder())
+                    persistentHolder->refreshNativeAttachment (false);
             }
 
             if (extraComp)
@@ -1171,16 +1777,77 @@ protected:
         //==============================================================================
         DerivedType& owner;
 
-        std::unique_ptr<cmaj::PatchWebView> patchWebView;
         std::unique_ptr<juce::Component> patchWebViewHolder, extraComp;
+        std::unique_ptr<cmaj::PatchWebView> localPatchWebView;
 
         juce::LookAndFeel_V4 lookAndFeel;
         bool isResizing = false;
-
-        static constexpr int defaultWidth = 500, defaultHeight = 400;
+        bool usingPersistentView = true;
+        bool localPatchWebViewSpacebarPassthroughInstalled = false;
 
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (Editor)
     };
+
+    void tickPatchWebViewAttachHealth (Editor& editor)
+    {
+        if (! shouldUsePersistentPatchWebView() || patchWebView == nullptr)
+            return;
+
+        auto* holder = editor.getPersistentHolder();
+
+        if (holder == nullptr)
+            return;
+
+        // FEATHER: Reapply native parent/bounds regularly. This is intentionally
+        // cheap, and covers peer creation races plus DPI changes after reparenting.
+        holder->refreshNativeAttachment (false);
+
+        if (patchWebViewAttachState == PatchWebViewAttachState::detached)
+            return;
+
+        if (patchWebViewAttachState == PatchWebViewAttachState::attached)
+        {
+            if (! holder->isNativeViewAttached())
+                startPatchWebViewAttachHealthProbe (true);
+
+            return;
+        }
+
+        if (patchWebViewAttachProbe->pingOK.load() && holder->isNativeViewAttached())
+        {
+            patchWebViewAttachState = PatchWebViewAttachState::attached;
+            patchWebViewSoftRecoveryAttempted = false;
+            patchWebViewHardRecoveryAttempted = false;
+            return;
+        }
+
+        if (patchWebViewAttachHealthStartMs == 0)
+            return;
+
+        const auto elapsedMs = juce::Time::getMillisecondCounter() - patchWebViewAttachHealthStartMs;
+
+        if (elapsedMs < patchWebViewAttachHealthTimeoutMs)
+            return;
+
+        if (! patchWebViewSoftRecoveryAttempted)
+        {
+            patchWebViewSoftRecoveryAttempted = true;
+            patchWebViewAttachState = PatchWebViewAttachState::recovering;
+            holder->detachNativeView();
+            holder->refreshNativeAttachment (true);
+            return;
+        }
+
+        if (! patchWebViewHardRecoveryAttempted)
+        {
+            patchWebViewHardRecoveryAttempted = true;
+            patchWebViewAttachState = PatchWebViewAttachState::recovering;
+            editor.recreatePersistentPatchWebViewAfterHardRecovery();
+            return;
+        }
+
+        startPatchWebViewAttachHealthProbe (true);
+    }
 
     int lastEditorWidth = 0, lastEditorHeight = 0;
 
