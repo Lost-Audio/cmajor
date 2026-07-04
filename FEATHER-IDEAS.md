@@ -17,7 +17,7 @@ Add freely; move items to FEATHER-MODS.md when they ship.
 Rule of thumb: C+D features are patch-agnostic (build once, every product benefits) — highest leverage. A/B are per-product or shared-DSP. E is rare and reviewed hardest. F is business plumbing.
 
 ## In flight
-- **Loader-level RAM rolling recorder** — CmajPlugin continuously taps its audio into a lock-free ring buffer (last N seconds, configurable). UI button saves the capture to WAV on the message thread; stretch: drag the clip from the webview straight into the DAW timeline (JUCE OS drag-and-drop with a temp file). Patch-agnostic: every loaded patch gets capture for free. Nothing upstream has this.
+_None currently tracked._
 
 ## Queued
 - **SpectralGate tilt normalization** — negative Tilt currently boosts overall loudness (lows gain a lot). Fix: pivot the tilt around a center frequency (~1kHz) and/or normalize total energy so Tilt changes color, not volume.
@@ -54,4 +54,4 @@ Rule of thumb: C+D features are patch-agnostic (build once, every product benefi
 - **Optional CI** — GitHub Actions: build + cmaj test + all feather smokes on push; weekly upstream-merge dry-run report.
 
 ## Shipped (see FEATHER-MODS.md for details)
-Persistent WebView editors (JUCE+CLAP) · sidechain/multi-bus everywhere incl. JIT loader · Svelte-default patch UI scaffold · PFFFT native FFT (18.7× kernel, 1.29× real spectral patch) · MCP dev-loop server · bundle sampling + bus layout docs · loader state restore · channel adaptation (mono up-mix) · SpectralGate example + PFFFT A/B harness
+Persistent WebView editors (JUCE+CLAP) · sidechain/multi-bus everywhere incl. JIT loader · Svelte-default patch UI scaffold · PFFFT native FFT (18.7× kernel, 1.29× real spectral patch) · MCP dev-loop server · bundle sampling + bus layout docs · loader state restore · channel adaptation (mono up-mix) · loader-level rolling recorder v1 · SpectralGate example + PFFFT A/B harness

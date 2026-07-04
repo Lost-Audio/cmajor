@@ -32,9 +32,15 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
 #include <cstdint>
+#include <functional>
 #include <iostream>
+#include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -42,6 +48,7 @@
 #include "cmaj_PluginHelpers.h"
 #include "cmaj_PatchWebView.h"
 #include "cmaj_GeneratedCppEngine.h"
+#include "../../choc/choc/audio/choc_AudioFileFormat_WAV.h"
 
 #if CMAJ_USE_QUICKJS_WORKER
  #include "cmaj_PatchWorker_QuickJS.h"
@@ -261,6 +268,10 @@ public:
     void prepareToPlay (double sampleRate, int samplesPerBlock) override
     {
         applyRateAndBlockSize (sampleRate, static_cast<uint32_t> (samplesPerBlock));
+
+        // FEATHER: dynamic loader keeps a fixed 30s post-output rolling capture ring.
+        if constexpr (! DerivedType::isFixedPatch)
+            static_cast<DerivedType&> (*this).prepareOutputCapture (sampleRate);
     }
 
     void releaseResources() override
@@ -371,6 +382,10 @@ public:
         // FEATHER: adapt main output bus groups whose channel count differs from the
         // host bus (e.g. a mono patch on the dynamic loader's stereo output bus).
         applyOutputBusChannelAdaptation (audio, static_cast<int> (numFrames));
+
+        // FEATHER: capture exactly the post-adaptation output that the host hears.
+        if constexpr (! DerivedType::isFixedPatch)
+            static_cast<DerivedType&> (*this).captureProcessedOutput (audio, static_cast<int> (numFrames));
     }
 
     void processBlock (juce::AudioBuffer<double>&, juce::MidiBuffer&) override { CMAJ_ASSERT_FALSE; }
@@ -2487,8 +2502,130 @@ public:
         return patch->isPlayable();
     }
 
+private:
+    // FEATHER: loader-only rolling output capture; generated plugins stay unchanged.
+    struct OutputCaptureSnapshot;
+
+public:
+    struct OutputCaptureSaveResult
+    {
+        bool ok = false;
+        juce::File file;
+        juce::String message;
+        int numFrames = 0;
+        int numChannels = 0;
+        double sampleRate = 0.0;
+    };
+
+    void prepareOutputCapture (double sampleRate)
+    {
+        outputCaptureEnabled.store (false, std::memory_order_release);
+        outputCaptureSnapshotRequested.store (true, std::memory_order_release);
+        waitForOutputCaptureWriterToStop();
+
+        const auto numChannels = getTotalNumOutputChannels();
+        const auto numSamples = sampleRate > 0.0 ? static_cast<int> (std::ceil (sampleRate * outputCaptureLengthSeconds))
+                                                 : 0;
+
+        outputCaptureRing.setSize (std::max (0, numChannels), std::max (0, numSamples), false, false, false);
+        outputCaptureRing.clear();
+        outputCaptureSampleRate = sampleRate;
+        outputCaptureWriteFrame.store (0, std::memory_order_release);
+
+        outputCaptureEnabled.store (numChannels > 0 && numSamples > 0, std::memory_order_release);
+        outputCaptureSnapshotRequested.store (false, std::memory_order_release);
+    }
+
+    void captureProcessedOutput (juce::AudioBuffer<float>& audio, int numFrames) noexcept
+    {
+        if (numFrames <= 0
+             || ! outputCaptureEnabled.load (std::memory_order_acquire)
+             || outputCaptureSnapshotRequested.load (std::memory_order_acquire))
+            return;
+
+        outputCaptureWriterActive.store (true, std::memory_order_release);
+
+        if (outputCaptureSnapshotRequested.load (std::memory_order_acquire)
+             || ! outputCaptureEnabled.load (std::memory_order_acquire))
+        {
+            outputCaptureWriterActive.store (false, std::memory_order_release);
+            return;
+        }
+
+        auto outputBus = getBusBuffer (audio, false, dynamicMainOutputBusIndex);
+        const auto ringChannels = outputCaptureRing.getNumChannels();
+        const auto ringFrames = outputCaptureRing.getNumSamples();
+
+        if (outputBus.getNumChannels() != ringChannels || ringFrames <= 0)
+        {
+            outputCaptureWriterActive.store (false, std::memory_order_release);
+            return;
+        }
+
+        const auto writeFrame = outputCaptureWriteFrame.load (std::memory_order_relaxed);
+        const auto framesToCopy = std::min (numFrames, ringFrames);
+        const auto sourceStartFrame = numFrames - framesToCopy;
+        auto ringFrame = static_cast<int> ((writeFrame + static_cast<uint64_t> (sourceStartFrame))
+                                            % static_cast<uint64_t> (ringFrames));
+        auto sourceFrame = sourceStartFrame;
+        auto remaining = framesToCopy;
+
+        while (remaining > 0)
+        {
+            const auto chunk = std::min (remaining, ringFrames - ringFrame);
+
+            for (int channel = 0; channel < ringChannels; ++channel)
+                juce::FloatVectorOperations::copy (outputCaptureRing.getWritePointer (channel, ringFrame),
+                                                   outputBus.getReadPointer (channel, sourceFrame),
+                                                   chunk);
+
+            sourceFrame += chunk;
+            remaining -= chunk;
+            ringFrame = 0;
+        }
+
+        outputCaptureWriteFrame.store (writeFrame + static_cast<uint64_t> (numFrames), std::memory_order_release);
+        outputCaptureWriterActive.store (false, std::memory_order_release);
+    }
+
+    OutputCaptureSaveResult saveLastOutputCapture()
+    {
+        OutputCaptureSaveResult result;
+
+        if (auto snapshot = createOutputCaptureSnapshot (result))
+            return writeOutputCaptureSnapshot (*snapshot);
+
+        return result;
+    }
+
+    void saveLastOutputCaptureAsync (std::function<void(OutputCaptureSaveResult)> completion)
+    {
+        OutputCaptureSaveResult result;
+        auto snapshot = createOutputCaptureSnapshot (result);
+
+        if (snapshot == nullptr)
+        {
+            completion (std::move (result));
+            return;
+        }
+
+        auto snapshotToWrite = std::shared_ptr<OutputCaptureSnapshot> (std::move (snapshot));
+
+        std::thread ([snapshotToWrite, completion = std::move (completion)]() mutable
+        {
+            auto writeResult = writeOutputCaptureSnapshot (*snapshotToWrite);
+
+            juce::MessageManager::callAsync ([completion = std::move (completion),
+                                              writeResult = std::move (writeResult)]() mutable
+            {
+                completion (std::move (writeResult));
+            });
+        }).detach();
+    }
+
     struct ExtraEditorComponent  : public juce::Component,
-                                   public juce::FileDragAndDropTarget
+                                   public juce::FileDragAndDropTarget,
+                                   private juce::Timer
     {
         ExtraEditorComponent (JITLoaderPlugin& p) : plugin (p)
         {
@@ -2496,21 +2633,33 @@ public:
             messageBox.setReadOnly (true);
 
             unloadButton.onClick = [this] { plugin.unload(); };
+            saveCaptureButton.onClick = [this] { saveCapture(); };
+            captureStatus.setJustificationType (juce::Justification::centredLeft);
 
             addAndMakeVisible (messageBox);
             addAndMakeVisible (unloadButton);
+            addAndMakeVisible (saveCaptureButton);
+            addAndMakeVisible (captureStatus);
         }
 
         void resized() override
         {
             auto r = getLocalBounds().reduced (4);
-            unloadButton.setBounds (r.removeFromTop (30).removeFromRight (80));
+            auto buttonRow = r.removeFromTop (30);
+            unloadButton.setBounds (buttonRow.removeFromRight (80));
+            buttonRow.removeFromRight (4);
+            saveCaptureButton.setBounds (buttonRow.removeFromRight (124));
+            buttonRow.removeFromRight (8);
+            captureStatus.setBounds (buttonRow);
             messageBox.setBounds (r);
         }
 
         void refresh()
         {
             unloadButton.setVisible (plugin.patch->isLoaded());
+            saveCaptureButton.setVisible (plugin.patch->isLoaded());
+            saveCaptureButton.setEnabled (plugin.patch->isLoaded() && ! saveCaptureInProgress);
+            captureStatus.setVisible (plugin.patch->isLoaded() && captureStatus.getText().isNotEmpty());
             messageBox.setVisible (! plugin.patch->isPlayable());
 
            #if JUCE_MAJOR_VERSION == 8
@@ -2528,6 +2677,54 @@ public:
                 text = "Cmajor " + std::string (cmaj::Library::getVersion()) + "\n\nDrag-and-drop a .cmajorpatch file here to load it";
 
             messageBox.setText (text);
+        }
+
+        void saveCapture()
+        {
+            saveCaptureInProgress = true;
+            saveCaptureButton.setEnabled (false);
+            showCaptureStatus ("Saving capture...", false, false);
+
+            juce::Component::SafePointer<ExtraEditorComponent> safeThis (this);
+
+            plugin.saveLastOutputCaptureAsync ([safeThis] (OutputCaptureSaveResult result)
+            {
+                if (auto* c = safeThis.getComponent())
+                    c->captureSaveFinished (std::move (result));
+            });
+        }
+
+        void captureSaveFinished (OutputCaptureSaveResult result)
+        {
+            saveCaptureInProgress = false;
+            saveCaptureButton.setEnabled (plugin.patch->isLoaded());
+
+            if (result.ok)
+                showCaptureStatus ("Saved: " + result.file.getFullPathName(), false, true);
+            else
+                showCaptureStatus (result.message, true, true);
+        }
+
+        void showCaptureStatus (const juce::String& text, bool isError, bool autoClear)
+        {
+            captureStatus.setText (text, juce::dontSendNotification);
+            captureStatus.setTooltip (text);
+            captureStatus.setColour (juce::Label::textColourId, isError ? juce::Colours::red
+                                                                         : juce::Colours::lightgreen);
+            captureStatus.setVisible (text.isNotEmpty() && plugin.patch->isLoaded());
+
+            if (autoClear)
+                startTimer (6000);
+            else
+                stopTimer();
+        }
+
+        void timerCallback() override
+        {
+            captureStatus.setText ({}, juce::dontSendNotification);
+            captureStatus.setTooltip ({});
+            captureStatus.setVisible (false);
+            stopTimer();
         }
 
         void paintOverChildren (juce::Graphics& g) override
@@ -2564,9 +2761,12 @@ public:
         //==============================================================================
         JITLoaderPlugin& plugin;
         bool isDragOver = false;
+        bool saveCaptureInProgress = false;
 
         juce::TextEditor messageBox;
         juce::TextButton unloadButton { "Unload" };
+        juce::TextButton saveCaptureButton { "Save last 30s" };
+        juce::Label captureStatus;
 
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ExtraEditorComponent)
     };
@@ -2583,6 +2783,235 @@ public:
         if (auto v = dynamic_cast<ExtraEditorComponent*> (c))
             v->refresh();
     }
+
+private:
+    struct OutputCaptureSnapshot
+    {
+        choc::buffer::ChannelArrayBuffer<float> audio;
+        double sampleRate = 0.0;
+    };
+
+    struct OutputCaptureSnapshotGate
+    {
+        explicit OutputCaptureSnapshotGate (JITLoaderPlugin& p)
+            : plugin (p),
+              wasSuspended (p.isSuspended())
+        {
+            plugin.outputCaptureSnapshotRequested.store (true, std::memory_order_release);
+            plugin.suspendProcessing (true);
+        }
+
+        ~OutputCaptureSnapshotGate()
+        {
+            plugin.suspendProcessing (wasSuspended);
+            plugin.outputCaptureSnapshotRequested.store (false, std::memory_order_release);
+        }
+
+        JITLoaderPlugin& plugin;
+        bool wasSuspended = false;
+    };
+
+    bool waitForOutputCaptureWriterToStop() const
+    {
+        for (int i = 0; i < 100; ++i)
+        {
+            if (! outputCaptureWriterActive.load (std::memory_order_acquire))
+                return true;
+
+            std::this_thread::sleep_for (std::chrono::milliseconds (1));
+        }
+
+        return ! outputCaptureWriterActive.load (std::memory_order_acquire);
+    }
+
+    std::unique_ptr<OutputCaptureSnapshot> createOutputCaptureSnapshot (OutputCaptureSaveResult& result)
+    {
+        if (! outputCaptureEnabled.load (std::memory_order_acquire))
+        {
+            result.message = "Capture is not prepared yet";
+            return {};
+        }
+
+        OutputCaptureSnapshotGate snapshotGate (*this);
+
+        if (! waitForOutputCaptureWriterToStop())
+        {
+            result.message = "Capture is busy";
+            return {};
+        }
+
+        const auto numChannels = outputCaptureRing.getNumChannels();
+        const auto capacityFrames = outputCaptureRing.getNumSamples();
+        const auto writeFrame = outputCaptureWriteFrame.load (std::memory_order_acquire);
+        const auto filledFrames = static_cast<int> (std::min<uint64_t> (writeFrame, static_cast<uint64_t> (capacityFrames)));
+
+        result.sampleRate = outputCaptureSampleRate;
+        result.numChannels = numChannels;
+        result.numFrames = filledFrames;
+
+        if (numChannels <= 0 || capacityFrames <= 0 || outputCaptureSampleRate <= 0.0)
+        {
+            result.message = "Capture is not prepared yet";
+            return {};
+        }
+
+        if (filledFrames <= 0)
+        {
+            result.message = "No captured audio yet";
+            return {};
+        }
+
+        auto snapshot = std::make_unique<OutputCaptureSnapshot>();
+        snapshot->sampleRate = outputCaptureSampleRate;
+        snapshot->audio = choc::buffer::ChannelArrayBuffer<float> (static_cast<choc::buffer::ChannelCount> (numChannels),
+                                                                   static_cast<choc::buffer::FrameCount> (filledFrames),
+                                                                   false);
+
+        const auto oldestFrame = writeFrame - static_cast<uint64_t> (filledFrames);
+        const auto firstSourceFrame = static_cast<int> (oldestFrame % static_cast<uint64_t> (capacityFrames));
+        const auto firstChunk = std::min (filledFrames, capacityFrames - firstSourceFrame);
+        const auto secondChunk = filledFrames - firstChunk;
+        auto destView = snapshot->audio.getView();
+
+        for (int channel = 0; channel < numChannels; ++channel)
+        {
+            auto* dest = destView.getChannel (static_cast<choc::buffer::ChannelCount> (channel)).data.data;
+
+            if (firstChunk > 0)
+                juce::FloatVectorOperations::copy (dest,
+                                                   outputCaptureRing.getReadPointer (channel, firstSourceFrame),
+                                                   firstChunk);
+
+            if (secondChunk > 0)
+                juce::FloatVectorOperations::copy (dest + firstChunk,
+                                                   outputCaptureRing.getReadPointer (channel, 0),
+                                                   secondChunk);
+        }
+
+        return snapshot;
+    }
+
+    static OutputCaptureSaveResult writeOutputCaptureSnapshot (const OutputCaptureSnapshot& snapshot)
+    {
+        OutputCaptureSaveResult result;
+        result.sampleRate = snapshot.sampleRate;
+        result.numChannels = static_cast<int> (snapshot.audio.getNumChannels());
+        result.numFrames = static_cast<int> (snapshot.audio.getNumFrames());
+
+        try
+        {
+            if (result.sampleRate <= 0.0 || result.numChannels <= 0 || result.numFrames <= 0)
+            {
+                result.message = "Capture snapshot is empty";
+                return result;
+            }
+
+            auto directory = getOutputCaptureDirectory();
+
+            if (! directory.exists())
+            {
+                auto createResult = directory.createDirectory();
+
+                if (createResult.failed())
+                {
+                    result.message = "Could not create capture directory: " + createResult.getErrorMessage();
+                    return result;
+                }
+            }
+
+            auto file = createOutputCaptureFile (directory);
+            choc::audio::WAVAudioFileFormat<true> wav;
+            choc::audio::AudioFileProperties properties;
+            properties.bitDepth = choc::audio::BitDepth::float32;
+            properties.sampleRate = result.sampleRate;
+            properties.numChannels = static_cast<uint32_t> (result.numChannels);
+
+            auto writer = wav.createWriter (file.getFullPathName().toStdString(), properties);
+
+            if (writer == nullptr)
+            {
+                result.message = "Could not create WAV writer";
+                return result;
+            }
+
+            if (! writer->appendFrames (snapshot.audio.getView()) || ! writer->flush())
+            {
+                file.deleteFile();
+                result.message = "Could not write capture WAV";
+                return result;
+            }
+
+            result.ok = true;
+            result.file = file;
+            result.message = file.getFullPathName();
+            return result;
+        }
+        catch (const std::exception& e)
+        {
+            result.message = juce::String ("Could not save capture: ") + e.what();
+            return result;
+        }
+        catch (...)
+        {
+            result.message = "Could not save capture";
+            return result;
+        }
+    }
+
+    static juce::File getOutputCaptureDirectory()
+    {
+       #if JUCE_WINDOWS
+        if (auto* userProfile = std::getenv ("USERPROFILE"); userProfile != nullptr && userProfile[0] != 0)
+            return juce::File (juce::String (userProfile))
+                    .getChildFile ("Documents")
+                    .getChildFile ("LostAudio")
+                    .getChildFile ("Captures");
+       #endif
+
+        return juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
+                .getChildFile ("LostAudio")
+                .getChildFile ("Captures");
+    }
+
+    static juce::File createOutputCaptureFile (const juce::File& directory)
+    {
+        const auto now = juce::Time::getCurrentTime();
+        const auto timestamp = juce::String (now.getYear())
+                             + paddedNumber (now.getMonth() + 1, 2)
+                             + paddedNumber (now.getDayOfMonth(), 2)
+                             + "_"
+                             + paddedNumber (now.getHours(), 2)
+                             + paddedNumber (now.getMinutes(), 2)
+                             + paddedNumber (now.getSeconds(), 2)
+                             + "_"
+                             + paddedNumber (now.getMilliseconds(), 3);
+        const auto stem = juce::String ("cmaj_capture_") + timestamp;
+
+        for (int i = 0; i < 10000; ++i)
+        {
+            auto suffix = i == 0 ? juce::String() : "_" + juce::String (i);
+            auto file = directory.getChildFile (stem + suffix + ".wav");
+
+            if (! file.exists())
+                return file;
+        }
+
+        return directory.getChildFile (stem + "_overflow.wav");
+    }
+
+    static juce::String paddedNumber (int value, int width)
+    {
+        return juce::String (value).paddedLeft ('0', width);
+    }
+
+    static constexpr double outputCaptureLengthSeconds = 30.0;
+
+    juce::AudioBuffer<float> outputCaptureRing;
+    std::atomic<uint64_t> outputCaptureWriteFrame { 0 };
+    std::atomic<bool> outputCaptureEnabled { false };
+    std::atomic<bool> outputCaptureWriterActive { false };
+    std::atomic<bool> outputCaptureSnapshotRequested { false };
+    double outputCaptureSampleRate = 0.0;
 };
 
 //==============================================================================
