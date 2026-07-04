@@ -35,7 +35,6 @@
 #include <cstdint>
 #include <utility>
 #include <vector>
-#include "../../choc/choc/memory/choc_xxHash.h"
 #include "cmaj_AudioBusLayoutHelper.h"
 #include "cmaj_PluginHelpers.h"
 #include "cmaj_PatchWebView.h"
@@ -361,15 +360,8 @@ public:
 
     void setStateInformation (const void* data, int size) override
     {
-        choc::hash::xxHash64 hash (1);
-        hash.addInput (data, static_cast<size_t> (size));
-        auto stateHash = hash.getHash();
-
-        if (lastLoadedStateHash != stateHash)
-        {
-            lastLoadedStateHash = stateHash;
-            setNewStateAsync (juce::ValueTree::readFromData (data, static_cast<size_t> (size)));
-        }
+        juce::ScopedValueSetter<bool> deferUIUpdates (deferPatchViewUpdates, true);
+        setNewState (juce::ValueTree::readFromData (data, static_cast<size_t> (size)));
     }
 
     Patch::PlaybackParams getPlaybackParams (double rate, uint32_t requestedBlockSize)
@@ -412,7 +404,8 @@ public:
     bool dllLoadedSuccessfully = false;
 
 protected:
-    uint64_t lastLoadedStateHash = 0;
+    bool deferPatchViewUpdates = false;
+    bool patchViewUpdatePending = false;
     std::vector<float*> inputChannelPointers, outputChannelPointers;
     std::vector<cmaj::audio_bus_layout::BusGroup> inputAudioBusGroups, outputAudioBusGroups;
     choc::buffer::ChannelCount inputAudioChannelCount = 0, outputAudioChannelCount = 0;
@@ -665,9 +658,12 @@ protected:
         changes.nonParameterStateChanged = true;
 
         setLatencySamples (newLatency);
-        if (getActiveEditor() == nullptr)
-            updatePatchWebViewForCurrentPatch (true);
-        notifyEditorPatchChanged();
+
+        if (deferPatchViewUpdates)
+            postPatchViewUpdate();
+        else
+            deliverPatchViewUpdate();
+
         updateHostDisplay (changes);
 
         if (patchChangeCallback)
@@ -687,8 +683,13 @@ protected:
             statusMessage = newMessage;
             isStatusMessageError = isError;
 
-            deliverStatusMessageToPatchWebView();
-            notifyEditorStatusMessageChanged();
+            if (deferPatchViewUpdates)
+                postPatchViewUpdate();
+            else
+            {
+                deliverStatusMessageToPatchWebView();
+                notifyEditorStatusMessageChanged();
+            }
         }
     }
 
@@ -722,6 +723,29 @@ protected:
     {
         if (auto* e = dynamic_cast<Editor*> (getActiveEditor()))
             e->onPatchChanged();
+    }
+
+    struct PatchViewUpdateMessage  : public juce::Message
+    {
+    };
+
+    void deliverPatchViewUpdate()
+    {
+        if (getActiveEditor() == nullptr)
+            updatePatchWebViewForCurrentPatch (true);
+
+        deliverStatusMessageToPatchWebView();
+        notifyEditorPatchChanged();
+        notifyEditorStatusMessageChanged();
+    }
+
+    void postPatchViewUpdate()
+    {
+        if (patchViewUpdatePending)
+            return;
+
+        patchViewUpdatePending = true;
+        postMessage (new PatchViewUpdateMessage());
     }
 
     //==============================================================================
@@ -912,6 +936,11 @@ protected:
             setNewState (const_cast<NewStateMessage*> (newStateMessage)->newState);
         else if (auto statusMessageUpdate = dynamic_cast<const StatusMessageMessage*> (&message))
             setStatusMessage (statusMessageUpdate->message, statusMessageUpdate->isError);
+        else if (dynamic_cast<const PatchViewUpdateMessage*> (&message) != nullptr)
+        {
+            patchViewUpdatePending = false;
+            deliverPatchViewUpdate();
+        }
     }
 
     void handleOutputEvent (uint64_t, std::string_view endpointID, const choc::value::ValueView& value)
