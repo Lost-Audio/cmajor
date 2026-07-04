@@ -30,6 +30,7 @@ processor SpectralGate [[ main ]]
     let referenceFrequency = 1000.0f;
     let minimumTiltFrequency = 20.0f;
     let inverseLog2 = 1.4426950408889634f;
+    let minimumTiltEnergy = 1.0e-20f;
 
     processor.latency = fftSize;
 
@@ -45,10 +46,12 @@ processor SpectralGate [[ main ]]
     float[fftSize] inverseL, inverseR;
     float[fftSize] hannWindow;
     float[numBins] previousMagnitudeL, previousMagnitudeR;
+    float[numBins] tiltGainTable;
 
     wrap<fftSize> bufferPosition;
     int hopCountdown = hopSize;
     bool hasPreviousMagnitude = false;
+    bool tiltGainTableDirty = true;
 
     event threshold (float v)
     {
@@ -63,6 +66,7 @@ processor SpectralGate [[ main ]]
     event tilt (float v)
     {
         tiltDbPerOctave = clamp (v, -12.0f, 12.0f);
+        tiltGainTableDirty = true;
     }
 
     event mix (float v)
@@ -70,19 +74,40 @@ processor SpectralGate [[ main ]]
         mixAmount = clamp (v, 0.0f, 100.0f) * 0.01f;
     }
 
-    float getBinTiltGain (int bin)
+    void updateTiltGainTable()
     {
-        let binFrequency = max (minimumTiltFrequency, float (bin) * float (processor.frequency) / float (fftSize));
-        let octaves = log (binFrequency / referenceFrequency) * inverseLog2;
-        return std::levels::dBtoGain (tiltDbPerOctave * octaves);
+        let binWidth = float (processor.frequency) / float (fftSize);
+        int pivotBin = int (referenceFrequency / binWidth + 0.5f);
+
+        if (pivotBin < 1)
+            pivotBin = 1;
+
+        if (pivotBin > nyquistBin)
+            pivotBin = nyquistBin;
+
+        let pivotFrequency = float (pivotBin) * binWidth;
+
+        for (wrap<numBins> bin)
+        {
+            let realIndex = int (bin);
+            let binFrequency = max (minimumTiltFrequency, float (max (1, realIndex)) * binWidth);
+            let octavesFromPivot = log (binFrequency / pivotFrequency) * inverseLog2;
+            tiltGainTable[bin] = std::levels::dBtoGain (tiltDbPerOctave * octavesFromPivot);
+        }
+
+        tiltGainTableDirty = false;
     }
 
     void processSpectrum (float[fftSize]& spectrum, float[numBins]& previousMagnitudes)
     {
+        float preTiltEnergy = 0.0f;
+        float postTiltEnergy = 0.0f;
+
         for (wrap<numBins> bin)
         {
             let realIndex = int (bin);
             let imagIndex = nyquistBin + realIndex;
+            let binWeight = (realIndex > 0 && realIndex < nyquistBin) ? 2.0f : 1.0f;
 
             float real = spectrum.at (realIndex);
             float imag = (realIndex > 0 && realIndex < nyquistBin) ? spectrum.at (imagIndex) : 0.0f;
@@ -97,8 +122,27 @@ processor SpectralGate [[ main ]]
 
             previousMagnitudes[bin] = targetMagnitude;
 
-            let tiltGain = getBinTiltGain (realIndex);
-            let magnitudeGain = magnitude > 0.0f ? (targetMagnitude * tiltGain) / magnitude : 0.0f;
+            let tiltGain = tiltGainTable[bin];
+            let targetEnergy = targetMagnitude * targetMagnitude * binWeight;
+
+            preTiltEnergy += targetEnergy;
+            postTiltEnergy += targetEnergy * tiltGain * tiltGain;
+        }
+
+        let energyNormalisationGain = (preTiltEnergy > minimumTiltEnergy && postTiltEnergy > minimumTiltEnergy)
+                                        ? sqrt (preTiltEnergy / postTiltEnergy)
+                                        : 1.0f;
+
+        for (wrap<numBins> bin)
+        {
+            let realIndex = int (bin);
+            let imagIndex = nyquistBin + realIndex;
+
+            float real = spectrum.at (realIndex);
+            float imag = (realIndex > 0 && realIndex < nyquistBin) ? spectrum.at (imagIndex) : 0.0f;
+            float magnitude = sqrt (real * real + imag * imag);
+            let tiltedMagnitude = previousMagnitudes[bin] * tiltGainTable[bin] * energyNormalisationGain;
+            let magnitudeGain = magnitude > 0.0f ? tiltedMagnitude / magnitude : 0.0f;
 
             spectrum.at (realIndex) = real * magnitudeGain;
 
@@ -124,6 +168,9 @@ processor SpectralGate [[ main ]]
 
         std::frequency::realOnlyForwardFFT (frameL, spectrumL);
         std::frequency::realOnlyForwardFFT (frameR, spectrumR);
+
+        if (tiltGainTableDirty)
+            updateTiltGainTable();
 
         processSpectrum (spectrumL, previousMagnitudeL);
         processSpectrum (spectrumR, previousMagnitudeR);

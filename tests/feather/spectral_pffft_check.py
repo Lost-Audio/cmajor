@@ -29,6 +29,10 @@ BYPASS_MAX_DIFF = 1.0e-4
 BYPASS_RMS_DIFF = 2.0e-5
 EFFECT_MIN_RMS_DIFF = 1.0e-3
 NONZERO_EPSILON = 1.0e-7
+TILT_RMS_TOLERANCE_DB = 1.5
+TILT_CENTROID_MIN_RATIO = 1.15
+CENTROID_FFT_SIZE = 2048
+CENTROID_HOP_SIZE = 1024
 
 
 def run(cmd, cwd=REPO_ROOT):
@@ -198,6 +202,24 @@ def write_fixture(path):
         wav.writeframes(frames)
 
 
+def write_broadband_fixture(path):
+    total_frames = int(SAMPLE_RATE * DURATION_SECONDS)
+
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(CHANNELS)
+        wav.setsampwidth(2)
+        wav.setframerate(SAMPLE_RATE)
+
+        frames = bytearray()
+
+        for frame in range(total_frames):
+            left = 0.20 * deterministic_noise(frame, 0)
+            right = 0.20 * deterministic_noise(frame, 1)
+            frames.extend(struct.pack("<hh", clamp16(left), clamp16(right)))
+
+        wav.writeframes(frames)
+
+
 def read_wav(path):
     content = pathlib.Path(path).read_bytes()
     if content[:4] != b"RIFF" or content[8:12] != b"WAVE":
@@ -246,6 +268,89 @@ def read_wav(path):
         raise RuntimeError(f"Unsupported WAV format tag={format_tag} bits={bits_per_sample}")
 
     return sample_rate, data
+
+
+def rms_db(data, start_frame=0):
+    total = 0.0
+    count = 0
+
+    for channel in data:
+        for sample in channel[start_frame:]:
+            total += sample * sample
+            count += 1
+
+    if count == 0:
+        raise RuntimeError("Empty RMS measurement")
+
+    rms = math.sqrt(total / count)
+    return 20.0 * math.log10(max(rms, 1.0e-12))
+
+
+def fft_in_place(values):
+    n = len(values)
+    j = 0
+
+    for i in range(1, n):
+        bit = n >> 1
+        while j & bit:
+            j ^= bit
+            bit >>= 1
+        j ^= bit
+
+        if i < j:
+            values[i], values[j] = values[j], values[i]
+
+    length = 2
+    while length <= n:
+        angle = -2.0 * math.pi / length
+        step = complex(math.cos(angle), math.sin(angle))
+
+        for offset in range(0, n, length):
+            factor = 1.0 + 0.0j
+            half_length = length >> 1
+
+            for i in range(offset, offset + half_length):
+                even = values[i]
+                odd = values[i + half_length] * factor
+                values[i] = even + odd
+                values[i + half_length] = even - odd
+                factor *= step
+
+        length <<= 1
+
+
+def spectral_centroid_hz(data, sample_rate, start_frame=0):
+    if not data or len(data[0]) < start_frame + CENTROID_FFT_SIZE:
+        raise RuntimeError("Not enough audio for spectral centroid")
+
+    channels = len(data)
+    frames = len(data[0])
+    window = [
+        0.5 - 0.5 * math.cos(2.0 * math.pi * index / CENTROID_FFT_SIZE)
+        for index in range(CENTROID_FFT_SIZE)
+    ]
+    frequency_scale = sample_rate / CENTROID_FFT_SIZE
+    weighted_frequency = 0.0
+    total_power = 0.0
+
+    for frame_start in range(start_frame, frames - CENTROID_FFT_SIZE + 1, CENTROID_HOP_SIZE):
+        spectrum = []
+
+        for index in range(CENTROID_FFT_SIZE):
+            mono = sum(channel[frame_start + index] for channel in data) / channels
+            spectrum.append(complex(mono * window[index], 0.0))
+
+        fft_in_place(spectrum)
+
+        for bin_index in range(1, CENTROID_FFT_SIZE // 2 + 1):
+            power = spectrum[bin_index].real * spectrum[bin_index].real + spectrum[bin_index].imag * spectrum[bin_index].imag
+            weighted_frequency += bin_index * frequency_scale * power
+            total_power += power
+
+    if total_power <= 0.0:
+        raise RuntimeError("Silent audio in spectral centroid measurement")
+
+    return weighted_frequency / total_power
 
 
 def output_difference(reference, candidate, start_frame=0):
@@ -359,13 +464,21 @@ def main():
         default_patch = copy_patch_variant(temp / "default")
         gated_patch = copy_patch_variant(temp / "gated", threshold_db=-12.0, smear_percent=0.0, tilt_db_oct=0.0, mix_percent=100.0)
         bypass_patch = copy_patch_variant(temp / "bypass", threshold_db=-12.0, smear_percent=0.0, tilt_db_oct=0.0, mix_percent=0.0)
+        tilt_minus_patch = copy_patch_variant(temp / "tilt_minus", threshold_db=-96.0, smear_percent=0.0, tilt_db_oct=-6.0, mix_percent=100.0)
+        tilt_zero_patch = copy_patch_variant(temp / "tilt_zero", threshold_db=-96.0, smear_percent=0.0, tilt_db_oct=0.0, mix_percent=100.0)
+        tilt_plus_patch = copy_patch_variant(temp / "tilt_plus", threshold_db=-96.0, smear_percent=0.0, tilt_db_oct=6.0, mix_percent=100.0)
 
         input_wav = temp / "spectral_fixture.wav"
+        broadband_wav = temp / "spectral_broadband.wav"
         native_out = temp / "spectral_native_on.wav"
         fallback_out = temp / "spectral_native_off.wav"
         gated_out = temp / "spectral_gated.wav"
         bypass_out = temp / "spectral_bypass.wav"
+        tilt_minus_out = temp / "spectral_tilt_minus.wav"
+        tilt_zero_out = temp / "spectral_tilt_zero.wav"
+        tilt_plus_out = temp / "spectral_tilt_plus.wav"
         write_fixture(input_wav)
+        write_broadband_fixture(broadband_wav)
 
         dry_run(cmaj_on, default_patch)
 
@@ -373,14 +486,29 @@ def main():
         fallback_seconds = render(cmaj_off, default_patch, input_wav, fallback_out)
         gated_seconds = render(cmaj_on, gated_patch, input_wav, gated_out)
         bypass_seconds = render(cmaj_on, bypass_patch, input_wav, bypass_out)
+        tilt_minus_seconds = render(cmaj_on, tilt_minus_patch, broadband_wav, tilt_minus_out)
+        tilt_zero_seconds = render(cmaj_on, tilt_zero_patch, broadband_wav, tilt_zero_out)
+        tilt_plus_seconds = render(cmaj_on, tilt_plus_patch, broadband_wav, tilt_plus_out)
 
         native_rate, native_data = read_wav(native_out)
         fallback_rate, fallback_data = read_wav(fallback_out)
         input_rate, input_data = read_wav(input_wav)
         gated_rate, gated_data = read_wav(gated_out)
         bypass_rate, bypass_data = read_wav(bypass_out)
+        tilt_minus_rate, tilt_minus_data = read_wav(tilt_minus_out)
+        tilt_zero_rate, tilt_zero_data = read_wav(tilt_zero_out)
+        tilt_plus_rate, tilt_plus_data = read_wav(tilt_plus_out)
 
-        rates = {native_rate, fallback_rate, input_rate, gated_rate, bypass_rate}
+        rates = {
+            native_rate,
+            fallback_rate,
+            input_rate,
+            gated_rate,
+            bypass_rate,
+            tilt_minus_rate,
+            tilt_zero_rate,
+            tilt_plus_rate,
+        }
         if rates != {SAMPLE_RATE}:
             raise RuntimeError(f"Unexpected sample rates: {sorted(rates)}")
 
@@ -388,14 +516,35 @@ def main():
         startup_skip = first_nonzero_frame(bypass_data)
         bypass_max, bypass_rms = output_difference(input_data, bypass_data, startup_skip)
         effect_max, effect_rms = output_difference(gated_data, bypass_data, startup_skip)
+        tilt_startup_skip = max(
+            first_nonzero_frame(tilt_minus_data),
+            first_nonzero_frame(tilt_zero_data),
+            first_nonzero_frame(tilt_plus_data),
+        )
+        tilt_minus_db = rms_db(tilt_minus_data, tilt_startup_skip)
+        tilt_zero_db = rms_db(tilt_zero_data, tilt_startup_skip)
+        tilt_plus_db = rms_db(tilt_plus_data, tilt_startup_skip)
+        tilt_rms_spread_db = max(tilt_minus_db, tilt_zero_db, tilt_plus_db) - min(tilt_minus_db, tilt_zero_db, tilt_plus_db)
+        tilt_minus_centroid = spectral_centroid_hz(tilt_minus_data, SAMPLE_RATE, tilt_startup_skip)
+        tilt_zero_centroid = spectral_centroid_hz(tilt_zero_data, SAMPLE_RATE, tilt_startup_skip)
+        tilt_plus_centroid = spectral_centroid_hz(tilt_plus_data, SAMPLE_RATE, tilt_startup_skip)
         speedup = fallback_seconds / native_seconds if native_seconds > 0.0 else float("inf")
 
         print(f"SpectralGate native/fallback diff: max={max_diff:.8f}, rms={rms_diff:.8f}")
         print(f"SpectralGate render startup skip for dry comparisons: {startup_skip} frames")
         print(f"SpectralGate bypass diff vs input after startup: max={bypass_max:.8f}, rms={bypass_rms:.8f}")
         print(f"SpectralGate gated diff vs bypass after startup: max={effect_max:.8f}, rms={effect_rms:.8f}")
+        print(
+            "SpectralGate tilt broadband RMS dB: "
+            f"-6={tilt_minus_db:.2f}, 0={tilt_zero_db:.2f}, +6={tilt_plus_db:.2f}, "
+            f"spread={tilt_rms_spread_db:.2f}"
+        )
+        print(
+            "SpectralGate tilt centroids Hz: "
+            f"-6={tilt_minus_centroid:.1f}, 0={tilt_zero_centroid:.1f}, +6={tilt_plus_centroid:.1f}"
+        )
         print(f"SpectralGate render times: native={native_seconds:.3f}s, fallback={fallback_seconds:.3f}s, speedup={speedup:.2f}x")
-        print(f"Additional render times: gated={gated_seconds:.3f}s, bypass={bypass_seconds:.3f}s")
+        print(f"Additional render times: gated={gated_seconds:.3f}s, bypass={bypass_seconds:.3f}s, tilt(-/0/+)={tilt_minus_seconds:.3f}/{tilt_zero_seconds:.3f}/{tilt_plus_seconds:.3f}s")
 
         failed = False
 
@@ -411,10 +560,19 @@ def main():
             print("FAIL: high-threshold gate did not materially change the signal", file=sys.stderr)
             failed = True
 
+        if tilt_rms_spread_db > TILT_RMS_TOLERANCE_DB:
+            print(f"FAIL: tilt broadband RMS spread exceeded {TILT_RMS_TOLERANCE_DB:.1f} dB", file=sys.stderr)
+            failed = True
+
+        if not (tilt_minus_centroid * TILT_CENTROID_MIN_RATIO < tilt_zero_centroid
+                and tilt_zero_centroid * TILT_CENTROID_MIN_RATIO < tilt_plus_centroid):
+            print("FAIL: tilt did not produce the expected spectral centroid shift", file=sys.stderr)
+            failed = True
+
         if args.keep:
             keep_dir = REPO_ROOT / "tests" / "feather" / "spectral_pffft_artifacts"
             keep_dir.mkdir(exist_ok=True)
-            for path in (input_wav, native_out, fallback_out, gated_out, bypass_out):
+            for path in (input_wav, broadband_wav, native_out, fallback_out, gated_out, bypass_out, tilt_minus_out, tilt_zero_out, tilt_plus_out):
                 shutil.copy2(path, keep_dir / path.name)
             print(f"Kept artifacts in {keep_dir}")
 
