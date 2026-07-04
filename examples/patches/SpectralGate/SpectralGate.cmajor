@@ -1,0 +1,189 @@
+//
+//     ,ad888ba,                              88
+//    d8"'    "8b
+//   d8            88,dba,,adba,   ,aPP8A.A8  88     (C)2024 Cmajor Software Ltd
+//   Y8,           88    88    88  88     88  88
+//    Y8a.   .a8P  88    88    88  88,   ,88  88     https://cmajor.dev
+//     '"Y888Y"'   88    88    88  '"8bbP"Y8  88
+//                                           ,88
+//                                        888P"
+//
+//  This code may be used under either a GPLv3 or commercial
+//  license: see LICENSE.md for more details.
+
+processor SpectralGate [[ main ]]
+{
+    input  stream float<2> audioIn;
+    output stream float<2> audioOut;
+
+    input event float threshold [[ name: "Threshold", min: -96, max: 0, init: -48, unit: "dB", step: 0.1 ]];
+    input event float smear     [[ name: "Smear",     min: 0,   max: 100, init: 35, unit: "%",  step: 1   ]];
+    input event float tilt      [[ name: "Tilt",      min: -12, max: 12, init: 0,   unit: "dB/oct", step: 0.1 ]];
+    input event float mix       [[ name: "Mix",       min: 0,   max: 100, init: 100, unit: "%", step: 1   ]];
+
+    let fftSize = 1024;
+    let hopSize = 256;
+    let numBins = fftSize / 2 + 1;
+    let nyquistBin = fftSize / 2;
+    let fftMagnitudeToGain = 2.0f / float (fftSize);
+    let hannSquaredCOLAGain = 2.0f / 3.0f;
+    let referenceFrequency = 1000.0f;
+    let minimumTiltFrequency = 20.0f;
+    let inverseLog2 = 1.4426950408889634f;
+
+    processor.latency = fftSize;
+
+    float thresholdGain = 0.0039810717f;
+    float smearAmount = 0.35f;
+    float tiltDbPerOctave = 0.0f;
+    float mixAmount = 1.0f;
+
+    float[fftSize] inputL, inputR;
+    float[fftSize] outputL, outputR;
+    float[fftSize] frameL, frameR;
+    float[fftSize] spectrumL, spectrumR;
+    float[fftSize] inverseL, inverseR;
+    float[fftSize] hannWindow;
+    float[numBins] previousMagnitudeL, previousMagnitudeR;
+
+    wrap<fftSize> bufferPosition;
+    int hopCountdown = hopSize;
+    bool hasPreviousMagnitude = false;
+
+    event threshold (float v)
+    {
+        thresholdGain = std::levels::dBtoGain (clamp (v, -96.0f, 0.0f));
+    }
+
+    event smear (float v)
+    {
+        smearAmount = clamp (v, 0.0f, 100.0f) * 0.01f;
+    }
+
+    event tilt (float v)
+    {
+        tiltDbPerOctave = clamp (v, -12.0f, 12.0f);
+    }
+
+    event mix (float v)
+    {
+        mixAmount = clamp (v, 0.0f, 100.0f) * 0.01f;
+    }
+
+    float getBinTiltGain (int bin)
+    {
+        let binFrequency = max (minimumTiltFrequency, float (bin) * float (processor.frequency) / float (fftSize));
+        let octaves = log (binFrequency / referenceFrequency) * inverseLog2;
+        return std::levels::dBtoGain (tiltDbPerOctave * octaves);
+    }
+
+    void processSpectrum (float[fftSize]& spectrum, float[numBins]& previousMagnitudes)
+    {
+        for (wrap<numBins> bin)
+        {
+            let realIndex = int (bin);
+            let imagIndex = nyquistBin + realIndex;
+
+            float real = spectrum.at (realIndex);
+            float imag = (realIndex > 0 && realIndex < nyquistBin) ? spectrum.at (imagIndex) : 0.0f;
+            float magnitude = sqrt (real * real + imag * imag);
+            float targetMagnitude = magnitude;
+
+            if (magnitude * fftMagnitudeToGain < thresholdGain)
+                targetMagnitude = 0.0f;
+
+            if (hasPreviousMagnitude)
+                targetMagnitude = lerp (targetMagnitude, previousMagnitudes[bin], smearAmount);
+
+            previousMagnitudes[bin] = targetMagnitude;
+
+            let tiltGain = getBinTiltGain (realIndex);
+            let magnitudeGain = magnitude > 0.0f ? (targetMagnitude * tiltGain) / magnitude : 0.0f;
+
+            spectrum.at (realIndex) = real * magnitudeGain;
+
+            if (realIndex > 0 && realIndex < nyquistBin)
+                spectrum.at (imagIndex) = imag * magnitudeGain;
+        }
+    }
+
+    void renderFrame()
+    {
+        wrap<fftSize> frameStart = bufferPosition;
+        ++frameStart;
+        wrap<fftSize> sourceIndex = frameStart;
+
+        for (wrap<fftSize> i)
+        {
+            let window = hannWindow[i];
+
+            frameL[i] = inputL[sourceIndex] * window;
+            frameR[i] = inputR[sourceIndex] * window;
+            ++sourceIndex;
+        }
+
+        std::frequency::realOnlyForwardFFT (frameL, spectrumL);
+        std::frequency::realOnlyForwardFFT (frameR, spectrumR);
+
+        processSpectrum (spectrumL, previousMagnitudeL);
+        processSpectrum (spectrumR, previousMagnitudeR);
+        hasPreviousMagnitude = true;
+
+        std::frequency::realOnlyInverseFFT (spectrumL, inverseL);
+        std::frequency::realOnlyInverseFFT (spectrumR, inverseR);
+
+        wrap<fftSize> targetIndex = frameStart;
+
+        for (wrap<fftSize> i)
+        {
+            let synthesisGain = hannWindow[i] * hannSquaredCOLAGain;
+
+            outputL[targetIndex] += inverseL[i] * synthesisGain;
+            outputR[targetIndex] += inverseR[i] * synthesisGain;
+            ++targetIndex;
+        }
+    }
+
+    void initialiseWindow()
+    {
+        for (wrap<fftSize> i)
+            hannWindow[i] = 0.5f - 0.5f * cos (float (twoPi) * float (i) / float (fftSize));
+    }
+
+    void main()
+    {
+        initialiseWindow();
+
+        loop
+        {
+            let dry = audioIn;
+            let wet = float<2> (outputL[bufferPosition], outputR[bufferPosition]);
+
+            outputL[bufferPosition] = 0.0f;
+            outputR[bufferPosition] = 0.0f;
+
+            inputL[bufferPosition] = dry[0];
+            inputR[bufferPosition] = dry[1];
+
+            float<2> mixed;
+
+            if (mixAmount <= 0.0f)
+                mixed = dry;
+            else
+                mixed = dry * (1.0f - mixAmount) + wet * mixAmount;
+
+            audioOut <- mixed;
+
+            --hopCountdown;
+
+            if (hopCountdown <= 0)
+            {
+                hopCountdown = hopSize;
+                renderFrame();
+            }
+
+            ++bufferPosition;
+            advance();
+        }
+    }
+}

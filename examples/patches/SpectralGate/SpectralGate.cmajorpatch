@@ -1,0 +1,13 @@
+{
+    "CmajorVersion":    1,
+    "ID":               "dev.cmajor.examples.spectral-gate",
+    "version":          "1.0",
+    "name":             "Spectral Gate",
+    "description":      "A stereo STFT spectral gate with per-bin smear, spectral tilt, and dry/wet mix.",
+    "category":         "effect",
+    "manufacturer":     "Cmajor Software Ltd",
+    "isInstrument":     false,
+    "latencySamples":   1024,
+
+    "source":           "SpectralGate.cmajor"
+}
