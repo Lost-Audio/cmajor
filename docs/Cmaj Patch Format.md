@@ -185,6 +185,16 @@ and
 
 ..but since there's nowhere to put the file's sample rate, that information will be discarded.
 
+### Feather fork note: sample bundles and generated plugins
+
+This section is extended in the Lost Audio fork. For practical sampler packaging notes, see `docs/Cmaj Bundle Sampling.md`.
+
+In this fork, the packaging rule is:
+
+- `.cmajorpatch` `externals` maps fully-qualified Cmajor external names, such as `ProcessorName::varName` or `namespace::varName`, to JSON values.
+- JSON strings inside those values may name patch-relative audio files. The manifest loader resolves them through `PatchManifest::createExternalResolverFunction()` and `replaceFilenameStringsWithAudioData()` in `include/cmajor/helpers/cmaj_PatchManifest.h`.
+- `cmaj generate` resolves externals before C++ code generation. Generated JUCE/CLAP plugin projects therefore bake external sample data into the generated performer code. The generated plugin wrapper embeds the stripped manifest and resource file array separately; `PatchManifest::getStrippedManifest()` removes the manifest's `externals` block after those values have already been compiled in.
+
 ------------------------------------------------------------------------------------------------------
 
 ## Patch GUIs

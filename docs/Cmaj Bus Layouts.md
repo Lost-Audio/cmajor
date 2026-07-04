@@ -1,0 +1,141 @@
+# Cmajor Bus Layouts
+
+Internal notes for Lost Audio's Feather bus and sidechain fork. This covers the code contract, wrapper behavior, and the regression gate we rely on.
+
+## Ground Truth Files
+
+- Shared interpretation: `include/cmajor/helpers/cmaj_AudioBusLayoutHelper.h`
+- JUCE wrapper: `include/cmajor/helpers/cmaj_JUCEPlugin.h`
+- CLAP wrapper: `modules/plugin/include/clap/cmaj_CLAPPlugin.h`
+- Dev-time player: `modules/playback/include/cmaj_PatchPlayer.h`
+- Fixture and smoke test: `examples/patches/SidechainDuck`, `tests/feather/sidechain_smoke.py`
+
+## Endpoint Annotation Contract
+
+Bus layout is driven by annotations on audio stream endpoints:
+
+```cmajor
+input stream float32<2> mainIn    [[ name: "Main Input", bus: "Input", role: "main" ]];
+input stream float32<2> sidechain [[ name: "Sidechain Input", bus: "Sidechain", role: "sidechain" ]];
+output stream float32<2> out      [[ name: "Output", bus: "Output", role: "main" ]];
+```
+
+This exact shape is used by `examples/patches/SidechainDuck/SidechainDuck.cmajor`.
+
+The supported roles in `cmaj_AudioBusLayoutHelper.h` are:
+
+- `main`
+- `sidechain`
+- `sideChain` as a compatibility spelling for `sidechain`
+- `aux`
+- omitted/unknown
+
+`bus` is the display/grouping name. Endpoints with the same bus name are grouped into one bus. If no audio endpoint in a list has `bus` or `role`, all audio endpoints collapse into the old default bus named `in` or `out`.
+
+If `bus` is omitted but `role` is present, defaults are:
+
+- `role: "main"` -> `Input` for inputs, `Output` for outputs
+- `role: "sidechain"` or `role: "aux"` -> `Sidechain`
+
+Channel count comes from the endpoint stream type. `EndpointDetails::getNumAudioChannels()` in `include/cmajor/API/cmaj_Endpoints.h` returns `1` for a float stream and the vector size for a float vector stream, for example `float32<2>` is stereo.
+
+## Shared Grouping Semantics
+
+`groupEndpointsByBus()` in `cmaj_AudioBusLayoutHelper.h` skips non-audio endpoints, preserves declaration order, and accumulates channel counts for endpoints sharing a bus name.
+
+Main-bus detection is deliberately conservative:
+
+- A bus with role `sidechain` or `aux` is not main.
+- A bus named `Sidechain` is treated as auxiliary.
+- Otherwise, role `main` or the first bus is main.
+
+This matters because wrappers allow disabled auxiliary buses but keep main buses strict.
+
+## JUCE And Generated JUCE
+
+`cmaj_JUCEPlugin.h` uses the shared helper in `addEndpointAudioBuses()` and `updateCachedAudioBusLayoutFromPatch()`. Generated JUCE projects inherit this because their generated `CMakeLists.txt` includes the same helper chain; see `tools/command/Source/cmaj_command_GeneratePlugin.h`.
+
+JUCE layout validation accepts a zero-channel suggested layout for non-main buses. The comment in `isLayoutOK()` states the intent: disabled auxiliary/sidechain inputs are silence-backed and disabled auxiliary outputs are routed to discard scratch buffers.
+
+Processing prepares the patch for the full declared patch bus shape even if the host disables an auxiliary bus. `getPlaybackParams()` uses cached patch channel counts when loaded, and `refreshAudioChannelPointers()` fills missing input bus channels from `inputSilentBusScratch` and missing output channels from `outputDisabledBusScratch`.
+
+Dynamic patch-loader caveat: `JITLoaderPlugin::getBusLayout()` is fixed at construction as stereo `Input`, stereo `Sidechain`, stereo `Output`. The code comment says hot-swapping to a different bus shape requires reloading the plugin.
+
+`SinglePatchJITPlugin` preloads the manifest and derives bus properties at construction. `GeneratedPlugin` derives bus layout from generated `programDetailsJSON`, so fixed-patch/generated plugins are the right path for product validation.
+
+## CLAP
+
+`modules/plugin/include/clap/cmaj_CLAPPlugin.h` builds `inputAudioBusGroups` and `outputAudioBusGroups` with the shared helper. It exposes one CLAP audio port per bus group, not one port per endpoint. Only buses considered main by `isMainBus()` get `CLAP_AUDIO_PORT_IS_MAIN`.
+
+During process, CLAP flattens active host ports into the declared Cmajor bus shape. Missing input ports/channels are fed from cleared scratch, and missing output ports/channels are rendered into scratch and discarded. See the comments around `toInputChannelArrayView()` and `toOutputChannelArrayView()`.
+
+## Dev-Time Player
+
+`PatchPlayer` does not expose named buses to the OS audio device. Its comment in `modules/playback/include/cmaj_PatchPlayer.h` documents a flat channel mapping:
+
+- bus groups consume input channels in declaration order,
+- main/default comes first,
+- aux/sidechain groups take remaining input channels,
+- outputs are flattened back in the same bus-group order.
+
+This is why the smoke test can feed a four-channel WAV: channels 1-2 are main, channels 3-4 are sidechain for `SidechainDuck`.
+
+## Disabled Or Missing Buses
+
+The fork's desired semantics are:
+
+- Main buses must match their declared channel count.
+- Disabled/missing sidechain or aux inputs read silence.
+- Disabled/missing aux outputs are discarded.
+- A missing sidechain should not produce null reads or garbage detector input.
+
+This is code-backed for JUCE and CLAP scratch paths, and covered in the dev-time flat-channel path by the smoke test. It is not a substitute for DAW/plugin-format checks.
+
+## DAW Routing Notes
+
+These steps are operational notes, not repo-verifiable code claims.
+
+Ableton Live VST3:
+
+1. Put the generated VST3 on the track that should be processed.
+2. Open the sidechain section in the device header.
+3. Enable sidechain and choose the source track.
+4. Use the patch's meter/debug build or audio result to confirm the sidechain bus is not silent.
+
+Logic AU:
+
+1. Use the generated AU on an audio or instrument channel strip.
+2. Pick the source from Logic's Side Chain menu in the plugin header.
+3. Logic routes that source to the AU sidechain bus; confirm with a patch like `SidechainDuck`.
+
+Reaper pin mapper:
+
+1. Put the plugin on a track with at least four track channels.
+2. Open the plugin pin connector.
+3. Map track channels 1/2 to the main input and 3/4 to the sidechain input.
+4. For CLAP, verify the listed audio ports are `Input`, `Sidechain`, and `Output`.
+
+Bitwig CLAP:
+
+1. Prefer CLAP when validating the CLAP wrapper path.
+2. Add the plugin, expose its sidechain/audio input routing in Bitwig's device inspector.
+3. Route a source into the sidechain input and confirm ducking/meter response.
+
+## Regression Gate
+
+`tests/feather/sidechain_smoke.py` is the primary automated gate. It:
+
+- renders `examples/patches/SidechainDuck/SidechainDuck.cmajorpatch`,
+- creates a pulsed four-channel input, a silent four-channel input, and a two-channel main-only input,
+- asserts the missing-sidechain render matches the silent-sidechain render,
+- asserts sidechain pulses produce a meaningful RMS dip.
+
+Coverage limits are explicit in the script docstring: it covers the `cmaj render`/player flat-channel path and missing sidechain silence. It does not cover JUCE disabled-bus negotiation or CLAP missing-port processing; those still need pluginval and DAW checks.
+
+## Authoring Checklist
+
+- Annotate every audio endpoint that participates in multi-bus routing.
+- Use stable bus names: `Input`, `Sidechain`, `Output` unless a product needs more.
+- Keep sidechain endpoints as streams, usually `float32<2>`.
+- Do not rely on hot-swapping the dynamic loader to change bus shape.
+- Validate `SidechainDuck` after changing endpoint metadata, wrappers, or generated plugin helpers.
