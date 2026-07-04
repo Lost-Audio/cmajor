@@ -22,6 +22,10 @@
 #include "../../codegen/cmaj_CodeGenHelpers.h"
 #include "../../validation/cmaj_ValidationUtilities.h"
 
+#if CMAJ_ENABLE_NATIVE_OVERRIDES
+ #include "../cmaj_NativeOverrides.h"
+#endif
+
 namespace cmaj::llvm
 {
 
@@ -60,18 +64,24 @@ struct LLVMCodeGenerator
             std::cout << cmaj::AST::print (program) << std::endl;
     }
 
-    void addNativeOverriddenFunctions (AST::ExternalFunctionManager& externalFunctionManager)
+    bool addNativeOverriddenFunctions()
     {
-        // example of how to use this. Remove the commented-out stuff when there's something real in here..
+       #if CMAJ_ENABLE_NATIVE_OVERRIDES
+        // FEATHER: Register prepared native implementations for this LLVM link only.
+        return native_overrides::registerNativeOverrides (program, nativeFunctionOverrides) != 0;
+       #else
+        return false;
+       #endif
+    }
 
-        (void) externalFunctionManager;
-        // if (auto f = program.rootNamespace.findQualifiedFunction (std::string_view ("std::intrinsics::wrap"),
-        //                                                           allocator.int32Type, allocator.int32Type))
-        //     externalFunctionManager.addFunctionWithImplementation (*f,
-        //         (void*) +[] (int32_t value, int32_t size)
-        //         {
-        //             if (size == 0) return 0; auto n = value % size; if (n < 0) return n + size; return n;
-        //         });
+    void* findResolvedFunction (const AST::Function& f) const
+    {
+       #if CMAJ_ENABLE_NATIVE_OVERRIDES
+        if (auto found = nativeFunctionOverrides.find (std::addressof (f)); found != nativeFunctionOverrides.end())
+            return found->second;
+       #endif
+
+        return program.externalFunctionManager.findResolvedFunction (f);
     }
 
     bool generate()
@@ -216,6 +226,9 @@ struct LLVMCodeGenerator
     const AST::Allocator& allocator;
     ptr<AST::StructType> stateStruct, ioStruct;
     ptr<CodeGenerator<LLVMCodeGenerator>> codeGenerator;
+   #if CMAJ_ENABLE_NATIVE_OVERRIDES
+    native_overrides::FunctionMap nativeFunctionOverrides; // FEATHER: per-link native symbol map, no shared program mutation.
+   #endif
     bool useFastMaths = false;
 
     ::llvm::DataLayout dataLayout;
@@ -864,7 +877,7 @@ struct LLVMCodeGenerator
         auto callee = createFunction (name, AST::castToTypeBaseRef (f.returnType), getParameterTypesAddingRefsWhereNeeded (f));
         functions[std::addressof (f)] = callee;
 
-        if (auto customImplementation = program.externalFunctionManager.findResolvedFunction (f))
+        if (auto customImplementation = findResolvedFunction (f))
             externalFunctionPointers[name] = customImplementation;
 
         return callee;

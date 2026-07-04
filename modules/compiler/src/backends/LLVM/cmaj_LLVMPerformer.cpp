@@ -307,7 +307,14 @@ struct LLVMEngine
 
     EngineBase<LLVMEngine>& engine;
 
-    static std::string getEngineVersion()   { return "llvm1"; }
+    static std::string getEngineVersion()
+    {
+       #if CMAJ_ENABLE_NATIVE_OVERRIDES
+        return "llvm2-native-overrides"; // FEATHER: native externals change generated/cacheable LLVM modules.
+       #else
+        return "llvm1";
+       #endif
+    }
 
     static constexpr bool canUseForwardBranches = true;
     static constexpr bool usesDynamicRateAndSessionID = false;
@@ -336,9 +343,10 @@ struct LLVMEngine
                                        stringDictionary,
                                        false);
 
-            codeGen.addNativeOverriddenFunctions (llvmEngine.engine.program->externalFunctionManager);
+            auto nativeOverridesActive = codeGen.addNativeOverriddenFunctions();
 
-            bool loadedFromCache = loadFromCache (codeGen, cache, cacheKey);
+            // FEATHER: cached bitcode would contain declarations for native-overridden bodies but no bound symbols.
+            bool loadedFromCache = ! nativeOverridesActive && loadFromCache (codeGen, cache, cacheKey);
 
             if (! (loadedFromCache || codeGen.generate()))
             {
@@ -357,7 +365,7 @@ struct LLVMEngine
 
             initialiseEndpointHandlers (codeGen, llvmEngine.engine.endpointHandles);
 
-            if (cache != nullptr && ! loadedFromCache)
+            if (cache != nullptr && ! nativeOverridesActive && ! loadedFromCache)
                 codeGen.saveBitcodeToCache (*cache, cacheKey);
 
             lljit.addExternalFunctionSymbols (codeGen.externalFunctionPointers);

@@ -58,6 +58,11 @@
  #define CMAJ_ENABLE_CODEGEN_LLVM_WASM 1
 #endif
 
+#ifndef CMAJ_ENABLE_NATIVE_OVERRIDES
+ // FEATHER: non-CMake builds default native LLVM stdlib overrides on.
+ #define CMAJ_ENABLE_NATIVE_OVERRIDES 1
+#endif
+
 //==============================================================================
 #if ! (CMAJ_ENABLE_PERFORMER_CPP || CMAJ_ENABLE_PERFORMER_WEBVIEW || CMAJ_ENABLE_PERFORMER_LLVM \
         || CMAJ_ENABLE_CODEGEN_LLVM_WASM)

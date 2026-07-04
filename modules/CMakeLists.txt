@@ -3,6 +3,13 @@ cmake_minimum_required (VERSION 3.16..3.22)
 set_property (GLOBAL PROPERTY CMAJ_MODULE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 set_property (GLOBAL PROPERTY CMAJ_VERSION ${CMAJ_VERSION})
 
+option (CMAJ_ENABLE_NATIVE_OVERRIDES "Enable Feather native LLVM stdlib overrides" ON)
+option (CMAJ_NATIVE_FFT_RT_CONTRACT_CHECK "Enable Feather native FFT render-path lock/allocation assertions" OFF) # FEATHER
+
+if (${CMAKE_SYSTEM_NAME} MATCHES "Emscripten|WebAssembly|WASM")
+    set (CMAJ_ENABLE_NATIVE_OVERRIDES OFF CACHE BOOL "Enable Feather native LLVM stdlib overrides" FORCE)
+endif()
+
 # Add choc library once (must be called before any MAKE_CMAJ_LIBRARY calls)
 if (NOT TARGET choc::choc)
     add_subdirectory (${CMAKE_CURRENT_SOURCE_DIR}/../include/choc choc_build)
@@ -302,6 +309,27 @@ function (MAKE_CMAJ_LIBRARY)
         ${CMAJ_MODULE_DIR}/compiler/src/backends/WebAssembly/wasm3/*.c
     )
 
+    set (CMAJ_ENABLE_NATIVE_OVERRIDES_FOR_TARGET ${CMAJ_ENABLE_NATIVE_OVERRIDES})
+    set (CMAJ_NATIVE_FFT_RT_CONTRACT_CHECK_FOR_TARGET ${CMAJ_NATIVE_FFT_RT_CONTRACT_CHECK})
+
+    if (NOT CMAJ_ENABLE_PERFORMER_LLVM)
+        set (CMAJ_ENABLE_NATIVE_OVERRIDES_FOR_TARGET OFF)
+    endif()
+
+    if (NOT CMAJ_ENABLE_NATIVE_OVERRIDES_FOR_TARGET)
+        set (CMAJ_NATIVE_FFT_RT_CONTRACT_CHECK_FOR_TARGET OFF)
+    endif()
+
+    if (CMAJ_ENABLE_NATIVE_OVERRIDES_FOR_TARGET)
+        # FEATHER: PFFFT-backed native stdlib overrides for the in-process LLVM JIT only.
+        set (PFFFT_SOURCE
+            ${CMAJ_MODULE_DIR}/../3rdParty/pffft/pffft.c
+            ${CMAJ_MODULE_DIR}/../3rdParty/pffft/pffft_common.c
+        )
+
+        set (SOURCE ${SOURCE} ${PFFFT_SOURCE})
+    endif()
+
     if (CMAJ_INCLUDE_PLAYBACK)
         file (GLOB_RECURSE PLAYBACK_SOURCE
             ${CMAJ_MODULE_DIR}/playback/include/*.h
@@ -332,13 +360,25 @@ function (MAKE_CMAJ_LIBRARY)
         set (SOURCE ${SOURCE} ${SCRIPTING_SOURCE})
     endif()
 
-    source_group (TREE "${CMAJ_MODULE_DIR}" PREFIX "modules" FILES ${SOURCE})
+    set (MODULE_SOURCE_GROUP ${SOURCE})
+
+    if (PFFFT_SOURCE)
+        list (REMOVE_ITEM MODULE_SOURCE_GROUP ${PFFFT_SOURCE})
+    endif()
+
+    source_group (TREE "${CMAJ_MODULE_DIR}" PREFIX "modules" FILES ${MODULE_SOURCE_GROUP})
+
+    if (PFFFT_SOURCE)
+        source_group (TREE "${CMAJ_MODULE_DIR}/../3rdParty/pffft" PREFIX "3rdParty/pffft" FILES ${PFFFT_SOURCE})
+    endif()
 
     TRANSFORM_BOOL (CMAJ_ENABLE_PERFORMER_LLVM)
     TRANSFORM_BOOL (CMAJ_ENABLE_PERFORMER_WEBVIEW)
     TRANSFORM_BOOL (CMAJ_ENABLE_PERFORMER_CPP)
     TRANSFORM_BOOL (CMAJ_ENABLE_CODEGEN_CPP)
     TRANSFORM_BOOL (CMAJ_ENABLE_CODEGEN_LLVM_WASM)
+    TRANSFORM_BOOL (CMAJ_ENABLE_NATIVE_OVERRIDES_FOR_TARGET)
+    TRANSFORM_BOOL (CMAJ_NATIVE_FFT_RT_CONTRACT_CHECK_FOR_TARGET)
 
     add_compile_definitions (
         $<$<CONFIG:Debug>:DEBUG=1>
@@ -348,6 +388,8 @@ function (MAKE_CMAJ_LIBRARY)
         CMAJ_ENABLE_PERFORMER_CPP=${CMAJ_ENABLE_PERFORMER_CPP}
         CMAJ_ENABLE_CODEGEN_CPP=${CMAJ_ENABLE_CODEGEN_CPP}
         CMAJ_ENABLE_CODEGEN_LLVM_WASM=${CMAJ_ENABLE_CODEGEN_LLVM_WASM}
+        CMAJ_ENABLE_NATIVE_OVERRIDES=${CMAJ_ENABLE_NATIVE_OVERRIDES_FOR_TARGET}
+        CMAJ_NATIVE_FFT_RT_CONTRACT_CHECK=${CMAJ_NATIVE_FFT_RT_CONTRACT_CHECK_FOR_TARGET}
     )
 
     add_library (${CMAJ_LIBRARY_NAME} OBJECT
@@ -378,7 +420,12 @@ function (MAKE_CMAJ_LIBRARY)
         PRIVATE
             CMAJ_VERSION="${CMAJ_VERSION}"
             CHOC_ASSERT=must_include_assertion_header_before_any_choc_headers
+            PFFFT_STATIC_DEFINE
     )
+
+    if (PFFFT_SOURCE AND (CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|ARM64|AARCH64" OR CMAKE_OSX_ARCHITECTURES MATCHES "arm64|aarch64|ARM64|AARCH64"))
+        target_compile_definitions (${CMAJ_LIBRARY_NAME} PRIVATE PFFFT_ENABLE_NEON) # FEATHER: enable PFFFT NEON on ARM/Apple Silicon.
+    endif()
 
     target_include_directories (${CMAJ_LIBRARY_NAME}
         PUBLIC
@@ -391,6 +438,7 @@ function (MAKE_CMAJ_LIBRARY)
     target_include_directories (${CMAJ_LIBRARY_NAME}
         PRIVATE
             ${CMAJ_MODULE_DIR}/../3rdParty
+            ${CMAJ_MODULE_DIR}/../3rdParty/pffft
             ${LLVM_PATH_ROOT}/include
     )
 

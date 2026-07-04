@@ -112,6 +112,12 @@ struct CPlusPlusCodeGenerator
         return getEndpointHandleFn (e.getEndpointID());
     }
 
+    void* findResolvedFunction (const AST::Function& f) const
+    {
+        // FEATHER: C++ keeps using the program external manager; only LLVM layers native overrides locally.
+        return program.externalFunctionManager.findResolvedFunction (f);
+    }
+
     //==============================================================================
     bool generateFromLinkedProgram()
     {
