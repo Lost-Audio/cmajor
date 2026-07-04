@@ -446,6 +446,7 @@ Keep LF line endings; do not introduce CRLF on Windows.
 Any Feather edit inside an upstream-owned file needs a nearby `// FEATHER:` marker comment.
 Prefer new files over upstream file edits when the fork behaviour can be isolated.
 All implementation goes through the Codex/orchestrator workflow; git operations are performed by the orchestrator.
+Custom plugin GUIs are built with **Svelte 5** (`cmaj create --ui=svelte`: Vite + Tailwind 4 + shadcn-svelte + motion-core + motion-gpu). Mandatory for new UIs in this fork — do not introduce React into patch views; the house stack is Svelte.
 
 ## Picking the right models for workflows and subagents
 
