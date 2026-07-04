@@ -16,7 +16,15 @@
 //  EXPRESSED OR IMPLIED, INCLUDING MERCHANTABILITY AND FITNESS FOR PURPOSE, ARE
 //  DISCLAIMED.
 
-static constexpr auto patchManifest = R"(
+// FEATHER: cmaj create defaults to a Svelte/Vite custom view scaffold for Lost Audio patch development.
+enum class CreatedPatchUI
+{
+    svelte,
+    generic,
+    none
+};
+
+static constexpr auto patchManifestGeneric = R"(
 {
     "CmajorVersion":    1,
     "ID":               "com.your_name.your_patch_ID",
@@ -28,6 +36,28 @@ static constexpr auto patchManifest = R"(
     "isInstrument":     true,
 
     "source":           "NAME.cmajor"
+}
+)";
+
+static constexpr auto patchManifestSvelte = R"(
+{
+    "CmajorVersion":    1,
+    "ID":               "com.your_name.your_patch_ID",
+    "version":          "1.0",
+    "name":             "NAME",
+    "description":      "NAME",
+    "category":         "generator",
+    "manufacturer":     "Your Company Goes Here",
+    "isInstrument":     true,
+
+    "source":           "NAME.cmajor",
+
+    "view": {
+        "src":           "view/dist/index.js",
+        "width":         600,
+        "height":        400,
+        "resizable":     true
+    }
 }
 )";
 
@@ -53,6 +83,1405 @@ graph NAME  [[main]]
 
 )";
 
+static constexpr auto viewPackageJSON = R"cmaj_view(
+{
+  "name": "NAME-view",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host localhost --port 5173",
+    "build": "svelte-check --tsconfig ./tsconfig.json && vite build",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "preview": "vite preview --host localhost --port 4173"
+  },
+  "dependencies": {
+    "bits-ui": "2.18.1",
+    "clsx": "2.1.1",
+    "tailwind-merge": "3.4.0"
+  },
+  "optionalDependencies": {
+    "@motion-core/motion-gpu": "0.1.0"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "5.1.1",
+    "@tailwindcss/vite": "4.1.17",
+    "@types/node": "20.19.16",
+    "react-grab": "0.1.0",
+    "svelte": "5.55.7",
+    "svelte-check": "4.4.8",
+    "tailwindcss": "4.1.17",
+    "typescript": "5.7.3",
+    "vite": "6.4.2"
+  }
+}
+)cmaj_view";
+
+static constexpr auto viewIndexHTML = R"cmaj_view(
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NAME View</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
+)cmaj_view";
+
+static constexpr auto viewSvelteConfig = R"cmaj_view(
+import { vitePreprocess } from '@sveltejs/vite-plugin-svelte'
+
+export default {
+  preprocess: vitePreprocess(),
+}
+)cmaj_view";
+
+static constexpr auto viewTSConfig = R"cmaj_view(
+{
+  "extends": "./tsconfig.node.json",
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true,
+    "isolatedModules": true,
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "target": "ES2022",
+    "types": ["svelte", "vite/client"]
+  },
+  "include": ["src/**/*.ts", "src/**/*.svelte", "vite.config.ts", "svelte.config.js"]
+}
+)cmaj_view";
+
+static constexpr auto viewTSConfigNode = R"cmaj_view(
+{
+  "compilerOptions": {
+    "composite": true,
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "target": "ES2022",
+    "types": ["node"]
+  },
+  "include": ["vite.config.ts"]
+}
+)cmaj_view";
+
+static constexpr auto viewViteConfig = R"cmaj_view(
+import { svelte } from '@sveltejs/vite-plugin-svelte'
+import tailwindcss from '@tailwindcss/vite'
+import { resolve } from 'node:path'
+import { defineConfig, type Plugin } from 'vite'
+
+function inlineCssIntoEntry(): Plugin {
+  return {
+    name: 'cmajor-inline-library-css',
+    generateBundle(_options, bundle) {
+      const css = Object.entries(bundle)
+        .filter(([, file]) => file.type === 'asset' && file.fileName.endsWith('.css'))
+        .map(([fileName, file]) => {
+          delete bundle[fileName]
+          return String(file.type === 'asset' ? file.source : '')
+        })
+        .join('\n')
+
+      if (!css.trim()) return
+
+      const escaped = JSON.stringify(css)
+
+      for (const file of Object.values(bundle)) {
+        if (file.type !== 'chunk' || !file.isEntry) continue
+
+        file.code += `
+const __cmajorCss = ${escaped};
+if (typeof document !== 'undefined' && !document.querySelector('style[data-cmajor-view="NAME"]')) {
+  const style = document.createElement('style');
+  style.dataset.cmajorView = 'NAME';
+  style.textContent = __cmajorCss;
+  document.head.appendChild(style);
+}
+`
+      }
+    },
+  }
+}
+
+function devOnlyReactGrab(): Plugin {
+  return {
+    name: 'cmajor-react-grab-dev-only',
+    apply: 'serve',
+    transformIndexHtml(html) {
+      return html.replace('</body>', '  <script type="module" src="/src/dev/react-grab.ts"></script>\n  </body>')
+    },
+  }
+}
+
+export default defineConfig(({ command }) => ({
+  plugins: [svelte(), tailwindcss(), inlineCssIntoEntry(), devOnlyReactGrab()],
+  build: {
+    assetsInlineLimit: Number.MAX_SAFE_INTEGER,
+    copyPublicDir: false,
+    cssCodeSplit: false,
+    emptyOutDir: true,
+    lib: {
+      entry: resolve(import.meta.dirname, 'src/createPatchView.ts'),
+      formats: ['es'],
+      fileName: () => 'index.js',
+    },
+    minify: false,
+    outDir: 'dist',
+    rollupOptions: {
+      output: {
+        inlineDynamicImports: true,
+      },
+    },
+    sourcemap: false,
+    target: 'es2022',
+  },
+  server: {
+    host: 'localhost',
+    port: 5173,
+  },
+  define: {
+    __CMAJ_DEV__: command === 'serve',
+  },
+}))
+)cmaj_view";
+
+static constexpr auto viewComponentsJSON = R"cmaj_view(
+{
+  "$schema": "https://shadcn-svelte.com/schema.json",
+  "style": "new-york",
+  "tailwind": {
+    "config": "",
+    "css": "src/index.css",
+    "baseColor": "neutral"
+  },
+  "aliases": {
+    "components": "$lib/components",
+    "utils": "$lib/utils",
+    "ui": "$lib/components/ui"
+  },
+  "typescript": true
+}
+)cmaj_view";
+
+static constexpr auto viewIndexCSS = R"cmaj_view(
+@import "tailwindcss";
+
+:root {
+  color: #1f2421;
+  background: #d9d6c8;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-synthesis: none;
+  text-rendering: geometricPrecision;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+.cmajor-view-root {
+  width: 100%;
+  min-height: 100%;
+}
+)cmaj_view";
+
+static constexpr auto viewMainTS = R"cmaj_view(
+import './index.css'
+import App from './App.svelte'
+import { createPreviewPatchConnection } from './lib/cmajor'
+
+const target = document.getElementById('app')
+
+if (target) {
+  new App({
+    target,
+    props: {
+      patchConnection: createPreviewPatchConnection(),
+    },
+  })
+}
+)cmaj_view";
+
+static constexpr auto viewCreatePatchViewTS = R"cmaj_view(
+import './index.css'
+import App from './App.svelte'
+import type { PatchConnection } from './lib/cmajor'
+
+export default function createPatchView(patchConnection: PatchConnection): HTMLElement {
+  const container = document.createElement('div')
+  container.className = 'cmajor-view-root'
+
+  new App({
+    target: container,
+    props: { patchConnection },
+  })
+
+  return container
+}
+)cmaj_view";
+
+static constexpr auto viewUtilsTS = R"cmaj_view(
+import { clsx, type ClassValue } from 'clsx'
+import { twMerge } from 'tailwind-merge'
+
+export function cn(...inputs: ClassValue[]) {
+  return twMerge(clsx(inputs))
+}
+)cmaj_view";
+
+static constexpr auto viewMotionTS = R"cmaj_view(
+export type MotionHandle = {
+  cancel(): void
+  finished: Promise<void>
+}
+
+export type MotionOptions = {
+  duration?: number
+  easing?: string
+}
+
+export const motionDefaults = {
+  duration: 0.28,
+  easing: 'cubic-bezier(.2,.7,.2,1)',
+}
+
+export function animateElement(
+  element: Element,
+  keyframes: Keyframe[] | PropertyIndexedKeyframes,
+  options: MotionOptions = {},
+): MotionHandle {
+  // TODO: Replace this vendored facade with direct @motion-core imports once the offline scaffold
+  // can pin the exact published package/API. It mirrors the small animate() shape used by examples.
+  const animation = element.animate(keyframes, {
+    duration: (options.duration ?? motionDefaults.duration) * 1000,
+    easing: options.easing ?? motionDefaults.easing,
+    fill: 'both',
+  })
+
+  return {
+    cancel: () => animation.cancel(),
+    finished: animation.finished.then(() => undefined),
+  }
+}
+)cmaj_view";
+
+static constexpr auto viewMotionGPUShimTS = R"cmaj_view(
+export async function loadMotionGpu() {
+  try {
+    // TODO: Verify @motion-core/motion-gpu's final published API when network access is available.
+    // The package is optional; the demo falls back to raw WebGPU if it is not installed.
+    return await import('@motion-core/motion-gpu')
+  } catch {
+    return null
+  }
+}
+)cmaj_view";
+
+static constexpr auto viewCmajorTS = R"cmaj_view(
+import { createSubscriber } from 'svelte/reactivity'
+
+export type PrimitiveValue = number | boolean | string
+export type StoredStateValue = Record<string, unknown> | unknown[] | PrimitiveValue | null | undefined
+
+export type EndpointDescription = {
+  endpointID?: string
+  id?: string
+  name?: string
+  annotation?: Record<string, unknown>
+  type?: string
+  valueType?: string
+  purpose?: string
+}
+
+export type PatchStatus = {
+  loaded?: boolean
+  manifest?: { name?: string; view?: Record<string, unknown> }
+  details?: string
+  endpoints?: EndpointDescription[]
+  inputs?: EndpointDescription[]
+  outputs?: EndpointDescription[]
+  parameters?: ParameterDescription[]
+}
+
+export type ParameterDescription = {
+  endpointID: string
+  name: string
+  min: number
+  max: number
+  init: number | boolean
+  step?: number
+  unit?: string
+  boolean: boolean
+  group?: string
+  text?: string
+}
+
+export type PatchConnection = {
+  requestStatusUpdate(): void
+  addStatusListener(listener: (status: PatchStatus) => void): void
+  removeStatusListener(listener: (status: PatchStatus) => void): void
+  sendEventOrValue(endpointID: string, value: unknown, rampFrames?: number, timeoutMillisecs?: number): void
+  sendParameterGestureStart(endpointID: string): void
+  sendParameterGestureEnd(endpointID: string): void
+  requestParameterValue(endpointID: string): void
+  addParameterListener(endpointID: string, listener: (value: PrimitiveValue) => void): void
+  removeParameterListener(endpointID: string, listener: (value: PrimitiveValue) => void): void
+  addAllParameterListener(listener: (message: { endpointID: string; value: PrimitiveValue }) => void): void
+  removeAllParameterListener(listener: (message: { endpointID: string; value: PrimitiveValue }) => void): void
+  addEndpointListener(endpointID: string, listener: (message: unknown) => void, granularity?: number, sendFullAudioData?: boolean): void
+  removeEndpointListener(endpointID: string, listener: (message: unknown) => void): void
+  requestStoredStateValue(key: string): void
+  sendStoredStateValue(key: string, newValue: StoredStateValue): void
+  clearAllStoredStateValues(): void
+  addStoredStateValueListener(listener: (message: { key: string; value: StoredStateValue }) => void): void
+  removeStoredStateValueListener(listener: (message: { key: string; value: StoredStateValue }) => void): void
+  sendFullStoredState(fullState: Record<string, StoredStateValue>): void
+  requestFullStoredState(callback: (state: Record<string, StoredStateValue>) => void): void
+}
+
+class ReactiveSignal {
+  #notify: (() => void) | undefined
+  #subscribe = createSubscriber((update) => {
+    this.#notify = update
+    return () => {
+      this.#notify = undefined
+    }
+  })
+
+  track() {
+    this.#subscribe()
+  }
+
+  notify() {
+    this.#notify?.()
+  }
+}
+
+export class CmajorPatch {
+  #signal = new ReactiveSignal()
+  #status: PatchStatus | null = null
+  #parameters: ParameterDescription[] = []
+  #endpoints: EndpointDescription[] = []
+
+  #statusListener = (status: PatchStatus) => {
+    this.#status = status
+    this.#endpoints = endpointsFromStatus(status)
+    this.#parameters = parametersFromStatus(status)
+    this.#signal.notify()
+  }
+
+  constructor(readonly connection: PatchConnection) {
+    connection.addStatusListener(this.#statusListener)
+    connection.requestStatusUpdate()
+  }
+
+  get status() {
+    this.#signal.track()
+    return this.#status
+  }
+
+  get parameters() {
+    this.#signal.track()
+    return this.#parameters
+  }
+
+  get endpoints() {
+    this.#signal.track()
+    return this.#endpoints
+  }
+
+  parameter(endpointID: string, fallback?: Partial<ParameterDescription>) {
+    const description =
+      this.#parameters.find((param) => param.endpointID === endpointID) ??
+      createFallbackParameter(endpointID, fallback)
+
+    return new ParameterRuneStore(this.connection, description)
+  }
+
+  endpoint(endpointID: string, listener: (message: unknown) => void, granularity?: number, sendFullAudioData?: boolean) {
+    this.connection.addEndpointListener(endpointID, listener, granularity, sendFullAudioData)
+    return () => this.connection.removeEndpointListener(endpointID, listener)
+  }
+
+  storedState(key: string, initial: StoredStateValue = undefined) {
+    return new StoredStateRuneStore(this.connection, key, initial)
+  }
+
+  destroy() {
+    this.connection.removeStatusListener(this.#statusListener)
+  }
+}
+
+export class ParameterRuneStore {
+  readonly description: ParameterDescription
+
+  #signal = new ReactiveSignal()
+  #frame = 0
+  #hasPending = false
+  #destroyed = false
+  #value: PrimitiveValue
+  #dragging = false
+  #hostValue: PrimitiveValue | undefined
+  #pendingValue: PrimitiveValue | undefined
+  #listener = (value: PrimitiveValue) => this.#receiveHostValue(value)
+
+  constructor(
+    readonly connection: PatchConnection,
+    description: ParameterDescription,
+  ) {
+    this.description = description
+    this.#value = description.init
+    connection.addParameterListener(description.endpointID, this.#listener)
+    connection.requestParameterValue(description.endpointID)
+  }
+
+  get value() {
+    this.#signal.track()
+    return this.#value
+  }
+
+  get dragging() {
+    this.#signal.track()
+    return this.#dragging
+  }
+
+  get hostValue() {
+    this.#signal.track()
+    return this.#hostValue
+  }
+
+  set(value: PrimitiveValue) {
+    this.#value = coerceForParameter(this.description, value)
+    this.#pendingValue = this.#value
+    this.#hasPending = true
+    this.#signal.notify()
+    this.#scheduleFlush()
+  }
+
+  beginGesture() {
+    if (this.#dragging) return
+    this.#dragging = true
+    this.#signal.notify()
+    this.connection.sendParameterGestureStart(this.description.endpointID)
+  }
+
+  endGesture() {
+    if (!this.#dragging) return
+    this.flush()
+    this.#dragging = false
+    this.#signal.notify()
+    this.connection.sendParameterGestureEnd(this.description.endpointID)
+  }
+
+  flush() {
+    if (this.#frame) {
+      cancelAnimationFrame(this.#frame)
+      this.#frame = 0
+    }
+
+    if (!this.#hasPending) return
+
+    const value = this.#pendingValue
+    this.#hasPending = false
+    this.#pendingValue = undefined
+    this.connection.sendEventOrValue(this.description.endpointID, value)
+  }
+
+  destroy() {
+    this.flush()
+    this.#destroyed = true
+    this.connection.removeParameterListener(this.description.endpointID, this.#listener)
+  }
+
+  #scheduleFlush() {
+    if (this.#frame || this.#destroyed) return
+
+    this.#frame = requestAnimationFrame(() => {
+      this.#frame = 0
+      this.flush()
+    })
+  }
+
+  #receiveHostValue(value: PrimitiveValue) {
+    this.#hostValue = value
+
+    if (!this.#dragging) {
+      this.#value = coerceForParameter(this.description, value)
+    }
+
+    this.#signal.notify()
+  }
+}
+
+export class StoredStateRuneStore {
+  #signal = new ReactiveSignal()
+  #value: StoredStateValue
+
+  #listener = (message: { key: string; value: StoredStateValue }) => {
+    if (message.key === this.key) {
+      this.#value = message.value
+      this.#signal.notify()
+    }
+  }
+
+  constructor(
+    readonly connection: PatchConnection,
+    readonly key: string,
+    initial: StoredStateValue = undefined,
+  ) {
+    this.#value = initial
+    connection.addStoredStateValueListener(this.#listener)
+    connection.requestStoredStateValue(key)
+  }
+
+  get value() {
+    this.#signal.track()
+    return this.#value
+  }
+
+  set(value: StoredStateValue) {
+    this.#value = value
+    this.#signal.notify()
+    this.connection.sendStoredStateValue(this.key, value)
+  }
+
+  destroy() {
+    this.connection.removeStoredStateValueListener(this.#listener)
+  }
+}
+
+export function createCmajorPatch(connection: PatchConnection) {
+  return new CmajorPatch(connection)
+}
+
+export function createPreviewPatchConnection(): PatchConnection {
+  const listeners = new Map<string, Set<(message: unknown) => void>>()
+  const params = new Map<string, PrimitiveValue>([
+    ['gain', 0.35],
+    ['enabled', true],
+  ])
+
+  const status: PatchStatus = {
+    loaded: true,
+    manifest: { name: 'NAME' },
+    parameters: [
+      { endpointID: 'gain', name: 'Gain', min: 0, max: 1, init: 0.35, step: 0.01, unit: '', boolean: false, group: 'Main' },
+      { endpointID: 'enabled', name: 'Enabled', min: 0, max: 1, init: true, boolean: true, group: 'Main' },
+    ],
+  }
+
+  const dispatch = (type: string, message: unknown) => {
+    for (const listener of listeners.get(type) ?? []) {
+      listener(message)
+    }
+  }
+
+  return {
+    requestStatusUpdate: () => queueMicrotask(() => dispatch('status', status)),
+    addStatusListener: (listener) => {
+      const set = listeners.get('status') ?? new Set()
+      set.add(listener as (message: unknown) => void)
+      listeners.set('status', set)
+    },
+    removeStatusListener: (listener) => listeners.get('status')?.delete(listener as (message: unknown) => void),
+    sendEventOrValue: (endpointID, value) => {
+      params.set(endpointID, value as PrimitiveValue)
+      queueMicrotask(() => dispatch(`param:${endpointID}`, value))
+    },
+    sendParameterGestureStart: () => undefined,
+    sendParameterGestureEnd: () => undefined,
+    requestParameterValue: (endpointID) => queueMicrotask(() => dispatch(`param:${endpointID}`, params.get(endpointID) ?? 0)),
+    addParameterListener: (endpointID, listener) => {
+      const set = listeners.get(`param:${endpointID}`) ?? new Set()
+      set.add(listener as (message: unknown) => void)
+      listeners.set(`param:${endpointID}`, set)
+    },
+    removeParameterListener: (endpointID, listener) => listeners.get(`param:${endpointID}`)?.delete(listener as (message: unknown) => void),
+    addAllParameterListener: () => undefined,
+    removeAllParameterListener: () => undefined,
+    addEndpointListener: () => undefined,
+    removeEndpointListener: () => undefined,
+    requestStoredStateValue: (key) => queueMicrotask(() => dispatch('state', { key, value: undefined })),
+    sendStoredStateValue: (key, value) => queueMicrotask(() => dispatch('state', { key, value })),
+    clearAllStoredStateValues: () => undefined,
+    addStoredStateValueListener: (listener) => {
+      const set = listeners.get('state') ?? new Set()
+      set.add(listener as (message: unknown) => void)
+      listeners.set('state', set)
+    },
+    removeStoredStateValueListener: (listener) => listeners.get('state')?.delete(listener as (message: unknown) => void),
+    sendFullStoredState: () => undefined,
+    requestFullStoredState: (callback) => queueMicrotask(() => callback({})),
+  }
+}
+
+function endpointsFromStatus(status: PatchStatus) {
+  return [...(status.endpoints ?? []), ...(status.inputs ?? []), ...(status.outputs ?? [])]
+}
+
+function parametersFromStatus(status: PatchStatus): ParameterDescription[] {
+  if (status.parameters?.length) {
+    return status.parameters
+  }
+
+  return endpointsFromStatus(status)
+    .map(parameterFromEndpoint)
+    .filter((param): param is ParameterDescription => Boolean(param))
+}
+
+function parameterFromEndpoint(endpoint: EndpointDescription): ParameterDescription | null {
+  const annotation = endpoint.annotation ?? {}
+  const endpointID = endpoint.endpointID ?? endpoint.id ?? ''
+  const name = stringFrom(annotation.name) ?? endpoint.name ?? endpointID
+  const valueType = `${endpoint.valueType ?? endpoint.type ?? ''}`.toLowerCase()
+  const isBool = booleanFrom(annotation.boolean) || valueType.includes('bool')
+  const min = numberFrom(annotation.min) ?? 0
+  const max = numberFrom(annotation.max) ?? 1
+  const init = isBool ? booleanFrom(annotation.init) : numberFrom(annotation.init) ?? min
+
+  if (!endpointID || !name) {
+    return null
+  }
+
+  return {
+    endpointID,
+    name,
+    min,
+    max,
+    init,
+    step: numberFrom(annotation.step),
+    unit: stringFrom(annotation.unit),
+    boolean: isBool,
+    group: stringFrom(annotation.group),
+    text: stringFrom(annotation.text),
+  }
+}
+
+function createFallbackParameter(endpointID: string, fallback: Partial<ParameterDescription> = {}): ParameterDescription {
+  return {
+    endpointID,
+    name: fallback.name ?? endpointID,
+    min: fallback.min ?? 0,
+    max: fallback.max ?? 1,
+    init: fallback.init ?? 0,
+    step: fallback.step,
+    unit: fallback.unit,
+    boolean: fallback.boolean ?? false,
+    group: fallback.group,
+    text: fallback.text,
+  }
+}
+
+function coerceForParameter(description: ParameterDescription, value: PrimitiveValue): PrimitiveValue {
+  if (description.boolean) {
+    return Boolean(value)
+  }
+
+  const numberValue = typeof value === 'number' ? value : Number(value)
+
+  if (!Number.isFinite(numberValue)) {
+    return description.init
+  }
+
+  const clamped = Math.min(description.max, Math.max(description.min, numberValue))
+
+  if (!description.step || description.step <= 0) {
+    return clamped
+  }
+
+  const stepped = description.min + Math.round((clamped - description.min) / description.step) * description.step
+  return Number(Math.min(description.max, Math.max(description.min, stepped)).toFixed(decimalPlaces(description.step)))
+}
+
+function decimalPlaces(value: number) {
+  const [, fraction = ''] = `${value}`.split('.')
+  return fraction.length
+}
+
+function numberFrom(value: unknown) {
+  return typeof value === 'number' ? value : undefined
+}
+
+function booleanFrom(value: unknown) {
+  return value === true || value === 'true'
+}
+
+function stringFrom(value: unknown) {
+  return typeof value === 'string' ? value : undefined
+}
+)cmaj_view";
+
+static constexpr auto viewAppSvelte = R"cmaj_view(
+<script lang="ts">
+  import { onDestroy } from 'svelte'
+  import MotionExample from './components/MotionExample.svelte'
+  import WebGpuDemo from './components/WebGpuDemo.svelte'
+  import ParamToggle from './lib/components/ui/param-toggle.svelte'
+  import RotaryKnob from './lib/components/ui/rotary-knob.svelte'
+  import { createCmajorPatch, type PatchConnection, type ParameterRuneStore } from './lib/cmajor'
+
+  let { patchConnection }: { patchConnection: PatchConnection } = $props()
+
+  const patch = createCmajorPatch(patchConnection)
+
+  let gain: ParameterRuneStore | null = $state(null)
+  let enabled: ParameterRuneStore | null = $state(null)
+
+  $effect(() => {
+    const numeric = patch.parameters.find((param) => !param.boolean)
+    const toggle = patch.parameters.find((param) => param.boolean)
+
+    gain?.destroy()
+    enabled?.destroy()
+
+    gain = patch.parameter(numeric?.endpointID ?? 'gain', {
+      name: numeric?.name ?? 'Gain',
+      min: numeric?.min ?? 0,
+      max: numeric?.max ?? 1,
+      init: numeric?.init ?? 0.35,
+      step: numeric?.step ?? 0.01,
+      unit: numeric?.unit,
+    })
+
+    enabled = patch.parameter(toggle?.endpointID ?? 'enabled', {
+      name: toggle?.name ?? 'Enabled',
+      init: toggle?.init ?? true,
+      boolean: true,
+    })
+
+    return () => {
+      gain?.destroy()
+      enabled?.destroy()
+      gain = null
+      enabled = null
+    }
+  })
+
+  onDestroy(() => patch.destroy())
+</script>
+
+<main class="shell">
+  <section class="panel">
+    <header>
+      <div>
+        <p class="eyebrow">Cmajor Svelte View</p>
+        <h1>{patch.status?.manifest?.name ?? 'NAME'}</h1>
+      </div>
+      <span class:online={patch.status?.loaded} class="status">
+        {patch.status?.loaded ? 'loaded' : 'waiting'}
+      </span>
+    </header>
+
+    <div class="controls">
+      {#if gain}
+        <RotaryKnob store={gain} />
+      {/if}
+      {#if enabled}
+        <ParamToggle store={enabled} />
+      {/if}
+    </div>
+
+    <MotionExample />
+    <WebGpuDemo />
+  </section>
+</main>
+
+<style>
+  .shell {
+    display: grid;
+    width: 100%;
+    min-height: 400px;
+    padding: 18px;
+    place-items: stretch;
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.28), transparent 36%),
+      #d9d6c8;
+  }
+
+  .panel {
+    display: grid;
+    grid-template-rows: auto auto 1fr auto;
+    gap: 18px;
+    width: min(100%, 600px);
+    min-height: 364px;
+    margin: 0 auto;
+    border: 1px solid #8f9286;
+    border-radius: 8px;
+    padding: 18px;
+    background: #edecdf;
+    box-shadow: 0 20px 42px rgba(42, 43, 38, 0.16);
+  }
+
+  header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+  }
+
+  .eyebrow,
+  h1 {
+    margin: 0;
+    letter-spacing: 0;
+  }
+
+  .eyebrow {
+    color: #5f655d;
+    font-size: 0.7rem;
+    font-weight: 800;
+    text-transform: uppercase;
+  }
+
+  h1 {
+    color: #1f2421;
+    font-size: 1.35rem;
+    font-weight: 820;
+    line-height: 1.1;
+  }
+
+  .status {
+    border: 1px solid #9a9d92;
+    border-radius: 999px;
+    padding: 4px 9px;
+    color: #5c6259;
+    font-size: 0.72rem;
+    font-weight: 800;
+    text-transform: uppercase;
+  }
+
+  .status.online {
+    border-color: #60713b;
+    color: #2f4211;
+    background: #d7ef9f;
+  }
+
+  .controls {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px;
+  }
+
+  @media (max-width: 460px) {
+    .shell {
+      padding: 10px;
+    }
+
+    .panel {
+      min-height: 380px;
+      padding: 14px;
+    }
+
+    .controls {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>
+)cmaj_view";
+
+static constexpr auto viewRotaryKnobSvelte = R"cmaj_view(
+<script lang="ts">
+  import { Slider } from 'bits-ui'
+  import type { ParameterRuneStore } from '../../cmajor'
+
+  let { store }: { store: ParameterRuneStore } = $props()
+
+  let value = $derived(typeof store.value === 'number' ? store.value : Number(store.value) || 0)
+  let percent = $derived(store.description.max === store.description.min ? 0 : (value - store.description.min) / (store.description.max - store.description.min))
+  let rotation = $derived(-135 + Math.min(1, Math.max(0, percent)) * 270)
+  let fill = $derived(`${Math.min(1, Math.max(0, percent)) * 75}%`)
+  let display = $derived(`${format(value)}${store.description.unit ?? ''}`)
+
+  function setValue(next: number) {
+    store.set(next)
+  }
+
+  function format(next: number) {
+    return Math.abs(next) < 10 ? next.toFixed(2).replace(/\.?0+$/, '') : next.toFixed(1).replace(/\.0$/, '')
+  }
+</script>
+
+<div class="knob-card" style={`--rotation: ${rotation}deg; --fill: ${fill};`}>
+  <span class="label">{store.description.name}</span>
+  <div
+    class:dragging={store.dragging}
+    class="face"
+    aria-hidden="true"
+    onpointerdown={() => store.beginGesture()}
+    onpointerup={() => store.endGesture()}
+    onpointercancel={() => store.endGesture()}
+    onlostpointercapture={() => store.endGesture()}
+  >
+    <span class="cap"><span></span></span>
+  </div>
+  <strong>{display}</strong>
+  <Slider.Root
+    class="slider"
+    type="single"
+    min={store.description.min}
+    max={store.description.max}
+    step={store.description.step ?? 0.01}
+    value={value}
+    onValueChange={setValue}
+    onValueCommit={() => store.endGesture()}
+    onpointerdown={() => store.beginGesture()}
+  >
+    <Slider.Range class="range" />
+    <Slider.Thumb class="thumb" index={0} />
+  </Slider.Root>
+</div>
+
+<style>
+  .knob-card {
+    --rotation: -135deg;
+    --fill: 0%;
+    display: grid;
+    min-width: 0;
+    justify-items: center;
+    gap: 8px;
+    border: 1px solid #a5a79d;
+    border-radius: 8px;
+    padding: 14px;
+    background: #e3e2d5;
+  }
+
+  .label,
+  strong {
+    overflow: hidden;
+    max-width: 100%;
+    color: #2f342f;
+    font-size: 0.74rem;
+    font-weight: 850;
+    letter-spacing: 0;
+    text-overflow: ellipsis;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+
+  strong {
+    color: #111511;
+    font-size: 0.88rem;
+  }
+
+  .face {
+    display: grid;
+    width: 82px;
+    aspect-ratio: 1;
+    place-items: center;
+    border-radius: 999px;
+    background:
+      conic-gradient(from -135deg, #526756 var(--fill), transparent 0 75%, transparent 0),
+      #aeb0a5;
+    box-shadow: inset 0 0 0 1px #76796f;
+  }
+
+  .face.dragging {
+    outline: 2px solid #4269ff;
+    outline-offset: 3px;
+  }
+
+  .cap {
+    position: relative;
+    width: 64px;
+    aspect-ratio: 1;
+    border: 1px solid #696d63;
+    border-radius: inherit;
+    background:
+      linear-gradient(145deg, rgba(255, 255, 255, 0.55), transparent 42%),
+      #c7c9bd;
+    transform: rotate(var(--rotation));
+  }
+
+  .cap span {
+    position: absolute;
+    top: 8px;
+    left: calc(50% - 2px);
+    width: 4px;
+    height: 18px;
+    border-radius: 999px;
+    background: #1f2421;
+  }
+
+  :global(.slider) {
+    position: relative;
+    width: 100%;
+    height: 22px;
+    touch-action: none;
+  }
+
+  :global(.slider)::before {
+    position: absolute;
+    top: 9px;
+    right: 0;
+    left: 0;
+    height: 4px;
+    border-radius: 999px;
+    background: #b8baaf;
+    content: "";
+  }
+
+  :global(.range) {
+    position: absolute;
+    top: 9px;
+    height: 4px;
+    border-radius: 999px;
+    background: #526756;
+  }
+
+  :global(.thumb) {
+    display: block;
+    width: 14px;
+    height: 14px;
+    border: 2px solid #394139;
+    border-radius: 999px;
+    background: #f7f6eb;
+  }
+</style>
+)cmaj_view";
+
+static constexpr auto viewParamToggleSvelte = R"cmaj_view(
+<script lang="ts">
+  import { Switch } from 'bits-ui'
+  import type { ParameterRuneStore } from '../../cmajor'
+
+  let { store }: { store: ParameterRuneStore } = $props()
+  let checked = $derived(Boolean(store.value))
+
+  function setChecked(next: boolean) {
+    store.beginGesture()
+    store.set(next)
+    store.endGesture()
+  }
+</script>
+
+<div class="toggle-card">
+  <div>
+    <span>{store.description.name}</span>
+    <strong>{checked ? 'On' : 'Off'}</strong>
+  </div>
+  <Switch.Root class="switch" checked={checked} onCheckedChange={setChecked} aria-label={store.description.name}>
+    <Switch.Thumb class="thumb" />
+  </Switch.Root>
+</div>
+
+<style>
+  .toggle-card {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    border: 1px solid #a5a79d;
+    border-radius: 8px;
+    padding: 14px;
+    background: #e3e2d5;
+  }
+
+  div div {
+    display: grid;
+    min-width: 0;
+    gap: 3px;
+  }
+
+  span,
+  strong {
+    overflow: hidden;
+    color: #2f342f;
+    font-size: 0.74rem;
+    font-weight: 850;
+    letter-spacing: 0;
+    text-overflow: ellipsis;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+
+  strong {
+    color: #111511;
+    font-size: 0.95rem;
+  }
+
+  :global(.switch) {
+    position: relative;
+    flex: 0 0 auto;
+    width: 52px;
+    height: 30px;
+    border: 1px solid #76796f;
+    border-radius: 999px;
+    background: #b9bbae;
+    transition: background 140ms ease;
+  }
+
+  :global(.switch[data-state='checked']) {
+    background: #c8ec68;
+  }
+
+  :global(.switch:focus-visible) {
+    outline: 2px solid #4269ff;
+    outline-offset: 2px;
+  }
+
+  :global(.thumb) {
+    position: absolute;
+    top: 3px;
+    left: 3px;
+    width: 22px;
+    height: 22px;
+    border-radius: 999px;
+    background: #f7f6eb;
+    box-shadow: 0 1px 3px rgba(29, 31, 27, 0.28);
+    transition: transform 140ms ease;
+  }
+
+  :global(.switch[data-state='checked'] .thumb) {
+    transform: translateX(22px);
+  }
+</style>
+)cmaj_view";
+
+static constexpr auto viewMotionExampleSvelte = R"cmaj_view(
+<script lang="ts">
+  import { onMount } from 'svelte'
+  import { animateElement } from '../lib/motion'
+
+  let meter: HTMLDivElement | null = $state(null)
+
+  onMount(() => {
+    if (!meter) return
+
+    const handle = animateElement(
+      meter,
+      [
+        { transform: 'scaleX(0.22)', opacity: 0.65 },
+        { transform: 'scaleX(0.82)', opacity: 1 },
+        { transform: 'scaleX(0.42)', opacity: 0.8 },
+      ],
+      { duration: 1.4, easing: 'ease-in-out' },
+    )
+
+    return () => handle.cancel()
+  })
+</script>
+
+<div class="motion-row">
+  <span>Motion</span>
+  <div class="track"><div bind:this={meter}></div></div>
+</div>
+
+<style>
+  .motion-row {
+    display: grid;
+    grid-template-columns: 76px minmax(0, 1fr);
+    align-items: center;
+    gap: 12px;
+  }
+
+  span {
+    color: #4b514a;
+    font-size: 0.72rem;
+    font-weight: 850;
+    letter-spacing: 0;
+    text-transform: uppercase;
+  }
+
+  .track {
+    overflow: hidden;
+    height: 10px;
+    border-radius: 999px;
+    background: #c6c8bc;
+  }
+
+  .track div {
+    width: 100%;
+    height: 100%;
+    border-radius: inherit;
+    background: #526756;
+    transform-origin: left center;
+  }
+</style>
+)cmaj_view";
+
+static constexpr auto viewWebGpuDemoSvelte = R"cmaj_view(
+<script lang="ts">
+  import { onMount } from 'svelte'
+  import { loadMotionGpu } from '../lib/motion-gpu'
+
+  let canvas: HTMLCanvasElement | null = $state(null)
+  let label = $state('WebGPU optional')
+
+  onMount(() => {
+    let cancelled = false
+
+    async function run() {
+      const motionGpu = await loadMotionGpu()
+
+      if (cancelled || !canvas) return
+
+      label = motionGpu ? 'motion-gpu ready' : navigator.gpu ? 'raw WebGPU ready' : 'WebGPU unavailable'
+
+      const context = canvas.getContext('2d')
+      if (!context) return
+
+      let frame = 0
+      const draw = () => {
+        if (cancelled || !context || !canvas) return
+        frame += 1
+        const width = canvas.width
+        const height = canvas.height
+        context.clearRect(0, 0, width, height)
+        context.fillStyle = '#c4c7b8'
+        context.fillRect(0, 0, width, height)
+        context.fillStyle = '#526756'
+        context.fillRect(0, height - 10 - Math.sin(frame / 22) * 8, width, 7)
+        context.fillStyle = '#1f2421'
+        context.beginPath()
+        context.arc(20 + ((frame * 1.6) % (width - 40)), height / 2, 8, 0, Math.PI * 2)
+        context.fill()
+        requestAnimationFrame(draw)
+      }
+      draw()
+    }
+
+    void run()
+
+    return () => {
+      cancelled = true
+    }
+  })
+</script>
+
+<div class="gpu-row">
+  <span>{label}</span>
+  <canvas bind:this={canvas} width="260" height="54" aria-label={label}></canvas>
+</div>
+
+<style>
+  .gpu-row {
+    display: grid;
+    grid-template-columns: 120px minmax(0, 1fr);
+    align-items: center;
+    gap: 12px;
+  }
+
+  span {
+    overflow: hidden;
+    color: #4b514a;
+    font-size: 0.72rem;
+    font-weight: 850;
+    letter-spacing: 0;
+    text-overflow: ellipsis;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+
+  canvas {
+    width: 100%;
+    height: 54px;
+    border: 1px solid #a0a398;
+    border-radius: 6px;
+    background: #c4c7b8;
+  }
+</style>
+)cmaj_view";
+
+static constexpr auto viewReactGrabTS = R"cmaj_view(
+if (import.meta.env.DEV) {
+  void import('react-grab')
+    .then((mod) => {
+      const api = mod as Record<string, unknown>
+      const install = api.default ?? api.install ?? api.createReactGrab
+
+      if (typeof install === 'function') {
+        install({ framework: 'svelte', root: '#app' })
+      }
+    })
+    .catch(() => {
+      console.info('[cmajor-view] react-grab is dev-only and was not loaded')
+    })
+}
+)cmaj_view";
+
+static constexpr auto viewViteEnvDTS = R"cmaj_view(
+/// <reference types="svelte" />
+/// <reference types="vite/client" />
+
+declare const __CMAJ_DEV__: boolean
+
+declare module '@motion-core/motion-gpu' {
+  const api: Record<string, unknown>
+  export default api
+}
+
+declare module 'react-grab' {
+  const api: Record<string, unknown>
+  export default api
+}
+)cmaj_view";
+
+static CreatedPatchUI parseCreatedPatchUI (choc::ArgumentList& args)
+{
+    if (auto ui = args.removeValueFor ("--ui"))
+    {
+        if (*ui == "svelte")   return CreatedPatchUI::svelte;
+        if (*ui == "generic")  return CreatedPatchUI::generic;
+        if (*ui == "none")     return CreatedPatchUI::none;
+
+        throw std::runtime_error ("Expected --ui to be one of: svelte, generic, none");
+    }
+
+    return CreatedPatchUI::svelte;
+}
+
+static void writePatchFile (const std::filesystem::path& folder, const std::filesystem::path& relativePath,
+                            std::string_view content, const std::string& name)
+{
+    auto target = folder / relativePath;
+    std::filesystem::create_directories (target.parent_path());
+
+    choc::file::replaceFileWithContent (target, choc::text::trimStart (choc::text::replace (std::string (content), "NAME", name)));
+}
+
+static void writeSvelteView (const std::filesystem::path& folder, const std::string& name)
+{
+    writePatchFile (folder, "view/package.json", viewPackageJSON, name);
+    writePatchFile (folder, "view/index.html", viewIndexHTML, name);
+    writePatchFile (folder, "view/svelte.config.js", viewSvelteConfig, name);
+    writePatchFile (folder, "view/tsconfig.json", viewTSConfig, name);
+    writePatchFile (folder, "view/tsconfig.node.json", viewTSConfigNode, name);
+    writePatchFile (folder, "view/vite.config.ts", viewViteConfig, name);
+    writePatchFile (folder, "view/components.json", viewComponentsJSON, name);
+    writePatchFile (folder, "view/src/index.css", viewIndexCSS, name);
+    writePatchFile (folder, "view/src/main.ts", viewMainTS, name);
+    writePatchFile (folder, "view/src/createPatchView.ts", viewCreatePatchViewTS, name);
+    writePatchFile (folder, "view/src/lib/utils.ts", viewUtilsTS, name);
+    writePatchFile (folder, "view/src/lib/motion.ts", viewMotionTS, name);
+    writePatchFile (folder, "view/src/lib/motion-gpu.ts", viewMotionGPUShimTS, name);
+    writePatchFile (folder, "view/src/lib/cmajor.ts", viewCmajorTS, name);
+    writePatchFile (folder, "view/src/App.svelte", viewAppSvelte, name);
+    writePatchFile (folder, "view/src/lib/components/ui/rotary-knob.svelte", viewRotaryKnobSvelte, name);
+    writePatchFile (folder, "view/src/lib/components/ui/param-toggle.svelte", viewParamToggleSvelte, name);
+    writePatchFile (folder, "view/src/components/MotionExample.svelte", viewMotionExampleSvelte, name);
+    writePatchFile (folder, "view/src/components/WebGpuDemo.svelte", viewWebGpuDemoSvelte, name);
+    writePatchFile (folder, "view/src/dev/react-grab.ts", viewReactGrabTS, name);
+    writePatchFile (folder, "view/src/vite-env.d.ts", viewViteEnvDTS, name);
+}
+
 void createPatch (choc::ArgumentList& args)
 {
     std::string name;
@@ -60,6 +1489,7 @@ void createPatch (choc::ArgumentList& args)
     if (auto n = args.removeValueFor ("--name"))
         name = choc::file::makeSafeFilename (choc::text::removeDoubleQuotes (*n));
 
+    auto ui = parseCreatedPatchUI (args);
     auto files = args.getAllAsFiles();
 
     if (files.size() != 1)
@@ -76,10 +1506,13 @@ void createPatch (choc::ArgumentList& args)
         name = folder.stem().string();
 
     choc::file::replaceFileWithContent ((folder / name).replace_extension (".cmajorpatch"),
-                                        choc::text::trimStart (choc::text::replace (patchManifest, "NAME", name)));
+                                        choc::text::trimStart (choc::text::replace (ui == CreatedPatchUI::svelte ? patchManifestSvelte : patchManifestGeneric, "NAME", name)));
 
     choc::file::replaceFileWithContent ((folder / name).replace_extension (".cmajor"),
                                         choc::text::trimStart (choc::text::replace (patchCode, "NAME", name)));
+
+    if (ui == CreatedPatchUI::svelte)
+        writeSvelteView (folder, name);
 
     std::cout << "Created Cmajor patch in: " << folder.string() << std::endl;
 }
