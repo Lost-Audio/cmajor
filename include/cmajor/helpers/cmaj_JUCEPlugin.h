@@ -34,6 +34,7 @@
 #include <atomic>
 #include <cstdint>
 #include <iostream>
+#include <mutex>
 #include <utility>
 #include <vector>
 #include "cmaj_AudioBusLayoutHelper.h"
@@ -951,7 +952,7 @@ protected:
         for (auto& p : patch->getParameterList())
             paramList.appendChild (juce::ValueTree (ids.PARAM,
                                                     { { ids.ID, juce::String (p->properties.endpointID) },
-                                                      { ids.V, p->currentValue } }),
+                                                      { ids.V, p->getCurrentValue() } }),
                                    nullptr);
 
         state.appendChild (paramList, nullptr);
@@ -1171,79 +1172,94 @@ protected:
 
         bool setPatchParam (PatchParameterPtr p)
         {
-            if (patchParam == p)
-                return false;
-
-            detach();
-            patchParam = std::move (p);
-
-            patchParam->valueChanged = [this] (float v)
             {
-                sendValueChangedMessageToListeners (patchParam->properties.convertTo0to1 (v));
-            };
+                const std::scoped_lock lock (patchParamLock);
 
-            patchParam->gestureStart = [this] { beginChangeGesture(); };
-            patchParam->gestureEnd   = [this] { endChangeGesture(); };
+                if (patchParam == p)
+                    return false;
+
+                detachWithoutLock();
+                patchParam = std::move (p);
+
+                auto* boundParam = patchParam.get();
+
+                patchParam->valueChanged = [this, boundParam] (float v)
+                {
+                    sendValueChangedMessageToListeners (boundParam->properties.convertTo0to1 (v));
+                };
+
+                patchParam->gestureStart = [this] { beginChangeGesture(); };
+                patchParam->gestureEnd   = [this] { endChangeGesture(); };
+            }
+
             return true;
         }
 
         void detach()
         {
+            const std::scoped_lock lock (patchParamLock);
+            detachWithoutLock();
+        }
+
+        void detachWithoutLock()
+        {
             if (patchParam != nullptr)
             {
-                patchParam->valueChanged = [] (float) {};
-                patchParam->gestureStart = [] {};
-                patchParam->gestureEnd   = [] {};
+                patchParam->valueChanged.reset();
+                patchParam->gestureStart.reset();
+                patchParam->gestureEnd.reset();
             }
         }
 
         void forceValueChanged()
         {
-            if (patchParam != nullptr)
-                patchParam->valueChanged (patchParam->currentValue);
+            if (auto p = getPatchParam())
+                p->valueChanged (p->getCurrentValue());
         }
 
         juce::String getParameterID() const override                { return paramID; }
-        juce::String getName (int maxLength) const override         { return patchParam == nullptr ? "unknown" : patchParam->properties.name.substr (0, (size_t) maxLength); }
-        juce::String getLabel() const override                      { return patchParam == nullptr ? juce::String() : patchParam->properties.unit; }
+        juce::String getName (int maxLength) const override         { if (auto p = getPatchParam()) return p->properties.name.substr (0, (size_t) maxLength); return "unknown"; }
+        juce::String getLabel() const override                      { if (auto p = getPatchParam()) return p->properties.unit; return {}; }
         Category getCategory() const override                       { return Category::genericParameter; }
-        bool isDiscrete() const override                            { return patchParam != nullptr && patchParam->properties.discrete; }
-        bool isBoolean() const override                             { return patchParam != nullptr && patchParam->properties.boolean; }
-        bool isAutomatable() const override                         { return patchParam == nullptr || patchParam->properties.automatable; }
-        bool isMetaParameter() const override                       { return patchParam != nullptr && patchParam->properties.hidden; }
+        bool isDiscrete() const override                            { if (auto p = getPatchParam()) return p->properties.discrete; return false; }
+        bool isBoolean() const override                             { if (auto p = getPatchParam()) return p->properties.boolean; return false; }
+        bool isAutomatable() const override                         { if (auto p = getPatchParam()) return p->properties.automatable; return true; }
+        bool isMetaParameter() const override                       { if (auto p = getPatchParam()) return p->properties.hidden; return false; }
 
         juce::StringArray getAllValueStrings() const override
         {
             juce::StringArray result;
 
-            if (patchParam != nullptr)
-                for (auto& s : patchParam->properties.valueStrings)
+            if (auto p = getPatchParam())
+                for (auto& s : p->properties.valueStrings)
                     result.add (s);
 
             return result;
         }
 
-        float getDefaultValue() const override       { return patchParam != nullptr ? patchParam->properties.convertTo0to1 (patchParam->properties.defaultValue) : 0.0f; }
-        float getValue() const override              { return patchParam != nullptr ? patchParam->properties.convertTo0to1 (patchParam->currentValue) : 0.0f; }
-        void setValue (float newValue) override      { if (patchParam != nullptr) patchParam->setValue (patchParam->properties.convertFrom0to1 (newValue), false, -1, 0); }
+        float getDefaultValue() const override       { if (auto p = getPatchParam()) return p->properties.convertTo0to1 (p->properties.defaultValue); return 0.0f; }
+        float getValue() const override              { if (auto p = getPatchParam()) return p->properties.convertTo0to1 (p->getCurrentValue()); return 0.0f; }
+        void setValue (float newValue) override      { if (auto p = getPatchParam()) p->setValue (p->properties.convertFrom0to1 (newValue), false, -1, 0); }
 
         juce::String getText (float v, int length) const override
         {
-            if (patchParam == nullptr)
+            auto p = getPatchParam();
+
+            if (p == nullptr)
                 return "0";
 
-            juce::String result = patchParam->properties.getValueAsString (patchParam->properties.convertFrom0to1 (v));
+            juce::String result = p->properties.getValueAsString (p->properties.convertFrom0to1 (v));
             return length > 0 ? result.substring (0, length) : result;
         }
 
         float getValueForText (const juce::String& text) const override
         {
-            if (patchParam != nullptr)
+            if (auto p = getPatchParam())
             {
-                if (auto value = patchParam->properties.getStringAsValue (text.toStdString()))
+                if (auto value = p->properties.getStringAsValue (text.toStdString()))
                     return *value;
 
-                return patchParam->properties.defaultValue;
+                return p->properties.defaultValue;
             }
 
             return 0;
@@ -1251,14 +1267,21 @@ protected:
 
         int getNumSteps() const override
         {
-            if (patchParam != nullptr)
-                if (auto steps = patchParam->properties.getNumDiscreteOptions())
+            if (auto p = getPatchParam())
+                if (auto steps = p->properties.getNumDiscreteOptions())
                     return static_cast<int> (steps);
 
             return AudioProcessor::getDefaultNumParameterSteps();
         }
 
+        PatchParameterPtr getPatchParam() const
+        {
+            const std::scoped_lock lock (patchParamLock);
+            return patchParam;
+        }
+
         PatchParameterPtr patchParam;
+        mutable std::mutex patchParamLock;
         const juce::String paramID;
     };
 

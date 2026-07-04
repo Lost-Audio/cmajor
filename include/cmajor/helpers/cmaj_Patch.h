@@ -21,6 +21,7 @@
 #include "cmaj_PatchHelpers.h"
 #include "cmaj_AudioMIDIPerformer.h"
 
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -386,17 +387,18 @@ struct PatchParameter  : public std::enable_shared_from_this<PatchParameter>
     bool setValue (const choc::value::ValueView&, bool forceSend, int32_t numRampFrames, uint32_t timeoutMilliseconds);
     /// Resets the parameter's value. For a default number of ramp frames, pass -1
     bool resetToDefaultValue (bool forceSend, int32_t numRampFrames, uint32_t timeoutMilliseconds);
+    float getCurrentValue() const noexcept;
 
     //==============================================================================
     const PatchParameterProperties properties;
     EndpointHandle endpointHandle;
-    float currentValue = 0;
+    std::atomic<float> currentValue { 0 };
 
     // optional callback that's invoked when the value is changed
-    std::function<void(float)> valueChanged;
+    choc::threading::ThreadSafeFunctor<std::function<void(float)>> valueChanged;
 
     // optional callbacks for gesture start/end events
-    std::function<void()> gestureStart, gestureEnd;
+    choc::threading::ThreadSafeFunctor<std::function<void()>> gestureStart, gestureEnd;
 
 private:
     std::weak_ptr<Patch::PatchRenderer> renderer;
@@ -2186,7 +2188,7 @@ inline void Patch::rebuild (bool synchronous)
     {
         if (isPlayable())
             for (auto& param : getParameterList())
-                lastLoadParams.parameterValues[param->properties.endpointID] = param->currentValue;
+                lastLoadParams.parameterValues[param->properties.endpointID] = param->getCurrentValue();
 
         if (lastLoadParams.manifest.reload())
         {
@@ -2501,14 +2503,14 @@ inline choc::value::Value Patch::getFullStoredState() const
     paramsToSave.reserve (256);
 
     for (auto& param : getParameterList())
-        if (param->currentValue != param->properties.defaultValue)
+        if (param->getCurrentValue() != param->properties.defaultValue)
             paramsToSave.push_back (param.get());
 
     auto parameters = choc::value::createArray (static_cast<uint32_t> (paramsToSave.size()),
                                                 [&] (uint32_t i)
     {
         return choc::json::create ("name", paramsToSave[i]->properties.endpointID,
-                                   "value", paramsToSave[i]->currentValue);
+                                   "value", paramsToSave[i]->getCurrentValue());
     });
 
     return choc::json::create ("parameters", parameters,
@@ -2729,7 +2731,7 @@ inline void Patch::sendGestureEnd (const EndpointID& endpointID)
 inline void Patch::sendCurrentParameterValueToViews (const EndpointID& endpointID) const
 {
     if (auto param = findParameter (endpointID))
-        sendParameterChangeToViews (endpointID, param->currentValue);
+        sendParameterChangeToViews (endpointID, param->getCurrentValue());
 }
 
 inline bool Patch::startEndpointData (PatchView& view, const EndpointID& endpointID, std::string replyType, uint32_t granularity, bool fullData)
@@ -2899,20 +2901,24 @@ inline PatchParameter::PatchParameter (std::shared_ptr<Patch::PatchRenderer> r, 
 {
 }
 
+inline float PatchParameter::getCurrentValue() const noexcept
+{
+    return currentValue.load (std::memory_order_relaxed);
+}
+
 inline bool PatchParameter::setValue (float newValue, bool forceSend, int32_t numRampFrames, uint32_t timeoutMilliseconds)
 {
     newValue = properties.snapAndConstrainValue (newValue);
 
-    if (currentValue != newValue || forceSend)
-    {
-        currentValue = newValue;
+    auto previousValue = currentValue.exchange (newValue, std::memory_order_relaxed);
 
+    if (previousValue != newValue || forceSend)
+    {
         if (auto r = renderer.lock())
             if (! r->postParameterChange (properties, endpointHandle, newValue, numRampFrames, timeoutMilliseconds))
                 return false;
 
-        if (valueChanged)
-            valueChanged (newValue);
+        valueChanged (newValue);
     }
 
     return true;

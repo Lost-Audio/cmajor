@@ -939,7 +939,7 @@ private:
         InitialParameterValues initialParameterValues {};
 
         for (const auto& parameter : patch.getParameterList())
-            initialParameterValues[parameter->properties.endpointID] = parameter->currentValue;
+            initialParameterValues[parameter->properties.endpointID] = parameter->getCurrentValue();
 
         if (! patch.preload (manifest))
             return {};
@@ -1921,8 +1921,7 @@ inline bool Plugin::Impl::clapParameters_getValue (clap_id id, double* out)
     if (auto parameterEntry = automatableParametersByHandle.find (id);
         parameterEntry != automatableParametersByHandle.end())
     {
-        // TODO: make `PatchParameter::currentValue` an atomic
-        auto clapValue = parameterEntry->second->currentValue;
+        auto clapValue = parameterEntry->second->getCurrentValue();
 
         if (auto maybeMappers = automatableParameterMappingFunctionsByHandle.find (id);
             maybeMappers != automatableParameterMappingFunctionsByHandle.end())
