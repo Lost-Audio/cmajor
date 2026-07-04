@@ -179,6 +179,16 @@ inline std::vector<BusGroup> groupEndpointsByBus (const EndpointDetailsList& end
     return groups;
 }
 
+inline uint32_t getTotalAudioChannels (const std::vector<BusGroup>& groups)
+{
+    uint32_t channelCount = 0;
+
+    for (const auto& group : groups)
+        channelCount += group.channelCount;
+
+    return channelCount;
+}
+
 inline bool isMainBus (const BusGroup& group, size_t index)
 {
     if (group.isAuxiliary())

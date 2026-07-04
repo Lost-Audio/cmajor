@@ -243,6 +243,8 @@ private:
     void updateParameterInfoCachesFromLoadedPatch();
     void updateAudioPortInfoCachesFromLoadedPatch();
     void updateNotePortInfoCachesFromLoadedPatch();
+    void prepareAudioProcessScratch();
+    bool isAudioProcessScratchPrepared (uint32_t blockSize) const;
 
     void resetIfRequestIsPending();
 
@@ -885,9 +887,6 @@ private:
 
         updatePatchWebViewForLoadedPatch (true);
 
-        flattenedInputChannelsScratchBuffer.resize (cmaj::audio_bus_layout::getTotalAudioChannels (patch.getInputEndpoints()));
-        flattenedOutputChannelsScratchBuffer.resize (cmaj::audio_bus_layout::getTotalAudioChannels (patch.getOutputEndpoints()));
-
         return true;
     }
 };
@@ -1167,6 +1166,37 @@ inline void Plugin::Impl::updateAudioPortInfoCachesFromLoadedPatch()
     {
         // TODO: in the JIT case we need to fall back to stereo or something
     }
+
+    prepareAudioProcessScratch();
+}
+
+inline void Plugin::Impl::prepareAudioProcessScratch()
+{
+    const auto inputChannelCount  = cmaj::audio_bus_layout::getTotalAudioChannels (inputAudioBusGroups);
+    const auto outputChannelCount = cmaj::audio_bus_layout::getTotalAudioChannels (outputAudioBusGroups);
+
+    flattenedInputChannelsScratchBuffer.resize (inputChannelCount);
+    flattenedOutputChannelsScratchBuffer.resize (outputChannelCount);
+
+    const auto maximumInputSamples  = static_cast<size_t> (inputChannelCount)  * static_cast<size_t> (maxBlockSize);
+    const auto maximumOutputSamples = static_cast<size_t> (outputChannelCount) * static_cast<size_t> (maxBlockSize);
+
+    missingInputChannelsScratchBuffer.resize (maximumInputSamples);
+    missingOutputChannelsScratchBuffer.resize (maximumOutputSamples);
+
+    std::fill (missingInputChannelsScratchBuffer.begin(),  missingInputChannelsScratchBuffer.end(),  0.0f);
+    std::fill (missingOutputChannelsScratchBuffer.begin(), missingOutputChannelsScratchBuffer.end(), 0.0f);
+}
+
+inline bool Plugin::Impl::isAudioProcessScratchPrepared (uint32_t blockSize) const
+{
+    const auto inputChannelCount  = cmaj::audio_bus_layout::getTotalAudioChannels (inputAudioBusGroups);
+    const auto outputChannelCount = cmaj::audio_bus_layout::getTotalAudioChannels (outputAudioBusGroups);
+
+    return flattenedInputChannelsScratchBuffer.size() == inputChannelCount
+        && flattenedOutputChannelsScratchBuffer.size() == outputChannelCount
+        && missingInputChannelsScratchBuffer.size() >= static_cast<size_t> (inputChannelCount) * static_cast<size_t> (blockSize)
+        && missingOutputChannelsScratchBuffer.size() >= static_cast<size_t> (outputChannelCount) * static_cast<size_t> (blockSize);
 }
 
 inline void Plugin::Impl::updateNotePortInfoCachesFromLoadedPatch()
@@ -1290,7 +1320,7 @@ inline clap_process_status Plugin::Impl::clapPlugin_process (const clap_process_
             dispatchEvent (transport->header);
     };
 
-    const auto processInChunksDelimitedByEvent = [this] (const clap_process_t& state)
+    const auto processInChunksDelimitedByEvent = [this] (const clap_process_t& state) -> bool
     {
         const auto& inputQueue = *state.in_events;
         auto& outputQueue = *state.out_events;
@@ -1307,10 +1337,12 @@ inline clap_process_status Plugin::Impl::clapPlugin_process (const clap_process_
                 ||  e.type == CLAP_EVENT_PARAM_VALUE);
         };
 
-        const auto ensureScratchChannelCapacity = [] (auto& scratch, uint32_t channelCount, uint32_t blockSize)
+        if (! isAudioProcessScratchPrepared (count))
+            return false;
+
+        const auto clearScratchChannels = [] (auto& scratch, uint32_t channelCount, uint32_t blockSize)
         {
-            scratch.resize (static_cast<size_t> (channelCount) * blockSize);
-            std::fill (scratch.begin(), scratch.end(), 0.0f);
+            std::fill_n (scratch.data(), static_cast<size_t> (channelCount) * blockSize, 0.0f);
         };
 
         const auto getScratchChannel = [] (auto& scratch, uint32_t channel, uint32_t blockSize)
@@ -1323,8 +1355,6 @@ inline clap_process_status Plugin::Impl::clapPlugin_process (const clap_process_
         const auto toInputChannelArrayView = [&] (auto& flattened, auto& missingScratch, const auto& busGroups,
                                                   const clap_audio_buffer_t* clapBuffers, uint32_t clapBufferCount, uint32_t blockSize)
         {
-            ensureScratchChannelCapacity (missingScratch, static_cast<uint32_t> (flattened.size()), blockSize);
-
             size_t flattenedChannelsIndex = 0;
             uint32_t missingScratchIndex = 0;
 
@@ -1354,8 +1384,6 @@ inline clap_process_status Plugin::Impl::clapPlugin_process (const clap_process_
         const auto toOutputChannelArrayView = [&] (auto& flattened, auto& missingScratch, const auto& busGroups,
                                                    clap_audio_buffer_t* clapBuffers, uint32_t clapBufferCount, uint32_t blockSize)
         {
-            ensureScratchChannelCapacity (missingScratch, static_cast<uint32_t> (flattened.size()), blockSize);
-
             size_t flattenedChannelsIndex = 0;
             uint32_t missingScratchIndex = 0;
 
@@ -1379,6 +1407,9 @@ inline clap_process_status Plugin::Impl::clapPlugin_process (const clap_process_
 
             return choc::buffer::createChannelArrayView (flattened.data(), static_cast<uint32_t> (flattened.size()), blockSize);
         };
+
+        clearScratchChannels (missingInputChannelsScratchBuffer,  static_cast<uint32_t> (flattenedInputChannelsScratchBuffer.size()),  count);
+        clearScratchChannels (missingOutputChannelsScratchBuffer, static_cast<uint32_t> (flattenedOutputChannelsScratchBuffer.size()), count);
 
         auto inputChannels = toInputChannelArrayView (flattenedInputChannelsScratchBuffer, missingInputChannelsScratchBuffer,
                                                      inputAudioBusGroups, inputs, state.audio_inputs_count, count);
@@ -1443,11 +1474,15 @@ inline clap_process_status Plugin::Impl::clapPlugin_process (const clap_process_
                 }
             }, replaceOutput);
         });
+
+        return true;
     };
 
     consumeEventsFromEditor (*process->out_events);
     processTransportForBlock (process->transport);
-    processInChunksDelimitedByEvent (*process);
+
+    if (! processInChunksDelimitedByEvent (*process))
+        return CLAP_PROCESS_ERROR;
 
     return CLAP_PROCESS_CONTINUE;
 }

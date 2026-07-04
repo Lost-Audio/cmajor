@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+"""SidechainDuck CLI render smoke test.
+
+This covers the cmaj render/player flat-channel path, including a missing
+sidechain input backed by silence. It does not cover JUCE disabled-bus
+negotiation or CLAP missing-port processing; those wrapper paths are deferred
+to pluginval/DAW checks.
+"""
 
 import argparse
 import math
@@ -16,13 +23,16 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 PATCH = REPO_ROOT / "examples" / "patches" / "SidechainDuck" / "SidechainDuck.cmajorpatch"
 SAMPLE_RATE = 48_000
 DURATION_SECONDS = 3.0
-CHANNELS_IN = 4
+FLAT_CHANNELS_IN = 4
+MAIN_ONLY_CHANNELS_IN = 2
 CHANNELS_OUT = 2
 BLOCK_SIZE = 128
 PULSES = (0.70, 1.30, 1.90, 2.50)
 PULSE_SECONDS = 0.18
 MEASURE_OFFSET_SECONDS = 0.045
 MEASURE_SECONDS = 0.09
+MISSING_SIDECHAIN_MAX_ABS_DIFF = 2.0e-4
+MISSING_SIDECHAIN_RMS_DIFF = 2.0e-5
 
 
 def find_cmaj(explicit):
@@ -56,11 +66,11 @@ def clamp16(value):
     return int(round(value * 32767.0))
 
 
-def write_fixture(path, sidechain_pulses):
+def write_fixture(path, channel_count, sidechain_pulses):
     total_frames = int(SAMPLE_RATE * DURATION_SECONDS)
 
     with wave.open(str(path), "wb") as wav:
-        wav.setnchannels(CHANNELS_IN)
+        wav.setnchannels(channel_count)
         wav.setsampwidth(2)
         wav.setframerate(SAMPLE_RATE)
 
@@ -77,11 +87,18 @@ def write_fixture(path, sidechain_pulses):
                         sidechain = 0.95
                         break
 
-            frames.extend(struct.pack("<hhhh",
-                                      clamp16(main),
-                                      clamp16(main),
-                                      clamp16(sidechain),
-                                      clamp16(sidechain)))
+            if channel_count == MAIN_ONLY_CHANNELS_IN:
+                frames.extend(struct.pack("<hh",
+                                          clamp16(main),
+                                          clamp16(main)))
+            elif channel_count == FLAT_CHANNELS_IN:
+                frames.extend(struct.pack("<hhhh",
+                                          clamp16(main),
+                                          clamp16(main),
+                                          clamp16(sidechain),
+                                          clamp16(sidechain)))
+            else:
+                raise RuntimeError(f"Unsupported fixture channel count: {channel_count}")
 
         wav.writeframes(frames)
 
@@ -157,6 +174,30 @@ def window_rms(data, start_seconds, length_seconds):
     return math.sqrt(total / count)
 
 
+def output_difference(reference, candidate):
+    if len(reference) != len(candidate):
+        raise RuntimeError(f"Output channel count mismatch: reference={len(reference)} candidate={len(candidate)}")
+
+    max_abs = 0.0
+    total = 0.0
+    count = 0
+
+    for ref_channel, candidate_channel in zip(reference, candidate):
+        if len(ref_channel) != len(candidate_channel):
+            raise RuntimeError("Output frame count mismatch")
+
+        for ref_sample, candidate_sample in zip(ref_channel, candidate_channel):
+            diff = abs(ref_sample - candidate_sample)
+            max_abs = max(max_abs, diff)
+            total += diff * diff
+            count += 1
+
+    if count == 0:
+        raise RuntimeError("Empty output comparison")
+
+    return max_abs, math.sqrt(total / count)
+
+
 def run_render(cmaj, input_wav, output_wav):
     cmd = [
         str(cmaj),
@@ -183,20 +224,33 @@ def main():
         temp = pathlib.Path(temp_dir)
         pulsed_in = temp / "main_with_sidechain.wav"
         silent_in = temp / "main_silent_sidechain.wav"
+        main_only_in = temp / "main_only_missing_sidechain.wav"
         pulsed_out = temp / "ducked.wav"
         silent_out = temp / "unducked.wav"
+        main_only_out = temp / "missing_sidechain.wav"
 
-        write_fixture(pulsed_in, True)
-        write_fixture(silent_in, False)
+        write_fixture(pulsed_in, FLAT_CHANNELS_IN, True)
+        write_fixture(silent_in, FLAT_CHANNELS_IN, False)
+        write_fixture(main_only_in, MAIN_ONLY_CHANNELS_IN, False)
 
         run_render(cmaj, pulsed_in, pulsed_out)
         run_render(cmaj, silent_in, silent_out)
+        run_render(cmaj, main_only_in, main_only_out)
 
         pulsed_rate, pulsed_data = read_wav(pulsed_out)
         silent_rate, silent_data = read_wav(silent_out)
+        main_only_rate, main_only_data = read_wav(main_only_out)
 
-        if pulsed_rate != SAMPLE_RATE or silent_rate != SAMPLE_RATE:
-            raise RuntimeError(f"Unexpected output rate: pulsed={pulsed_rate}, silent={silent_rate}")
+        if pulsed_rate != SAMPLE_RATE or silent_rate != SAMPLE_RATE or main_only_rate != SAMPLE_RATE:
+            raise RuntimeError(f"Unexpected output rate: pulsed={pulsed_rate}, silent={silent_rate}, main_only={main_only_rate}")
+
+        max_diff, rms_diff = output_difference(silent_data, main_only_data)
+
+        print(f"Missing-sidechain diff vs silent-reference: max={max_diff:.8f}, rms={rms_diff:.8f}")
+
+        if max_diff > MISSING_SIDECHAIN_MAX_ABS_DIFF or rms_diff > MISSING_SIDECHAIN_RMS_DIFF:
+            print("FAIL: missing sidechain did not match the silent-sidechain reference", file=sys.stderr)
+            return 1
 
         ratios = []
 
@@ -225,7 +279,7 @@ def main():
             keep_dir = REPO_ROOT / "tests" / "feather" / "sidechain_smoke_artifacts"
             keep_dir.mkdir(exist_ok=True)
 
-            for path in (pulsed_in, silent_in, pulsed_out, silent_out):
+            for path in (pulsed_in, silent_in, main_only_in, pulsed_out, silent_out, main_only_out):
                 shutil.copy2(path, keep_dir / path.name)
 
             print(f"Kept artifacts in {keep_dir}")
