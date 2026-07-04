@@ -52,6 +52,10 @@ struct BusGroup
     uint32_t channelCount = 0;
     std::vector<EndpointRef> endpoints;
 
+    // FEATHER: true when any endpoint in the group is annotated channelMode: "strict",
+    // which opts a main bus group out of host channel-count adaptation.
+    bool strictChannelMode = false;
+
     bool isAuxiliary() const
     {
         return role == BusRole::sidechain || role == BusRole::aux || name == "Sidechain";
@@ -71,6 +75,15 @@ inline BusRole getEndpointBusRole (const EndpointDetails& endpoint)
     }
 
     return BusRole::unknown;
+}
+
+// FEATHER: endpoint annotation `channelMode: "strict"` opts a main-bus endpoint out
+// of the wrappers' channel-count adaptation (mono<->multi replication/fold-down).
+// The default is adaptive for main buses and strict for aux/sidechain buses.
+inline bool hasStrictChannelMode (const EndpointDetails& endpoint)
+{
+    return endpoint.annotation.isObject()
+        && endpoint.annotation["channelMode"].toString() == "strict";
 }
 
 inline bool hasAudioBusAnnotation (const EndpointDetails& endpoint)
@@ -148,6 +161,7 @@ inline void addEndpointToGroup (std::vector<BusGroup>& groups,
         group->role = role;
 
     group->channelCount += channelCount;
+    group->strictChannelMode = group->strictChannelMode || hasStrictChannelMode (endpoint); // FEATHER
     group->endpoints.push_back ({ std::addressof (endpoint), channelCount });
 }
 
@@ -195,6 +209,16 @@ inline bool isMainBus (const BusGroup& group, size_t index)
         return false;
 
     return group.role == BusRole::main || index == 0;
+}
+
+// FEATHER: main bus groups adapt mismatched host channel counts by default, restoring
+// the pre-bus-layout upstream behaviour (mono output replicated to every host channel,
+// multi-channel groups folded to a mono host bus by unscaled summing, mono host input
+// replicated into every endpoint channel). Aux/sidechain groups always stay strict and
+// silence-backed, and `channelMode: "strict"` opts a main-bus endpoint out.
+inline bool shouldAdaptChannels (const BusGroup& group, size_t index)
+{
+    return isMainBus (group, index) && ! group.strictChannelMode;
 }
 
 } // namespace cmaj::audio_bus_layout

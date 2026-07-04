@@ -302,6 +302,12 @@ public:
             if (! cmaj::audio_bus_layout::isMainBus (patchLayout, static_cast<size_t> (i)) && suggestedSize == 0)
                 continue;
 
+            // FEATHER: adaptive main buses accept any non-empty host size; the cached
+            // process mapping replicates or folds channels (see refreshAudioChannelPointers()
+            // and applyOutputBusChannelAdaptation()). channelMode: "strict" opts out.
+            if (suggestedSize > 0 && cmaj::audio_bus_layout::shouldAdaptChannels (patchLayout, static_cast<size_t> (i)))
+                continue;
+
             if (static_cast<int> (patchLayout.channelCount) != suggestedSize)
                 return false;
         }
@@ -361,6 +367,10 @@ public:
                         {
                             midi.addEvent (m.data(), static_cast<int> (m.length()), static_cast<int> (frame));
                         });
+
+        // FEATHER: adapt main output bus groups whose channel count differs from the
+        // host bus (e.g. a mono patch on the dynamic loader's stereo output bus).
+        applyOutputBusChannelAdaptation (audio, static_cast<int> (numFrames));
     }
 
     void processBlock (juce::AudioBuffer<double>&, juce::MidiBuffer&) override { CMAJ_ASSERT_FALSE; }
@@ -691,6 +701,20 @@ protected:
                         }
                     }
 
+                    // FEATHER: adaptive main groups replicate a mono host bus into every
+                    // endpoint channel, matching the pre-bus-layout upstream mono input
+                    // adaptation in cmaj::Patch::connectPerformerEndpoints(). Pointer
+                    // replication only - no copying or allocation on the audio thread.
+                    if (busBuffer.getNumChannels() == 1
+                         && cmaj::audio_bus_layout::shouldAdaptChannels (groups[(size_t) bus], (size_t) bus))
+                    {
+                        if (auto* data = busBuffer.getWritePointer (0))
+                        {
+                            inputChannelPointers[inputIndex++] = data;
+                            continue;
+                        }
+                    }
+
                     inputChannelPointers[inputIndex++] = inputSilentBusScratch.getWritePointer (scratchIndex++);
                 }
             }
@@ -765,6 +789,62 @@ protected:
             return false;
 
         return mapOutputGroups (outputAudioBusGroups, outputAudioBusGroupHostBuses);
+    }
+
+    // FEATHER: post-process channel-count adaptation for main output bus groups. This
+    // restores the pre-bus-layout upstream behaviour that lived in
+    // cmaj::Patch::connectPerformerEndpoints() before the per-bus mapping bypassed it:
+    //   - a mono endpoint group is replicated to every host bus channel,
+    //   - a multi-channel group rendered to a mono host bus is folded down by unscaled
+    //     summing (upstream mapped every endpoint channel onto device channel 0, where
+    //     the performer overwrote the first and added the rest),
+    //   - a partial fill (1 < endpoint channels < host channels) clears the extra host
+    //     channels so hosts never see stale buffer garbage (upstream cleared unused
+    //     device channels in its output-clear action).
+    // Equal channel counts take none of these branches, so produced audio is unchanged.
+    // RT-safe: reads the cached group/host mappings and pre-mapped channel pointers;
+    // no locks, no heap allocation.
+    void applyOutputBusChannelAdaptation (juce::AudioBuffer<float>& audio, int numFrames)
+    {
+        size_t flatChannelIndex = 0;
+
+        for (size_t bus = 0; bus < outputAudioBusGroups.size(); ++bus)
+        {
+            const auto& group = outputAudioBusGroups[bus];
+            const auto numGroupChannels = group.channelCount;
+            const auto hostBus = bus < outputAudioBusGroupHostBuses.size() ? outputAudioBusGroupHostBuses[bus]
+                                                                           : disabledHostBusIndex;
+
+            if (hostBus >= 0 && hostBus < getBusCount (false)
+                 && cmaj::audio_bus_layout::shouldAdaptChannels (group, bus))
+            {
+                auto busBuffer = getBusBuffer (audio, false, hostBus);
+                const auto numHostChannels = static_cast<uint32_t> (busBuffer.getNumChannels());
+
+                if (numGroupChannels == 1 && numHostChannels > 1)
+                {
+                    for (uint32_t channel = 1; channel < numHostChannels; ++channel)
+                        juce::FloatVectorOperations::copy (busBuffer.getWritePointer ((int) channel),
+                                                           busBuffer.getReadPointer (0), numFrames);
+                }
+                else if (numHostChannels == 1 && numGroupChannels > 1
+                          && flatChannelIndex + numGroupChannels <= outputChannelPointers.size())
+                {
+                    // Extra endpoint channels were rendered into outputDisabledBusScratch
+                    // by mapOutputGroups(); their pointers are still in outputChannelPointers.
+                    for (uint32_t channel = 1; channel < numGroupChannels; ++channel)
+                        juce::FloatVectorOperations::add (busBuffer.getWritePointer (0),
+                                                          outputChannelPointers[flatChannelIndex + channel], numFrames);
+                }
+                else if (numGroupChannels > 1 && numHostChannels > numGroupChannels)
+                {
+                    for (uint32_t channel = numGroupChannels; channel < numHostChannels; ++channel)
+                        busBuffer.clear ((int) channel, 0, numFrames);
+                }
+            }
+
+            flatChannelIndex += numGroupChannels;
+        }
     }
 
     void unload (const std::string& message, bool isError)

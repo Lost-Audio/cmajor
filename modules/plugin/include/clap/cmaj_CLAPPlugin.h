@@ -1441,6 +1441,14 @@ inline clap_process_status Plugin::Impl::clapPlugin_process (const clap_process_
                     if (buffer != nullptr && buffer->data32 != nullptr && channel < buffer->channel_count)
                         channelData = buffer->data32[channel];
 
+                    // FEATHER: adaptive main ports replicate a mono host buffer into every
+                    // endpoint channel, matching the pre-bus-layout upstream mono input
+                    // adaptation. Pointer replication only - no copies or allocation.
+                    if (channelData == nullptr
+                         && buffer != nullptr && buffer->data32 != nullptr && buffer->channel_count == 1
+                         && cmaj::audio_bus_layout::shouldAdaptChannels (busGroups[portIndex], portIndex))
+                        channelData = buffer->data32[0];
+
                     if (channelData == nullptr)
                         channelData = getScratchChannel (missingScratch, missingScratchIndex++, blockSize);
 
@@ -1546,6 +1554,60 @@ inline clap_process_status Plugin::Impl::clapPlugin_process (const clap_process_
                 }
             }, replaceOutput);
         });
+
+        // FEATHER: post-process channel-count adaptation for main output ports, mirroring
+        // the JUCE wrapper's applyOutputBusChannelAdaptation() and the pre-bus-layout
+        // upstream behaviour in cmaj::Patch::connectPerformerEndpoints():
+        //   - a mono endpoint group is replicated to every host buffer channel,
+        //   - a multi-channel group given a mono host buffer folds down by unscaled summing
+        //     (the extra endpoint channels were rendered into the missing-output scratch),
+        //   - a partial fill (1 < endpoint channels < host channels) clears the extra host
+        //     channels so the host never sees stale buffer garbage.
+        // Equal channel counts take none of these branches. RT-safe: no locks, no allocation.
+        {
+            size_t flatChannelIndex = 0;
+
+            for (size_t portIndex = 0; portIndex < outputAudioBusGroups.size(); ++portIndex)
+            {
+                const auto& group = outputAudioBusGroups[portIndex];
+                const auto numGroupChannels = group.channelCount;
+                auto* buffer = portIndex < state.audio_outputs_count && outputs != nullptr ? outputs + portIndex : nullptr;
+
+                if (buffer != nullptr && buffer->data32 != nullptr
+                     && cmaj::audio_bus_layout::shouldAdaptChannels (group, portIndex))
+                {
+                    const auto numHostChannels = buffer->channel_count;
+
+                    if (numGroupChannels == 1 && numHostChannels > 1 && buffer->data32[0] != nullptr)
+                    {
+                        for (uint32_t channel = 1; channel < numHostChannels; ++channel)
+                            if (auto* dest = buffer->data32[channel])
+                                std::copy_n (buffer->data32[0], count, dest);
+                    }
+                    else if (numHostChannels == 1 && numGroupChannels > 1 && buffer->data32[0] != nullptr
+                              && flatChannelIndex + numGroupChannels <= flattenedOutputChannelsScratchBuffer.size())
+                    {
+                        auto* dest = buffer->data32[0];
+
+                        for (uint32_t channel = 1; channel < numGroupChannels; ++channel)
+                        {
+                            const auto* source = flattenedOutputChannelsScratchBuffer[flatChannelIndex + channel];
+
+                            for (uint32_t frame = 0; frame < count; ++frame)
+                                dest[frame] += source[frame];
+                        }
+                    }
+                    else if (numGroupChannels > 1 && numHostChannels > numGroupChannels)
+                    {
+                        for (uint32_t channel = numGroupChannels; channel < numHostChannels; ++channel)
+                            if (auto* dest = buffer->data32[channel])
+                                std::fill_n (dest, count, 0.0f);
+                    }
+                }
+
+                flatChannelIndex += numGroupChannels;
+            }
+        }
 
         return true;
     };
