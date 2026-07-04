@@ -33,6 +33,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <iostream>
 #include <utility>
 #include <vector>
 #include "cmaj_AudioBusLayoutHelper.h"
@@ -89,15 +90,10 @@ public:
             resizeAudioChannelPointerStorage();
             resizeSilentBusScratch (static_cast<uint32_t> (getBlockSize()));
 
-            const auto executeOrDeferToMessageThread = [] (auto&& fn) -> void
-            {
-                if (juce::MessageManager::getInstance()->isThisTheMessageThread())
-                    return fn();
-
-                juce::MessageManager::callAsync (std::forward<decltype (fn)> (fn));
-            };
-
-            executeOrDeferToMessageThread ([this] { handlePatchChange(); });
+            if (juce::MessageManager::getInstance()->isThisTheMessageThread())
+                handlePatchChange();
+            else
+                postPatchChange();
         };
 
         patch->statusChanged = [this] (const auto& s) { setStatusMessageAsync (s.statusMessage, s.messageList.hasErrors()); };
@@ -269,19 +265,35 @@ public:
     {
     }
 
-    static bool isLayoutOK (const std::vector<cmaj::audio_bus_layout::BusGroup>& patchLayouts,
-                            const juce::Array<juce::AudioChannelSet>& suggestedLayouts)
+    bool isLayoutOK (const std::vector<cmaj::audio_bus_layout::BusGroup>& patchLayouts,
+                     const std::vector<int>& hostBusMappings,
+                     const juce::Array<juce::AudioChannelSet>& suggestedLayouts,
+                     bool isInput) const
     {
         if (patchLayouts.empty())
             return suggestedLayouts.isEmpty() || suggestedLayouts.getReference(0).size() == 0;
 
-        if (suggestedLayouts.size() < static_cast<int> (patchLayouts.size()))
+        if (hostBusMappings.size() != patchLayouts.size())
             return false;
 
-        for (int i = 0; i < juce::jmin (static_cast<int> (patchLayouts.size()), suggestedLayouts.size()); ++i)
+        for (int i = 0; i < static_cast<int> (patchLayouts.size()); ++i)
         {
             auto& patchLayout = patchLayouts[(size_t) i];
-            auto suggestedSize = suggestedLayouts.getReference(i).size();
+            auto hostBusIndex = hostBusMappings[(size_t) i];
+
+            if (hostBusIndex < 0)
+                continue;
+
+            if (hostBusIndex >= suggestedLayouts.size())
+                return false;
+
+            auto suggestedSize = suggestedLayouts.getReference(hostBusIndex).size();
+
+            // FEATHER: the dynamic patch-loader has one predeclared stereo aux input bus.
+            // Patch aux channel-count mismatches are handled by the cached process routing.
+            if constexpr (! DerivedType::isFixedPatch)
+                if (isInput && hostBusIndex == dynamicSidechainInputBusIndex && patchLayout.isAuxiliary())
+                    continue;
 
             // FEATHER: hosts may disable auxiliary/sidechain buses; input endpoints are
             // silence-backed and output endpoints are routed to discard scratch buffers.
@@ -303,8 +315,8 @@ public:
         if (inputAudioBusGroups.empty() && outputAudioBusGroups.empty())
             const_cast<JUCEPluginBase*> (this)->updateCachedAudioBusLayoutFromPatch();
 
-        return isLayoutOK (inputAudioBusGroups,  layout.inputBuses)
-            && isLayoutOK (outputAudioBusGroups, layout.outputBuses);
+        return isLayoutOK (inputAudioBusGroups,  inputAudioBusGroupHostBuses,  layout.inputBuses,  true)
+            && isLayoutOK (outputAudioBusGroups, outputAudioBusGroupHostBuses, layout.outputBuses, false);
     }
 
     bool applyBusLayouts (const BusesLayout& layouts) override
@@ -408,8 +420,15 @@ protected:
     bool patchViewUpdatePending = false;
     std::vector<float*> inputChannelPointers, outputChannelPointers;
     std::vector<cmaj::audio_bus_layout::BusGroup> inputAudioBusGroups, outputAudioBusGroups;
+    std::vector<int> inputAudioBusGroupHostBuses, outputAudioBusGroupHostBuses;
     choc::buffer::ChannelCount inputAudioChannelCount = 0, outputAudioChannelCount = 0;
     juce::AudioBuffer<float> inputSilentBusScratch, outputDisabledBusScratch;
+    std::string lastDynamicLoaderUnmappedAuxWarning;
+
+    static constexpr int disabledHostBusIndex = -1;
+    static constexpr int dynamicMainInputBusIndex = 0;
+    static constexpr int dynamicSidechainInputBusIndex = 1;
+    static constexpr int dynamicMainOutputBusIndex = 0;
 
     //==============================================================================
     static bool initialiseDLL()
@@ -484,6 +503,8 @@ protected:
     {
         inputAudioBusGroups.clear();
         outputAudioBusGroups.clear();
+        inputAudioBusGroupHostBuses.clear();
+        outputAudioBusGroupHostBuses.clear();
 
         if (patch->isLoaded())
         {
@@ -491,8 +512,119 @@ protected:
             outputAudioBusGroups = cmaj::audio_bus_layout::groupEndpointsByBus (patch->getOutputEndpoints());
         }
 
+        rebuildAudioBusGroupHostMappings();
+
         inputAudioChannelCount  = static_cast<choc::buffer::ChannelCount> (cmaj::audio_bus_layout::getTotalAudioChannels (inputAudioBusGroups));
         outputAudioChannelCount = static_cast<choc::buffer::ChannelCount> (cmaj::audio_bus_layout::getTotalAudioChannels (outputAudioBusGroups));
+    }
+
+    void rebuildAudioBusGroupHostMappings()
+    {
+        inputAudioBusGroupHostBuses.assign  (inputAudioBusGroups.size(),  disabledHostBusIndex);
+        outputAudioBusGroupHostBuses.assign (outputAudioBusGroups.size(), disabledHostBusIndex);
+
+        if constexpr (DerivedType::isFixedPatch)
+        {
+            setIdentityHostBusMapping (inputAudioBusGroupHostBuses);
+            setIdentityHostBusMapping (outputAudioBusGroupHostBuses);
+        }
+        else
+        {
+            rebuildDynamicLoaderHostBusMappings();
+        }
+    }
+
+    static void setIdentityHostBusMapping (std::vector<int>& mappings)
+    {
+        for (size_t i = 0; i < mappings.size(); ++i)
+            mappings[i] = static_cast<int> (i);
+    }
+
+    void rebuildDynamicLoaderHostBusMappings()
+    {
+        bool hasMappedMainInput = false;
+        bool hasMappedAuxInput = false;
+        std::vector<std::string> unmappedAuxInputBusNames;
+
+        for (size_t i = 0; i < inputAudioBusGroups.size(); ++i)
+        {
+            const auto& group = inputAudioBusGroups[i];
+
+            if (group.isAuxiliary())
+            {
+                if (! hasMappedAuxInput)
+                {
+                    inputAudioBusGroupHostBuses[i] = dynamicSidechainInputBusIndex;
+                    hasMappedAuxInput = true;
+                }
+                else
+                {
+                    unmappedAuxInputBusNames.push_back (group.name);
+                }
+
+                continue;
+            }
+
+            if (! hasMappedMainInput)
+            {
+                inputAudioBusGroupHostBuses[i] = dynamicMainInputBusIndex;
+                hasMappedMainInput = true;
+            }
+        }
+
+        bool hasMappedMainOutput = false;
+
+        for (size_t i = 0; i < outputAudioBusGroups.size(); ++i)
+        {
+            if (! hasMappedMainOutput && ! outputAudioBusGroups[i].isAuxiliary())
+            {
+                outputAudioBusGroupHostBuses[i] = dynamicMainOutputBusIndex;
+                hasMappedMainOutput = true;
+            }
+        }
+
+        if (! hasMappedMainOutput && ! outputAudioBusGroups.empty())
+            outputAudioBusGroupHostBuses.front() = dynamicMainOutputBusIndex;
+
+        warnAboutUnmappedDynamicAuxInputBuses (unmappedAuxInputBusNames);
+    }
+
+    static std::string joinBusNames (const std::vector<std::string>& names)
+    {
+        std::string result;
+
+        for (const auto& name : names)
+        {
+            if (! result.empty())
+                result += ", ";
+
+            result += name.empty() ? std::string ("<unnamed>") : name;
+        }
+
+        return result;
+    }
+
+    void warnAboutUnmappedDynamicAuxInputBuses (const std::vector<std::string>& names)
+    {
+        auto busNames = joinBusNames (names);
+
+        if (busNames.empty())
+        {
+            lastDynamicLoaderUnmappedAuxWarning.clear();
+            return;
+        }
+
+        if (busNames == lastDynamicLoaderUnmappedAuxWarning)
+            return;
+
+        lastDynamicLoaderUnmappedAuxWarning = busNames;
+
+        auto warning = "CmajPlugin warning: dynamic loader exposes one auxiliary input bus; unmapped aux input bus groups: " + busNames;
+
+        if (handleConsoleMessage)
+            handleConsoleMessage (warning.c_str());
+
+        std::cerr << warning << std::endl;
     }
 
     void resizeAudioChannelPointerStorage()
@@ -533,15 +665,18 @@ protected:
         // FEATHER: walk declared bus groups rather than active JUCE channel totals. Disabled
         // auxiliary input buses are represented by cleared scratch channels, so sidechain
         // endpoints see silence instead of missing/null bus pointers.
-        auto mapInputGroups = [&] (const auto& groups)
+        auto mapInputGroups = [&] (const auto& groups, const auto& hostBusMappings)
         {
             size_t inputIndex = 0;
             int scratchIndex = 0;
 
             for (int bus = 0; bus < (int) groups.size(); ++bus)
             {
-                auto busBuffer = bus < getBusCount (true) ? getBusBuffer (audio, true, bus)
-                                                          : juce::AudioBuffer<float>();
+                const auto hostBus = bus < static_cast<int> (hostBusMappings.size()) ? hostBusMappings[(size_t) bus]
+                                                                                     : disabledHostBusIndex;
+
+                auto busBuffer = hostBus >= 0 && hostBus < getBusCount (true) ? getBusBuffer (audio, true, hostBus)
+                                                                              : juce::AudioBuffer<float>();
 
                 for (uint32_t channel = 0; channel < groups[(size_t) bus].channelCount; ++channel)
                 {
@@ -563,15 +698,18 @@ protected:
 
         // FEATHER: disabled auxiliary output buses still need patch-declared output pointers;
         // route them to scratch so rendered samples are discarded without allocating here.
-        auto mapOutputGroups = [&] (const auto& groups)
+        auto mapOutputGroups = [&] (const auto& groups, const auto& hostBusMappings)
         {
             size_t outputIndex = 0;
             int scratchIndex = 0;
 
             for (int bus = 0; bus < (int) groups.size(); ++bus)
             {
-                auto busBuffer = bus < getBusCount (false) ? getBusBuffer (audio, false, bus)
-                                                           : juce::AudioBuffer<float>();
+                const auto hostBus = bus < static_cast<int> (hostBusMappings.size()) ? hostBusMappings[(size_t) bus]
+                                                                                     : disabledHostBusIndex;
+
+                auto busBuffer = hostBus >= 0 && hostBus < getBusCount (false) ? getBusBuffer (audio, false, hostBus)
+                                                                               : juce::AudioBuffer<float>();
 
                 for (uint32_t channel = 0; channel < groups[(size_t) bus].channelCount; ++channel)
                 {
@@ -621,17 +759,25 @@ protected:
                 && outputIndex == outputChannelPointers.size();
         }
 
-        if (! mapInputGroups (inputAudioBusGroups))
+        if (! mapInputGroups (inputAudioBusGroups, inputAudioBusGroupHostBuses))
             return false;
 
-        return mapOutputGroups (outputAudioBusGroups);
+        return mapOutputGroups (outputAudioBusGroups, outputAudioBusGroupHostBuses);
     }
 
     void unload (const std::string& message, bool isError)
     {
         if constexpr (! DerivedType::isPrecompiled)
         {
-            patch->unload();
+            if (patch->isLoaded())
+                patch->unload();
+            else
+            {
+                updateCachedAudioBusLayoutFromPatch();
+                resizeAudioChannelPointerStorage();
+                resizeSilentBusScratch (static_cast<uint32_t> (getBlockSize()));
+            }
+
             setStatusMessage (message, isError);
             updatePatchWebViewForCurrentPatch (false);
         }
@@ -735,6 +881,10 @@ protected:
     {
     };
 
+    struct PatchChangedMessage  : public juce::Message
+    {
+    };
+
     void deliverPatchViewUpdate()
     {
         if (getActiveEditor() == nullptr)
@@ -752,6 +902,11 @@ protected:
 
         patchViewUpdatePending = true;
         postMessage (new PatchViewUpdateMessage());
+    }
+
+    void postPatchChange()
+    {
+        postMessage (new PatchChangedMessage());
     }
 
     //==============================================================================
@@ -942,6 +1097,8 @@ protected:
             setNewState (const_cast<NewStateMessage*> (newStateMessage)->newState);
         else if (auto statusMessageUpdate = dynamic_cast<const StatusMessageMessage*> (&message))
             setStatusMessage (statusMessageUpdate->message, statusMessageUpdate->isError);
+        else if (dynamic_cast<const PatchChangedMessage*> (&message) != nullptr)
+            handlePatchChange();
         else if (dynamic_cast<const PatchViewUpdateMessage*> (&message) != nullptr)
         {
             patchViewUpdatePending = false;
@@ -1224,7 +1381,7 @@ protected:
 
     bool shouldUsePersistentPatchWebView() const
     {
-        return cmaj::plugin::shouldUsePersistentView (*patch);
+        return patch->isLoaded() && cmaj::plugin::shouldUsePersistentView (*patch);
     }
 
     cmaj::PatchWebView& getOrCreatePatchWebView()
@@ -2115,10 +2272,11 @@ public:
     static BusesProperties getBusLayout()
     {
         // FEATHER: this dynamic patch-loader layout is fixed at processor construction.
-        // Hot-swapping to a patch with a different bus shape requires reloading the plugin.
+        // It predeclares one optional aux input bus and maps a loaded patch's first
+        // aux/sidechain input group onto it; more exotic layouts need generated plugins.
         BusesProperties layout;
         layout.addBus (true,  "Input",     juce::AudioChannelSet::stereo(), true);
-        layout.addBus (true,  "Sidechain", juce::AudioChannelSet::stereo(), true);
+        layout.addBus (true,  "Sidechain", juce::AudioChannelSet::stereo(), false);
         layout.addBus (false, "Output",    juce::AudioChannelSet::stereo(), true);
         return layout;
     }
