@@ -59,7 +59,7 @@ JUCE layout validation accepts a zero-channel suggested layout for non-main buse
 
 Processing prepares the patch for the full declared patch bus shape even if the host disables an auxiliary bus. `getPlaybackParams()` uses cached patch channel counts when loaded, and `refreshAudioChannelPointers()` fills missing input bus channels from `inputSilentBusScratch` and missing output channels from `outputDisabledBusScratch`.
 
-Dynamic patch-loader caveat: `JITLoaderPlugin::getBusLayout()` is fixed at construction as stereo `Input`, stereo `Sidechain`, stereo `Output`. The code comment says hot-swapping to a different bus shape requires reloading the plugin.
+Dynamic patch-loader caveat: `JITLoaderPlugin::getBusLayout()` is fixed at construction as stereo `Input`, optional stereo `Sidechain`, and stereo `Output`. On patch load, the wrapper derives endpoint groups with `cmaj_AudioBusLayoutHelper.h` and maps the first aux/sidechain input group onto the predeclared sidechain bus. If there is no aux input group, the sidechain bus remains unused; if there are multiple aux input groups, only the first is mapped and the rest are silence-backed with a console warning. More exotic input or output layouts still need `SinglePatchJITPlugin`/generated plugins so their bus shape is known at construction.
 
 `SinglePatchJITPlugin` preloads the manifest and derives bus properties at construction. `GeneratedPlugin` derives bus layout from generated `programDetailsJSON`, so fixed-patch/generated plugins are the right path for product validation.
 
@@ -137,5 +137,5 @@ Coverage limits are explicit in the script docstring: it covers the `cmaj render
 - Annotate every audio endpoint that participates in multi-bus routing.
 - Use stable bus names: `Input`, `Sidechain`, `Output` unless a product needs more.
 - Keep sidechain endpoints as streams, usually `float32<2>`.
-- Do not rely on hot-swapping the dynamic loader to change bus shape.
+- The dynamic loader can hot-swap between patches with no aux input and one aux/sidechain input; use fixed/generated plugins for more bus groups or product validation.
 - Validate `SidechainDuck` after changing endpoint metadata, wrappers, or generated plugin helpers.
