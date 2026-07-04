@@ -448,7 +448,19 @@ Prefer new files over upstream file edits when the fork behaviour can be isolate
 All implementation goes through the Codex/orchestrator workflow; git operations are performed by the orchestrator.
 Custom plugin GUIs are built with **Svelte 5** (`cmaj create --ui=svelte`: Vite + Tailwind 4 + shadcn-svelte + motion-core + motion-gpu). Mandatory for new UIs in this fork — do not introduce React into patch views; the house stack is Svelte.
 
-## Picking the right models for workflows and subagents
+## Dispatching Codex (windowless — ALWAYS run it this way)
+
+The canonical dispatch, run as a BACKGROUND shell command from the agent harness:
+
+```bash
+cd F:/Programming/DSP_Projects/2025/cmajor-feather && \
+codex exec --sandbox workspace-write -c model_reasoning_effort=xhigh \
+  "$(cat .feather/<name>-brief.txt)" < /dev/null > .feather/reports/<name>-exec.log 2>&1; \
+echo "EXIT: $?"; tail -10 .feather/reports/<name>-exec.log
+```
+
+Hard rules (each learned the painful way):
+- **NEVER dispatch through the codex plugin's broker/companion (`task --background`)** — the broker runs detached from any console, so every sub
 
 Rankings, higher = better. Cost reflects what I actually pay (OpenAI has really generous limits), not list price. Intelligence is how hard a problem you can hand the model unsupervised. Taste covers UI/UX, code quality, API design, and copy.
 
