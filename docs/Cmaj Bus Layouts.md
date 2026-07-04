@@ -8,7 +8,8 @@ Internal notes for Lost Audio's Feather bus and sidechain fork. This covers the 
 - JUCE wrapper: `include/cmajor/helpers/cmaj_JUCEPlugin.h`
 - CLAP wrapper: `modules/plugin/include/clap/cmaj_CLAPPlugin.h`
 - Dev-time player: `modules/playback/include/cmaj_PatchPlayer.h`
-- Fixture and smoke test: `examples/patches/SidechainDuck`, `tests/feather/sidechain_smoke.py`
+- Fixtures and smoke tests: `examples/patches/SidechainDuck`, `tests/feather/sidechain_smoke.py`,
+  `examples/patches/HelloWorld`, `tests/feather/mono_upmix_smoke.py`
 
 ## Endpoint Annotation Contract
 
@@ -38,6 +39,14 @@ If `bus` is omitted but `role` is present, defaults are:
 - `role: "sidechain"` or `role: "aux"` -> `Sidechain`
 
 Channel count comes from the endpoint stream type. `EndpointDetails::getNumAudioChannels()` in `include/cmajor/API/cmaj_Endpoints.h` returns `1` for a float stream and the vector size for a float vector stream, for example `float32<2>` is stereo.
+
+One further annotation controls channel-count adaptation (see the Channel Adaptation section):
+
+```cmajor
+output stream float out [[ name: "Out", channelMode: "strict" ]];
+```
+
+`channelMode: "strict"` opts a main-bus endpoint out of adaptation, so its bus group requires an exact host channel-count match. Any other value (or omitting it) leaves main buses adaptive. Aux/sidechain buses are always strict regardless of this annotation.
 
 ## Shared Grouping Semantics
 
@@ -80,11 +89,63 @@ During process, CLAP flattens active host ports into the declared Cmajor bus sha
 
 This is why the smoke test can feed a four-channel WAV: channels 1-2 are main, channels 3-4 are sidechain for `SidechainDuck`.
 
+## Channel Adaptation
+
+Main bus groups adapt mismatched host channel counts by default. This restores the
+behaviour that upstream implemented in `cmaj::Patch::connectPerformerEndpoints()`
+(the "Handle mono -> stereo as a special case" block plus the mono-device
+replication/summing paths in `cmaj_AudioMIDIPerformer.h`) before the fork's per-bus
+mapping bypassed it by preparing the patch with its own exact channel counts. The
+user-visible regression this fixes: a mono patch (for example the stock SineSynth)
+loaded into the dynamic JIT loader's stereo output bus played hard-left, because its
+single output channel mapped to bus channel 0 and channel 1 stayed silent.
+
+The convention deliberately matches upstream's old device-channel adaptation:
+
+- Mono endpoint group into a wider host bus: the single channel is replicated to
+  every host bus channel after processing. (Upstream replicated a total-mono output
+  to device channels 0 and 1; the fork generalises this to all bus channels.)
+- Multi-channel endpoint group into a mono host bus: outputs are folded down by
+  unscaled summing (upstream mapped every endpoint channel onto device channel 0,
+  where the performer overwrote with the first and added the rest); a mono host
+  input is replicated into every input endpoint channel by pointer replication.
+- Host bus wider than a multi-channel endpoint group (partial fill): inputs take
+  the first N host channels and ignore the rest; the extra output host channels are
+  cleared so hosts never see stale buffer garbage. Upstream did not replicate or
+  average in this case either (its adaptation only special-cased mono), so no
+  averaging/1-over-N downmix was introduced - matching old renders bit-for-bit
+  matters more than inventing a nicer downmix.
+
+Rules and scope:
+
+- Only main bus groups adapt. Aux/sidechain groups keep strict, silence-backed
+  semantics exactly as before.
+- `channelMode: "strict"` on any endpoint in a main group makes the whole group
+  strict (exact channel-count match required, as for aux buses).
+- When endpoint and host channel counts are equal, none of the adaptation branches
+  run and produced audio is bit-identical to the pre-adaptation code.
+- Everything is planned against the cached bus-group mappings: input adaptation is
+  pure pointer replication, output adaptation copies/sums/clears host channels after
+  `patch->process()` using the pre-mapped pointer tables and pre-sized scratch. No
+  locks and no heap allocation on the audio path.
+
+Implementation points: `shouldAdaptChannels()` in `cmaj_AudioBusLayoutHelper.h`;
+`isLayoutOK()`, `mapInputGroups()` (inside `refreshAudioChannelPointers()`) and
+`applyOutputBusChannelAdaptation()` in `cmaj_JUCEPlugin.h` (shared by the dynamic
+loader and the fixed/generated `isFixedPatch` paths); `toInputChannelArrayView()`
+and the output adaptation block in `clapPlugin_process()` in `cmaj_CLAPPlugin.h`.
+
+The dev-time player and `cmaj render` do not use the wrapper mapping: they pass real
+device/file channel counts into `cmaj::Patch`, whose upstream adaptation code is
+unchanged, so they already had (and keep) the mono -> stereo behaviour. That path is
+pinned by `tests/feather/mono_upmix_smoke.py`.
+
 ## Disabled Or Missing Buses
 
 The fork's desired semantics are:
 
-- Main buses must match their declared channel count.
+- Main buses adapt mismatched host channel counts (see Channel Adaptation);
+  `channelMode: "strict"` groups must match their declared channel count exactly.
 - Disabled/missing sidechain or aux inputs read silence.
 - Disabled/missing aux outputs are discarded.
 - A missing sidechain should not produce null reads or garbage detector input.
@@ -131,6 +192,8 @@ Bitwig CLAP:
 - asserts sidechain pulses produce a meaningful RMS dip.
 
 Coverage limits are explicit in the script docstring: it covers the `cmaj render`/player flat-channel path and missing sidechain silence. It does not cover JUCE disabled-bus negotiation or CLAP missing-port processing; those still need pluginval and DAW checks.
+
+`tests/feather/mono_upmix_smoke.py` guards the mono-output adaptation convention. It renders `examples/patches/HelloWorld` (mono `output stream float out`) at `--channels=2` and asserts both output channels are bit-identical and non-silent. It covers the render/player path; the JUCE dynamic-loader fix (the Bitwig hard-left SineSynth report) still needs a DAW or pluginval check because the plugin wrappers have no CLI harness.
 
 ## Authoring Checklist
 
