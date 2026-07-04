@@ -13,15 +13,16 @@
 //  DISCLAIMED.
 
 #include "../../include/cmaj_DefaultFlags.h"
+#include "../../include/cmaj_ErrorHandling.h"
 
 #include "cmaj_NativeFFT.h"
 
 #if CMAJ_ENABLE_NATIVE_OVERRIDES
 
-#include <algorithm>
-#include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <mutex>
 
 #include "pffft/pffft.h"
@@ -31,161 +32,139 @@ namespace cmaj::native_fft
 namespace
 {
     static constexpr uint64_t minBoundComplexSize = 16;
-    static constexpr size_t stackScratchBytes = 2048;
+    static constexpr uint64_t maxBoundComplexSize = 1024;
 
-    static bool isPowerOfTwo (uint64_t n)
+   #ifndef CMAJ_NATIVE_FFT_RT_CONTRACT_CHECK
+    #define CMAJ_NATIVE_FFT_RT_CONTRACT_CHECK 0
+   #endif
+
+   #if CMAJ_NATIVE_FFT_RT_CONTRACT_CHECK
+    static thread_local bool insideRenderPath = false;
+
+    struct RenderPathRTContract
     {
-        return n != 0 && (n & (n - 1)) == 0;
-    }
-
-    static uint32_t getLog2 (uint64_t n)
-    {
-        uint32_t result = 0;
-
-        while (n > 1)
+        void enter()
         {
-            n >>= 1;
-            ++result;
+            CMAJ_ASSERT (! insideRenderPath);
+            insideRenderPath = true;
+            ++calls;
         }
 
-        return result;
-    }
+        void exit() noexcept
+        {
+            insideRenderPath = false;
+        }
+
+        void assertSatisfied() const
+        {
+            CMAJ_ASSERT (lockAttempts.load() == 0);
+            CMAJ_ASSERT (heapAllocations.load() == 0);
+        }
+
+        void assertNotInRenderPath() const
+        {
+            CMAJ_ASSERT (! insideRenderPath);
+        }
+
+        std::atomic<uint64_t> calls { 0 };
+        std::atomic<uint64_t> lockAttempts { 0 };
+        std::atomic<uint64_t> heapAllocations { 0 };
+    };
+
+    static RenderPathRTContract renderPathRTContract;
+
+    struct RenderPathScope
+    {
+        RenderPathScope()
+        {
+            renderPathRTContract.enter();
+            renderPathRTContract.assertSatisfied();
+        }
+
+        ~RenderPathScope()
+        {
+            renderPathRTContract.exit();
+        }
+    };
+   #endif
 
     static bool isAligned16 (const void* p)
     {
         return (reinterpret_cast<uintptr_t> (p) & 15u) == 0;
     }
 
-    struct SetupCache
+    struct PFFFTSetupDeleter
     {
-        ~SetupCache()
+        void operator() (PFFFT_Setup* setup) const
         {
-            for (auto* setup : complexFloatSetups)
-                if (setup != nullptr)
-                    pffft_destroy_setup (setup);
+            if (setup != nullptr)
+                pffft_destroy_setup (setup);
         }
+    };
 
-        PFFFT_Setup* getComplexFloatSetup (uint64_t n)
+    template <uint64_t numComplexValues>
+    struct PreparedComplexFFT32
+    {
+        static PFFFT_Setup* prepare()
         {
-            if (n < minBoundComplexSize || ! isPowerOfTwo (n) || n > maxBoundComplexSize)
-                return {};
+            static_assert (numComplexValues >= minBoundComplexSize && numComplexValues <= maxBoundComplexSize);
+            static_assert ((numComplexValues & (numComplexValues - 1)) == 0);
 
-            auto index = getLog2 (n);
-            std::lock_guard<std::mutex> lock (mutex);
-            auto& setup = complexFloatSetups[index];
+           #if CMAJ_NATIVE_FFT_RT_CONTRACT_CHECK
+            renderPathRTContract.assertNotInRenderPath();
+           #endif
 
-            if (setup == nullptr)
-                setup = pffft_new_setup (static_cast<int> (n), PFFFT_COMPLEX);
+            std::call_once (setupOnce, []
+            {
+                ownedSetup.reset (pffft_new_setup (static_cast<int> (numComplexValues), PFFFT_COMPLEX));
+                setup = ownedSetup.get();
+            });
 
             return setup;
         }
 
-        static constexpr uint64_t maxBoundComplexSize = 65536;
-        std::mutex mutex;
-        std::array<PFFFT_Setup*, 17> complexFloatSetups {};
-    };
-
-    static SetupCache& getSetupCache()
-    {
-        static SetupCache cache;
-        return cache;
-    }
-
-    struct ThreadLocalScratch
-    {
-        ~ThreadLocalScratch()
+        static PFFFT_Setup* getPreparedSetup() noexcept
         {
-            pffft_aligned_free (data);
+            return setup;
         }
 
-        float* ensure (size_t numFloats)
-        {
-            if (numFloats > capacity)
-            {
-                auto* newData = static_cast<float*> (pffft_aligned_malloc (numFloats * sizeof (float)));
-
-                if (newData == nullptr)
-                    return {};
-
-                pffft_aligned_free (data);
-                data = newData;
-                capacity = numFloats;
-            }
-
-            return data;
-        }
-
-        float* data = nullptr;
-        size_t capacity = 0;
+        static inline std::once_flag setupOnce;
+        static inline std::unique_ptr<PFFFT_Setup, PFFFTSetupDeleter> ownedSetup;
+        static inline PFFFT_Setup* setup = nullptr;
     };
-
-    static float* getThreadLocalScratch (size_t numFloats)
-    {
-        thread_local ThreadLocalScratch scratch;
-        return scratch.ensure (numFloats);
-    }
 
     template <uint64_t numComplexValues>
     void runComplexFFT32 (float* interleavedComplexData)
     {
         static constexpr auto dataFloats = static_cast<size_t> (2 * numComplexValues);
-        static constexpr auto workFloats = dataFloats;
-        static constexpr auto stackWorkBytes = workFloats * sizeof (float);
-        static constexpr auto stackBounceBytes = (dataFloats + workFloats) * sizeof (float);
+        static_assert (numComplexValues <= maxBoundComplexSize);
 
-        auto* setup = getSetupCache().getComplexFloatSetup (numComplexValues);
+       #if CMAJ_NATIVE_FFT_RT_CONTRACT_CHECK
+        RenderPathScope renderPathScope;
+       #endif
 
-        if (setup == nullptr)
-            return;
+        auto* setup = PreparedComplexFFT32<numComplexValues>::getPreparedSetup();
+        CMAJ_ASSERT (setup != nullptr);
 
         if (isAligned16 (interleavedComplexData))
         {
-            if constexpr (stackWorkBytes <= stackScratchBytes)
-            {
-                alignas (16) float work[workFloats];
-                pffft_transform_ordered (setup, interleavedComplexData, interleavedComplexData, work, PFFFT_FORWARD);
-            }
-            else
-            {
-                auto* work = getThreadLocalScratch (workFloats);
-
-                if (work != nullptr)
-                    pffft_transform_ordered (setup, interleavedComplexData, interleavedComplexData, work, PFFFT_FORWARD);
-            }
+            // FEATHER: nullptr work tells PFFFT to use its bounded internal stack buffer; no render-path heap.
+            pffft_transform_ordered (setup, interleavedComplexData, interleavedComplexData, nullptr, PFFFT_FORWARD);
         }
         else
         {
-            if constexpr (stackBounceBytes <= stackScratchBytes)
-            {
-                alignas (16) float scratch[dataFloats + workFloats];
-                auto* alignedData = scratch;
-                auto* work = scratch + dataFloats;
+            alignas (16) float alignedData[dataFloats];
 
-                std::memcpy (alignedData, interleavedComplexData, dataFloats * sizeof (float));
-                pffft_transform_ordered (setup, alignedData, alignedData, work, PFFFT_FORWARD);
-                std::memcpy (interleavedComplexData, alignedData, dataFloats * sizeof (float));
-            }
-            else
-            {
-                auto* scratch = getThreadLocalScratch (dataFloats + workFloats);
-
-                if (scratch != nullptr)
-                {
-                    auto* alignedData = scratch;
-                    auto* work = scratch + dataFloats;
-
-                    std::memcpy (alignedData, interleavedComplexData, dataFloats * sizeof (float));
-                    pffft_transform_ordered (setup, alignedData, alignedData, work, PFFFT_FORWARD);
-                    std::memcpy (interleavedComplexData, alignedData, dataFloats * sizeof (float));
-                }
-            }
+            std::memcpy (alignedData, interleavedComplexData, dataFloats * sizeof (float));
+            pffft_transform_ordered (setup, alignedData, alignedData, nullptr, PFFFT_FORWARD);
+            std::memcpy (interleavedComplexData, alignedData, dataFloats * sizeof (float));
         }
     }
 
     template <uint64_t numComplexValues>
     void* getFunctionIfSetupCanBeCreated()
     {
-        if (getSetupCache().getComplexFloatSetup (numComplexValues) == nullptr)
+        if (PreparedComplexFFT32<numComplexValues>::prepare() == nullptr)
             return {};
 
         auto fn = &runComplexFFT32<numComplexValues>;
@@ -204,12 +183,6 @@ void* getComplexFFT32Function (uint64_t numComplexValues)
         case 256:   return getFunctionIfSetupCanBeCreated<256>();
         case 512:   return getFunctionIfSetupCanBeCreated<512>();
         case 1024:  return getFunctionIfSetupCanBeCreated<1024>();
-        case 2048:  return getFunctionIfSetupCanBeCreated<2048>();
-        case 4096:  return getFunctionIfSetupCanBeCreated<4096>();
-        case 8192:  return getFunctionIfSetupCanBeCreated<8192>();
-        case 16384: return getFunctionIfSetupCanBeCreated<16384>();
-        case 32768: return getFunctionIfSetupCanBeCreated<32768>();
-        case 65536: return getFunctionIfSetupCanBeCreated<65536>();
         default:    return {};
     }
 }

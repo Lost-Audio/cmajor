@@ -271,7 +271,7 @@ private:
 
     void emitFunction (const AST::Function& f)
     {
-        if (builder.program.externalFunctionManager.findResolvedFunction (f) != nullptr)
+        if (builder.findResolvedFunction (f) != nullptr) // FEATHER: allows LLVM native overrides to remain per-link-local.
             return;
 
         isInsideFunction = true;

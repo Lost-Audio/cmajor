@@ -64,15 +64,24 @@ struct LLVMCodeGenerator
             std::cout << cmaj::AST::print (program) << std::endl;
     }
 
-    bool addNativeOverriddenFunctions (AST::ExternalFunctionManager& externalFunctionManager)
+    bool addNativeOverriddenFunctions()
     {
        #if CMAJ_ENABLE_NATIVE_OVERRIDES
-        // FEATHER: Register prepared native implementations for selected stdlib specialisations.
-        return native_overrides::registerNativeOverrides (program, externalFunctionManager) != 0;
+        // FEATHER: Register prepared native implementations for this LLVM link only.
+        return native_overrides::registerNativeOverrides (program, nativeFunctionOverrides) != 0;
        #else
-        (void) externalFunctionManager;
         return false;
        #endif
+    }
+
+    void* findResolvedFunction (const AST::Function& f) const
+    {
+       #if CMAJ_ENABLE_NATIVE_OVERRIDES
+        if (auto found = nativeFunctionOverrides.find (std::addressof (f)); found != nativeFunctionOverrides.end())
+            return found->second;
+       #endif
+
+        return program.externalFunctionManager.findResolvedFunction (f);
     }
 
     bool generate()
@@ -217,6 +226,9 @@ struct LLVMCodeGenerator
     const AST::Allocator& allocator;
     ptr<AST::StructType> stateStruct, ioStruct;
     ptr<CodeGenerator<LLVMCodeGenerator>> codeGenerator;
+   #if CMAJ_ENABLE_NATIVE_OVERRIDES
+    native_overrides::FunctionMap nativeFunctionOverrides; // FEATHER: per-link native symbol map, no shared program mutation.
+   #endif
     bool useFastMaths = false;
 
     ::llvm::DataLayout dataLayout;
@@ -865,7 +877,7 @@ struct LLVMCodeGenerator
         auto callee = createFunction (name, AST::castToTypeBaseRef (f.returnType), getParameterTypesAddingRefsWhereNeeded (f));
         functions[std::addressof (f)] = callee;
 
-        if (auto customImplementation = program.externalFunctionManager.findResolvedFunction (f))
+        if (auto customImplementation = findResolvedFunction (f))
             externalFunctionPointers[name] = customImplementation;
 
         return callee;

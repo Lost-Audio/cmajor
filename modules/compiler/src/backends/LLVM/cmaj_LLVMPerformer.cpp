@@ -343,7 +343,7 @@ struct LLVMEngine
                                        stringDictionary,
                                        false);
 
-            auto nativeOverridesActive = codeGen.addNativeOverriddenFunctions (llvmEngine.engine.program->externalFunctionManager);
+            auto nativeOverridesActive = codeGen.addNativeOverriddenFunctions();
 
             // FEATHER: cached bitcode would contain declarations for native-overridden bodies but no bound symbols.
             bool loadedFromCache = ! nativeOverridesActive && loadFromCache (codeGen, cache, cacheKey);

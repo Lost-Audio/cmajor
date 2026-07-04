@@ -15,7 +15,9 @@
 #pragma once
 
 #include <cstddef>
+#include <memory>
 #include <string_view>
+#include <unordered_map>
 
 #include "../AST/cmaj_AST.h"
 #include "cmaj_NativeFFT.h"
@@ -23,6 +25,7 @@
 namespace cmaj::native_overrides
 {
 
+using FunctionMap = std::unordered_map<const AST::Function*, void*>;
 using MatcherFn = void* (*) (const AST::Function&);
 
 struct Entry
@@ -79,7 +82,7 @@ inline void* matchComplexFFT (const AST::Function& function)
     return native_fft::getComplexFFT32Function (dataType.getArrayOrVectorSize (0));
 }
 
-inline size_t registerNativeOverrides (const AST::Program& program, AST::ExternalFunctionManager& externalFunctionManager)
+inline size_t registerNativeOverrides (const AST::Program& program, FunctionMap& overrides)
 {
     static constexpr Entry entries[]
     {
@@ -103,7 +106,7 @@ inline size_t registerNativeOverrides (const AST::Program& program, AST::Externa
             {
                 if (auto implementation = entry.matcher (function))
                 {
-                    externalFunctionManager.addFunctionWithImplementation (function, implementation);
+                    overrides[std::addressof (function)] = implementation;
                     ++numOverrides;
                 }
 
@@ -116,4 +119,3 @@ inline size_t registerNativeOverrides (const AST::Program& program, AST::Externa
 }
 
 } // namespace cmaj::native_overrides
-
