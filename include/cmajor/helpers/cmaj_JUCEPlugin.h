@@ -49,6 +49,7 @@
 #include "cmaj_PatchWebView.h"
 #include "cmaj_GeneratedCppEngine.h"
 #include "../../choc/choc/audio/choc_AudioFileFormat_WAV.h"
+#include "../../choc/choc/text/choc_Files.h"
 
 #if CMAJ_USE_QUICKJS_WORKER
  #include "cmaj_PatchWorker_QuickJS.h"
@@ -112,6 +113,13 @@ public:
             handleOutputEvent (frame, endpointID, v);
         };
 
+        // FEATHER: Preset files belong to the native wrapper because patch code
+        // and WebViews cannot safely own host file I/O.
+        patch->handlePresetList   = [this] { return listPresets(); };
+        patch->handlePresetSave   = [this] (const std::string& name, const choc::value::ValueView& state) { return savePreset (name, state); };
+        patch->handlePresetLoad   = [this] (const std::string& name) { return loadPreset (name); };
+        patch->handlePresetDelete = [this] (const std::string& name) { return deletePreset (name); };
+
        #if CMAJ_USE_QUICKJS_WORKER
         enableQuickJSPatchWorker (*patch);
         #else
@@ -129,6 +137,10 @@ public:
 
         patch->patchChanged = [] {};
         patch->statusChanged = [] (const Patch::Status&) {};
+        patch->handlePresetList = {};
+        patch->handlePresetSave = {};
+        patch->handlePresetLoad = {};
+        patch->handlePresetDelete = {};
         // FEATHER: Park and then destroy the processor-owned WebView before the
         // parking native window member is torn down.
         destroyPatchWebView();
@@ -977,6 +989,265 @@ protected:
     {
         if (auto* e = dynamic_cast<Editor*> (getActiveEditor()))
             e->onPatchChanged();
+    }
+
+    // FEATHER: Lost Audio preset v1. This is intentionally wrapper-owned file
+    // I/O that reuses Patch::getFullStoredState()/setFullStoredState() as the
+    // only musical-state primitive.
+    static constexpr int presetSchemaVersion = 1;
+
+    choc::value::Value listPresets() const
+    {
+        auto presets = choc::value::createEmptyArray();
+
+        if (! isPresetProductAvailable())
+            return presets;
+
+        auto directory = getPresetDirectory (patch->getUID());
+
+        if (! directory.isDirectory())
+            return presets;
+
+        auto files = directory.findChildFiles (juce::File::findFiles, false, "*.lapreset");
+        auto productID = patch->getUID();
+
+        for (auto i = 0; i < files.size(); ++i)
+        {
+            try
+            {
+                auto preset = readPresetFile (files.getReference (i));
+
+                if (validatePresetMetadata (preset, productID).empty())
+                    presets.addArrayElement (createPresetSummary (files.getReference (i), preset));
+            }
+            catch (...) {}
+        }
+
+        return presets;
+    }
+
+    choc::value::Value savePreset (const std::string& requestedName, const choc::value::ValueView& state) const
+    {
+        try
+        {
+            if (! isPresetProductAvailable())
+                return createPresetError ("Presets are available after a patch is loaded");
+
+            auto presetName = sanitisePresetName (requestedName);
+
+            if (presetName.isEmpty())
+                return createPresetError ("Preset name is empty");
+
+            auto directory = getPresetDirectory (patch->getUID());
+
+            if (! directory.exists())
+            {
+                auto createResult = directory.createDirectory();
+
+                if (createResult.failed())
+                    return createPresetError ((juce::String ("Could not create preset directory: ") + createResult.getErrorMessage()).toStdString());
+            }
+
+            auto savedAt = createPresetTimestamp();
+            auto preset = choc::json::create ("schemaVersion", presetSchemaVersion,
+                                              "name", presetName.toStdString(),
+                                              "productId", patch->getUID(),
+                                              "pluginVersion", patch->getVersion(),
+                                              "savedAt", savedAt.toStdString(),
+                                              "state", state);
+            auto file = getPresetFile (patch->getUID(), presetName);
+
+            choc::file::replaceFileWithContent (file.getFullPathName().toStdString(),
+                                                choc::json::toString (preset, true));
+
+            return choc::json::create ("ok", true,
+                                       "name", presetName.toStdString(),
+                                       "savedAt", savedAt.toStdString());
+        }
+        catch (const std::exception& e)
+        {
+            return createPresetError (std::string ("Could not save preset: ") + e.what());
+        }
+        catch (...)
+        {
+            return createPresetError ("Could not save preset");
+        }
+    }
+
+    choc::value::Value loadPreset (const std::string& requestedName) const
+    {
+        try
+        {
+            if (! isPresetProductAvailable())
+                return createPresetError ("Presets are available after a patch is loaded");
+
+            auto presetName = sanitisePresetName (requestedName);
+
+            if (presetName.isEmpty())
+                return createPresetError ("Preset name is empty");
+
+            auto file = getPresetFile (patch->getUID(), presetName);
+
+            if (! file.existsAsFile())
+                return createPresetError ("Preset file was not found");
+
+            auto preset = readPresetFile (file);
+
+            if (auto error = validatePresetMetadata (preset, patch->getUID()); ! error.empty())
+                return createPresetError (error);
+
+            if (! preset["state"].isObject())
+                return createPresetError ("Preset file did not contain a state object");
+
+            return choc::json::create ("ok", true,
+                                       "name", getPresetDisplayName (file, preset),
+                                       "savedAt", preset["savedAt"].toString(),
+                                       "state", choc::value::Value (preset["state"]));
+        }
+        catch (const std::exception& e)
+        {
+            return createPresetError (std::string ("Could not load preset: ") + e.what());
+        }
+        catch (...)
+        {
+            return createPresetError ("Could not load preset");
+        }
+    }
+
+    choc::value::Value deletePreset (const std::string& requestedName) const
+    {
+        try
+        {
+            if (! isPresetProductAvailable())
+                return createPresetError ("Presets are available after a patch is loaded");
+
+            auto presetName = sanitisePresetName (requestedName);
+
+            if (presetName.isEmpty())
+                return createPresetError ("Preset name is empty");
+
+            auto file = getPresetFile (patch->getUID(), presetName);
+
+            if (! file.existsAsFile())
+                return createPresetError ("Preset file was not found");
+
+            if (! file.deleteFile())
+                return createPresetError ("Could not delete preset file");
+
+            return choc::json::create ("ok", true,
+                                       "name", presetName.toStdString());
+        }
+        catch (const std::exception& e)
+        {
+            return createPresetError (std::string ("Could not delete preset: ") + e.what());
+        }
+        catch (...)
+        {
+            return createPresetError ("Could not delete preset");
+        }
+    }
+
+    bool isPresetProductAvailable() const
+    {
+        return patch != nullptr && patch->isLoaded() && patch->getUID() != "cmajor";
+    }
+
+    static juce::File getPresetDirectory (const std::string& productID)
+    {
+       #if JUCE_WINDOWS
+        if (auto* userProfile = std::getenv ("USERPROFILE"); userProfile != nullptr && userProfile[0] != 0)
+            return juce::File (juce::String (userProfile))
+                    .getChildFile ("Documents")
+                    .getChildFile ("LostAudio")
+                    .getChildFile (juce::String (productID))
+                    .getChildFile ("presets");
+       #endif
+
+        return juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
+                .getChildFile ("LostAudio")
+                .getChildFile (juce::String (productID))
+                .getChildFile ("presets");
+    }
+
+    static juce::File getPresetFile (const std::string& productID, const juce::String& presetName)
+    {
+        return getPresetDirectory (productID).getChildFile (presetName).withFileExtension (".lapreset");
+    }
+
+    static juce::String sanitisePresetName (const std::string& requestedName)
+    {
+        auto name = juce::String (requestedName).trim();
+
+        if (name.endsWithIgnoreCase (".lapreset"))
+            name = name.dropLastCharacters (9);
+
+        return juce::File::createLegalFileName (name).trim();
+    }
+
+    static juce::String createPresetTimestamp()
+    {
+        const auto now = juce::Time::getCurrentTime();
+        return juce::String (now.getYear())
+             + "-"
+             + presetPaddedNumber (now.getMonth() + 1, 2)
+             + "-"
+             + presetPaddedNumber (now.getDayOfMonth(), 2)
+             + "T"
+             + presetPaddedNumber (now.getHours(), 2)
+             + ":"
+             + presetPaddedNumber (now.getMinutes(), 2)
+             + ":"
+             + presetPaddedNumber (now.getSeconds(), 2)
+             + "."
+             + presetPaddedNumber (now.getMilliseconds(), 3);
+    }
+
+    static juce::String presetPaddedNumber (int value, int width)
+    {
+        return juce::String (value).paddedLeft ('0', width);
+    }
+
+    static choc::value::Value readPresetFile (const juce::File& file)
+    {
+        return choc::json::parse (choc::file::loadFileAsString (file.getFullPathName().toStdString()));
+    }
+
+    static std::string validatePresetMetadata (const choc::value::ValueView& preset, const std::string& productID)
+    {
+        if (! preset.isObject())
+            return "Preset file is not a JSON object";
+
+        if (preset["schemaVersion"].getWithDefault<int32_t> (0) != presetSchemaVersion)
+            return "Unsupported preset schema version";
+
+        if (preset["productId"].toString() != productID)
+            return "Preset is for a different product";
+
+        return {};
+    }
+
+    static std::string getPresetDisplayName (const juce::File& file, const choc::value::ValueView& preset)
+    {
+        if (auto name = preset["name"].toString(); ! name.empty())
+            return name;
+
+        return file.getFileNameWithoutExtension().toStdString();
+    }
+
+    static choc::value::Value createPresetSummary (const juce::File& file, const choc::value::ValueView& preset)
+    {
+        auto tags = preset["tags"].isArray() ? choc::value::Value (preset["tags"])
+                                             : choc::value::createEmptyArray();
+
+        return choc::json::create ("name", getPresetDisplayName (file, preset),
+                                   "tags", tags,
+                                   "savedAt", preset["savedAt"].toString());
+    }
+
+    static choc::value::Value createPresetError (std::string message)
+    {
+        return choc::json::create ("ok", false,
+                                   "error", std::move (message));
     }
 
     struct PatchViewUpdateMessage  : public juce::Message

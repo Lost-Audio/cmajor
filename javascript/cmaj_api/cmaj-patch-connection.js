@@ -158,6 +158,53 @@ export class PatchConnection  extends EventListenerList
     }
 
     //==============================================================================
+    // FEATHER: Lost Audio preset browser API. Native wrappers own file I/O; patch
+    // views just request/list/apply by name.
+
+    /** Lists saved user presets for the currently loaded patch.
+     *  @param {Function} callback
+     */
+    listPresets (callback)
+    {
+        const replyType = "presetreply_" + (Math.floor (Math.random() * 100000000)).toString();
+        this.addSingleUseListener (replyType, callback);
+        this.sendMessageToServer ({ type: "listPresets", replyType: replyType });
+    }
+
+    /** Saves the current full patch state as a named user preset.
+     *  @param {string} name
+     *  @param {Function} callback
+     */
+    savePreset (name, callback)
+    {
+        const replyType = "presetreply_" + (Math.floor (Math.random() * 100000000)).toString();
+        this.addSingleUseListener (replyType, callback);
+        this.sendMessageToServer ({ type: "savePreset", replyType: replyType, name: name });
+    }
+
+    /** Loads a named user preset into the currently loaded patch.
+     *  @param {string} name
+     *  @param {Function} callback
+     */
+    loadPreset (name, callback)
+    {
+        const replyType = "presetreply_" + (Math.floor (Math.random() * 100000000)).toString();
+        this.addSingleUseListener (replyType, callback);
+        this.sendMessageToServer ({ type: "loadPreset", replyType: replyType, name: name });
+    }
+
+    /** Deletes a named user preset for the currently loaded patch.
+     *  @param {string} name
+     *  @param {Function} callback
+     */
+    deletePreset (name, callback)
+    {
+        const replyType = "presetreply_" + (Math.floor (Math.random() * 100000000)).toString();
+        this.addSingleUseListener (replyType, callback);
+        this.sendMessageToServer ({ type: "deletePreset", replyType: replyType, name: name });
+    }
+
+    //==============================================================================
     // Listener methods:
 
     /** Attaches a listener function that will receive updates with the events or audio data

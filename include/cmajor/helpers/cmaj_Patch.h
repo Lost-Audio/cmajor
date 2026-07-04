@@ -216,6 +216,13 @@ struct Patch
     /// Applies a state which was previously returned by getFullStoredState()
     bool setFullStoredState (const choc::value::ValueView& newState);
 
+    // FEATHER: Native wrappers can provide patch-scoped preset storage while
+    // this class remains the authority for full-state capture/apply.
+    std::function<choc::value::Value()> handlePresetList;
+    std::function<choc::value::Value(const std::string&, const choc::value::ValueView&)> handlePresetSave;
+    std::function<choc::value::Value(const std::string&)> handlePresetLoad;
+    std::function<choc::value::Value(const std::string&)> handlePresetDelete;
+
     //==============================================================================
     /// This must be supplied by the client using this class before trying to load a patch.
     std::function<cmaj::Engine()> createEngine;
@@ -2834,6 +2841,79 @@ inline bool Patch::handleClientMessage (PatchView& sourceView, const choc::value
         {
             if (auto replyType = msg["replyType"].toString(); ! replyType.empty())
                 sendMessageToView (sourceView, replyType, getFullStoredState());
+
+            return true;
+        }
+
+        if (type == "listPresets")
+        {
+            if (auto replyType = msg["replyType"].toString(); ! replyType.empty())
+                sendMessageToView (sourceView, replyType,
+                                   handlePresetList ? handlePresetList()
+                                                    : choc::value::createEmptyArray());
+
+            return true;
+        }
+
+        if (type == "savePreset")
+        {
+            if (auto replyType = msg["replyType"].toString(); ! replyType.empty())
+            {
+                auto name = msg["name"].toString();
+                auto result = handlePresetSave ? handlePresetSave (name, getFullStoredState())
+                                               : choc::json::create ("ok", false,
+                                                                     "error", "Preset support is unavailable");
+
+                sendMessageToView (sourceView, replyType, result);
+            }
+
+            return true;
+        }
+
+        if (type == "loadPreset")
+        {
+            if (auto replyType = msg["replyType"].toString(); ! replyType.empty())
+            {
+                auto name = msg["name"].toString();
+                auto result = handlePresetLoad ? handlePresetLoad (name)
+                                               : choc::json::create ("ok", false,
+                                                                     "error", "Preset support is unavailable");
+
+                if (result["ok"].getWithDefault<bool> (false))
+                {
+                    if (auto state = result["state"]; state.isObject())
+                    {
+                        auto applied = setFullStoredState (state);
+                        result = choc::json::create ("ok", applied,
+                                                    "name", result["name"].toString(),
+                                                    "savedAt", result["savedAt"].toString(),
+                                                    "error", applied ? std::string()
+                                                                     : std::string ("Preset state could not be applied"));
+                    }
+                    else
+                    {
+                        result = choc::json::create ("ok", false,
+                                                    "name", name,
+                                                    "error", "Preset file did not contain a state object");
+                    }
+                }
+
+                sendMessageToView (sourceView, replyType, result);
+            }
+
+            return true;
+        }
+
+        if (type == "deletePreset")
+        {
+            if (auto replyType = msg["replyType"].toString(); ! replyType.empty())
+            {
+                auto result = handlePresetDelete ? handlePresetDelete (msg["name"].toString())
+                                                 : choc::json::create ("ok", false,
+                                                                       "error", "Preset support is unavailable");
+
+                sendMessageToView (sourceView, replyType, result);
+            }
 
             return true;
         }

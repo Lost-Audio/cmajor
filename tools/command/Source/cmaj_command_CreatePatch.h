@@ -426,6 +426,19 @@ export type PatchStatus = {
   parameters?: ParameterDescription[]
 }
 
+export type PresetSummary = {
+  name: string
+  tags?: string[]
+  savedAt?: string
+}
+
+export type PresetCommandResult = {
+  ok?: boolean
+  name?: string
+  savedAt?: string
+  error?: string
+}
+
 export type ParameterDescription = {
   endpointID: string
   name: string
@@ -460,6 +473,10 @@ export type PatchConnection = {
   removeStoredStateValueListener(listener: (message: { key: string; value: StoredStateValue }) => void): void
   sendFullStoredState(fullState: Record<string, StoredStateValue>): void
   requestFullStoredState(callback: (state: Record<string, StoredStateValue>) => void): void
+  listPresets(callback: (presets: PresetSummary[]) => void): void
+  savePreset(name: string, callback: (result: PresetCommandResult) => void): void
+  loadPreset(name: string, callback: (result: PresetCommandResult) => void): void
+  deletePreset(name: string, callback: (result: PresetCommandResult) => void): void
 }
 
 class ReactiveSignal {
@@ -683,6 +700,9 @@ export function createPreviewPatchConnection(): PatchConnection {
     ['gain', 0.35],
     ['enabled', true],
   ])
+  const presets = new Map<string, PresetSummary>([
+    ['Init', { name: 'Init', savedAt: 'preview' }],
+  ])
 
   const status: PatchStatus = {
     loaded: true,
@@ -735,6 +755,16 @@ export function createPreviewPatchConnection(): PatchConnection {
     removeStoredStateValueListener: (listener) => listeners.get('state')?.delete(listener as (message: unknown) => void),
     sendFullStoredState: () => undefined,
     requestFullStoredState: (callback) => queueMicrotask(() => callback({})),
+    listPresets: (callback) => queueMicrotask(() => callback([...presets.values()])),
+    savePreset: (name, callback) => {
+      presets.set(name, { name, savedAt: 'preview' })
+      queueMicrotask(() => callback({ ok: true, name, savedAt: 'preview' }))
+    },
+    loadPreset: (name, callback) => queueMicrotask(() => callback({ ok: presets.has(name), name, error: presets.has(name) ? undefined : 'Preset not found' })),
+    deletePreset: (name, callback) => {
+      const ok = presets.delete(name)
+      queueMicrotask(() => callback({ ok, name, error: ok ? undefined : 'Preset not found' }))
+    },
   }
 }
 
@@ -838,6 +868,7 @@ static constexpr auto viewAppSvelte = R"cmaj_view(
 <script lang="ts">
   import { onDestroy, untrack } from 'svelte'
   import MotionExample from './components/MotionExample.svelte'
+  import PresetBrowser from './components/PresetBrowser.svelte'
   import WebGpuDemo from './components/WebGpuDemo.svelte'
   import ParamToggle from './lib/components/ui/param-toggle.svelte'
   import RotaryKnob from './lib/components/ui/rotary-knob.svelte'
@@ -849,6 +880,7 @@ static constexpr auto viewAppSvelte = R"cmaj_view(
 
   let gain: ParameterRuneStore | null = $state(null)
   let enabled: ParameterRuneStore | null = $state(null)
+  let patchReady = $derived(Boolean(patch.status?.loaded || patch.status?.manifest))
 
   $effect(() => {
     const numeric = patch.parameters.find((param) => !param.boolean)
@@ -886,13 +918,17 @@ static constexpr auto viewAppSvelte = R"cmaj_view(
 <main class="shell">
   <section class="panel">
     <header>
-      <div>
-        <p class="eyebrow">Cmajor Svelte View</p>
-        <h1>{patch.status?.manifest?.name ?? 'NAME'}</h1>
+      <div class="header-line">
+        <div>
+          <p class="eyebrow">Cmajor Svelte View</p>
+          <h1>{patch.status?.manifest?.name ?? 'NAME'}</h1>
+        </div>
+        <span class:online={patchReady} class="status">
+          {patchReady ? 'loaded' : 'waiting'}
+        </span>
       </div>
-      <span class:online={patch.status?.loaded} class="status">
-        {patch.status?.loaded ? 'loaded' : 'waiting'}
-      </span>
+
+      <PresetBrowser patchConnection={patchConnection} disabled={!patchReady} />
     </header>
 
     <div class="controls">
@@ -936,7 +972,13 @@ static constexpr auto viewAppSvelte = R"cmaj_view(
   }
 
   header {
+    display: grid;
+    gap: 16px;
+  }
+
+  .header-line {
     display: flex;
+    min-width: 0;
     align-items: flex-start;
     justify-content: space-between;
     gap: 16px;
@@ -1260,6 +1302,247 @@ static constexpr auto viewParamToggleSvelte = R"cmaj_view(
 </style>
 )cmaj_view";
 
+static constexpr auto viewPresetBrowserSvelte = R"cmaj_view(
+<script lang="ts">
+  import type { PatchConnection, PresetCommandResult, PresetSummary } from '../lib/cmajor'
+
+  let { patchConnection, disabled = false }: { patchConnection: PatchConnection; disabled?: boolean } = $props()
+
+  let presets = $state<PresetSummary[]>([])
+  let search = $state('')
+  let selected = $state('')
+  let busy = $state(false)
+  let message = $state('')
+
+  let visiblePresets = $derived(
+    presets.filter((preset) => preset.name.toLowerCase().includes(search.trim().toLowerCase())),
+  )
+  let selectedIndex = $derived(visiblePresets.findIndex((preset) => preset.name === selected))
+  let hasPresets = $derived(visiblePresets.length > 0)
+
+  $effect(() => {
+    if (disabled) {
+      presets = []
+      selected = ''
+      message = ''
+      return
+    }
+
+    refreshPresets()
+  })
+
+  function refreshPresets() {
+    if (disabled) return
+
+    patchConnection.listPresets((items) => {
+      presets = Array.isArray(items) ? items : []
+
+      if (!presets.some((preset) => preset.name === selected)) {
+        selected = presets[0]?.name ?? ''
+      }
+    })
+  }
+
+  function saveAs() {
+    if (disabled || busy) return
+
+    const name = window.prompt('Preset name', selected || 'New Preset')?.trim()
+    if (!name) return
+
+    busy = true
+    patchConnection.savePreset(name, (result) => {
+      finishCommand(result)
+
+      if (result.ok) {
+        selected = result.name ?? name
+        refreshPresets()
+      }
+    })
+  }
+
+  function loadPreset(name = selected) {
+    if (disabled || busy || !name) return
+
+    busy = true
+    patchConnection.loadPreset(name, (result) => {
+      finishCommand(result)
+
+      if (result.ok) {
+        selected = result.name ?? name
+      }
+    })
+  }
+
+  function deleteSelected() {
+    if (disabled || busy || !selected) return
+
+    if (!window.confirm(`Delete preset "${selected}"?`)) return
+
+    const name = selected
+    busy = true
+    patchConnection.deletePreset(name, (result) => {
+      finishCommand(result)
+
+      if (result.ok) {
+        selected = ''
+        refreshPresets()
+      }
+    })
+  }
+
+  function step(offset: number) {
+    if (!hasPresets) return
+
+    const current = selectedIndex >= 0 ? selectedIndex : 0
+    const next = (current + offset + visiblePresets.length) % visiblePresets.length
+    loadPreset(visiblePresets[next]?.name)
+  }
+
+  function finishCommand(result: PresetCommandResult) {
+    busy = false
+    message = result.ok ? '' : result.error ?? 'Preset command failed'
+  }
+</script>
+
+<div class="preset-browser" data-disabled={disabled}>
+  <div class="preset-bar">
+    <button type="button" aria-label="Previous preset" title="Previous preset" disabled={disabled || busy || !hasPresets} onclick={() => step(-1)}>&lt;</button>
+    <input aria-label="Search presets" placeholder="Search presets" bind:value={search} disabled={disabled || busy} />
+    <button type="button" aria-label="Next preset" title="Next preset" disabled={disabled || busy || !hasPresets} onclick={() => step(1)}>&gt;</button>
+    <button type="button" aria-label="Save preset" title="Save preset" disabled={disabled || busy} onclick={saveAs}>+</button>
+    <button type="button" aria-label="Delete preset" title="Delete preset" disabled={disabled || busy || !selected} onclick={deleteSelected}>x</button>
+  </div>
+
+  {#if !disabled && hasPresets}
+    <div class="preset-list" role="listbox" aria-label="Presets">
+      {#each visiblePresets as preset (preset.name)}
+        <button
+          type="button"
+          class:active={preset.name === selected}
+          role="option"
+          aria-selected={preset.name === selected}
+          disabled={busy}
+          onclick={() => loadPreset(preset.name)}
+        >
+          <span>{preset.name}</span>
+          {#if preset.savedAt}
+            <small>{preset.savedAt}</small>
+          {/if}
+        </button>
+      {/each}
+    </div>
+  {/if}
+
+  {#if message}
+    <p>{message}</p>
+  {/if}
+</div>
+
+<style>
+  .preset-browser {
+    display: grid;
+    min-width: 0;
+    gap: 7px;
+  }
+
+  .preset-bar {
+    display: grid;
+    grid-template-columns: 30px minmax(120px, 1fr) 30px 30px 30px;
+    gap: 6px;
+    align-items: center;
+  }
+
+  button,
+  input {
+    min-width: 0;
+    height: 30px;
+    border: 1px solid #90978e;
+    border-radius: 6px;
+    color: #1f2421;
+    font: inherit;
+    font-size: 0.76rem;
+    letter-spacing: 0;
+  }
+
+  button {
+    display: grid;
+    place-items: center;
+    background: #d9e2d2;
+    font-weight: 850;
+  }
+
+  button:hover:not(:disabled),
+  button.active {
+    border-color: #46616a;
+    background: #bed6dd;
+  }
+
+  button:disabled,
+  input:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+  }
+
+  input {
+    padding: 0 9px;
+    background: #f5f4eb;
+    outline: none;
+  }
+
+  input:focus,
+  button:focus-visible {
+    border-color: #4269ff;
+    box-shadow: 0 0 0 2px rgba(66, 105, 255, 0.18);
+  }
+
+  .preset-list {
+    display: grid;
+    max-height: 96px;
+    overflow: auto;
+    border: 1px solid #aeb3aa;
+    border-radius: 6px;
+    background: #f5f4eb;
+  }
+
+  .preset-list button {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    justify-items: stretch;
+    width: 100%;
+    height: 28px;
+    border: 0;
+    border-radius: 0;
+    padding: 0 8px;
+    background: transparent;
+    text-align: left;
+  }
+
+  span,
+  small,
+  p {
+    overflow: hidden;
+    margin: 0;
+    letter-spacing: 0;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  span {
+    min-width: 0;
+  }
+
+  small,
+  p {
+    color: #59615a;
+    font-size: 0.68rem;
+  }
+
+  p {
+    color: #7a2f2f;
+  }
+</style>
+)cmaj_view";
+
 static constexpr auto viewMotionExampleSvelte = R"cmaj_view(
 <script lang="ts">
   import { onMount } from 'svelte'
@@ -1481,6 +1764,7 @@ static void writeSvelteView (const std::filesystem::path& folder, const std::str
     writePatchFile (folder, "view/src/App.svelte", viewAppSvelte, name);
     writePatchFile (folder, "view/src/lib/components/ui/rotary-knob.svelte", viewRotaryKnobSvelte, name);
     writePatchFile (folder, "view/src/lib/components/ui/param-toggle.svelte", viewParamToggleSvelte, name);
+    writePatchFile (folder, "view/src/components/PresetBrowser.svelte", viewPresetBrowserSvelte, name);
     writePatchFile (folder, "view/src/components/MotionExample.svelte", viewMotionExampleSvelte, name);
     writePatchFile (folder, "view/src/components/WebGpuDemo.svelte", viewWebGpuDemoSvelte, name);
     writePatchFile (folder, "view/src/dev/react-grab.ts", viewReactGrabTS, name);

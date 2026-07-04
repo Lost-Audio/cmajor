@@ -40,13 +40,18 @@ class GenericPatchView extends HTMLElement
         {
             this.status = status;
             this.createControlElements();
+            this.refreshPresets();
         };
+
+        this.presets = [];
+        this.currentPreset = "";
 
         this.attachShadow ({ mode: "open" });
         const root = /** @type {ShadowRoot} */ (this.shadowRoot);
         root.innerHTML = this.createHTML();
 
         this.titleElement      = /** @type {HTMLElement} */ (root.querySelector ("cmaj-generic-patch-title"));
+        this.presetsElement    = /** @type {HTMLElement} */ (root.querySelector ("cmaj-generic-patch-presets"));
         this.parametersElement = /** @type {HTMLElement} */ (root.querySelector ("cmaj-generic-patch-parameters"));
     }
 
@@ -93,6 +98,141 @@ class GenericPatchView extends HTMLElement
                 }
             }
         }
+    }
+
+    /** @private */
+    refreshPresets()
+    {
+        if (! this.presetsElement)
+            return;
+
+        if (! this.status?.manifest)
+        {
+            this.presets = [];
+            this.currentPreset = "";
+            this.renderPresetControls();
+            return;
+        }
+
+        this.patchConnection.listPresets (/** @param {Array<{name: string}>} presets */ (presets) =>
+        {
+            this.presets = Array.isArray (presets) ? presets : [];
+
+            if (! this.presets.some ((preset) => preset.name === this.currentPreset))
+                this.currentPreset = this.presets[0]?.name ?? "";
+
+            this.renderPresetControls();
+        });
+    }
+
+    /** @private */
+    renderPresetControls()
+    {
+        if (! this.presetsElement)
+            return;
+
+        const disabled = ! this.status?.manifest;
+        const options = this.presets.map ((preset) =>
+        {
+            const selected = preset.name === this.currentPreset ? " selected" : "";
+            const escaped = this.escapeHTML (preset.name);
+            return `<option value="${escaped}"${selected}>${escaped}</option>`;
+        }).join ("");
+
+        this.presetsElement.innerHTML = `
+            <button data-action="previous" title="Previous preset" aria-label="Previous preset" ${disabled || this.presets.length === 0 ? "disabled" : ""}>&lt;</button>
+            <select aria-label="Preset" ${disabled ? "disabled" : ""}>${options}</select>
+            <button data-action="next" title="Next preset" aria-label="Next preset" ${disabled || this.presets.length === 0 ? "disabled" : ""}>&gt;</button>
+            <button data-action="save" title="Save preset" aria-label="Save preset" ${disabled ? "disabled" : ""}>+</button>
+            <button data-action="delete" title="Delete preset" aria-label="Delete preset" ${disabled || ! this.currentPreset ? "disabled" : ""}>x</button>`;
+
+        const select = /** @type {HTMLSelectElement | null} */ (this.presetsElement.querySelector ("select"));
+        select?.addEventListener ("change", () => this.loadPreset (select.value));
+
+        for (const button of this.presetsElement.querySelectorAll ("button"))
+        {
+            button.addEventListener ("click", () =>
+            {
+                const action = button.getAttribute ("data-action");
+
+                if (action === "previous") this.stepPreset (-1);
+                if (action === "next")     this.stepPreset (1);
+                if (action === "save")     this.savePreset();
+                if (action === "delete")   this.deletePreset();
+            });
+        }
+    }
+
+    /** @private */
+    savePreset()
+    {
+        const name = window.prompt ("Preset name", this.currentPreset || "New Preset")?.trim();
+
+        if (! name)
+            return;
+
+        this.patchConnection.savePreset (name, (result) =>
+        {
+            if (result?.ok)
+                this.currentPreset = result.name ?? name;
+            else
+                window.alert (result?.error ?? "Preset save failed");
+
+            this.refreshPresets();
+        });
+    }
+
+    /** @private */
+    loadPreset (name)
+    {
+        if (! name)
+            return;
+
+        this.patchConnection.loadPreset (name, (result) =>
+        {
+            if (result?.ok)
+                this.currentPreset = result.name ?? name;
+            else
+                window.alert (result?.error ?? "Preset load failed");
+
+            this.renderPresetControls();
+        });
+    }
+
+    /** @private */
+    deletePreset()
+    {
+        if (! this.currentPreset || ! window.confirm (`Delete preset "${this.currentPreset}"?`))
+            return;
+
+        this.patchConnection.deletePreset (this.currentPreset, (result) =>
+        {
+            if (! result?.ok)
+                window.alert (result?.error ?? "Preset delete failed");
+
+            this.currentPreset = "";
+            this.refreshPresets();
+        });
+    }
+
+    /** @private */
+    stepPreset (offset)
+    {
+        if (this.presets.length === 0)
+            return;
+
+        const current = Math.max (0, this.presets.findIndex ((preset) => preset.name === this.currentPreset));
+        const next = (current + offset + this.presets.length) % this.presets.length;
+        this.loadPreset (this.presets[next]?.name);
+    }
+
+    /** @private */
+    escapeHTML (text)
+    {
+        return String (text).replaceAll ("&", "&amp;")
+                            .replaceAll ("<", "&lt;")
+                            .replaceAll (">", "&gt;")
+                            .replaceAll ('"', "&quot;");
     }
 
     /** @private */
@@ -163,6 +303,34 @@ class GenericPatchView extends HTMLElement
                 flex: 1;
             }
 
+            cmaj-generic-patch-presets {
+                display: grid;
+                grid-template-columns: 2rem minmax(7rem, 13rem) 2rem 2rem 2rem;
+                gap: 0.35rem;
+                margin-right: 0.5rem;
+            }
+
+            cmaj-generic-patch-presets button,
+            cmaj-generic-patch-presets select {
+                min-width: 0;
+                height: 1.8rem;
+                border: 0.1rem solid #777;
+                border-radius: 0.25rem;
+                color: var(--background);
+                background: var(--foreground);
+                font-size: 0.72rem;
+                font-weight: bold;
+            }
+
+            cmaj-generic-patch-presets select {
+                padding: 0 0.35rem;
+            }
+
+            cmaj-generic-patch-presets button:disabled,
+            cmaj-generic-patch-presets select:disabled {
+                opacity: 0.45;
+            }
+
             cmaj-generic-patch-parameters {
                 display: flex;
                 flex-flow: row wrap;
@@ -182,6 +350,7 @@ class GenericPatchView extends HTMLElement
                 <cmaj-generic-patch-logo></cmaj-generic-patch-logo>
                 <cmaj-generic-patch-title></cmaj-generic-patch-title>
                 <cmaj-generic-patch-padding></cmaj-generic-patch-padding>
+                <cmaj-generic-patch-presets></cmaj-generic-patch-presets>
               </cmaj-generic-patch-header>
               <cmaj-generic-patch-parameters></cmaj-generic-patch-parameters>
             </cmaj-generic-patch-main>`;

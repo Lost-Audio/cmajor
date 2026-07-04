@@ -60,3 +60,16 @@ interface StatusMessage {
     httpRootURL?: string;
     status?: string;
 }
+
+interface PresetSummary {
+    name: string;
+    tags?: string[];
+    savedAt?: string;
+}
+
+interface PresetCommandResult {
+    ok?: boolean;
+    name?: string;
+    savedAt?: string;
+    error?: string;
+}
