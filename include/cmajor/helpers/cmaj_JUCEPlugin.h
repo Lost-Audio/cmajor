@@ -271,8 +271,7 @@ public:
     }
 
     static bool isLayoutOK (const std::vector<cmaj::audio_bus_layout::BusGroup>& patchLayouts,
-                            const juce::Array<juce::AudioChannelSet>& suggestedLayouts,
-                            bool isInput)
+                            const juce::Array<juce::AudioChannelSet>& suggestedLayouts)
     {
         if (patchLayouts.empty())
             return suggestedLayouts.isEmpty() || suggestedLayouts.getReference(0).size() == 0;
@@ -285,9 +284,9 @@ public:
             auto& patchLayout = patchLayouts[(size_t) i];
             auto suggestedSize = suggestedLayouts.getReference(i).size();
 
-            // FEATHER: hosts may disable auxiliary/sidechain buses; the processor keeps the patch
-            // endpoint active and feeds silence for its missing channels during processBlock().
-            if (isInput && ! cmaj::audio_bus_layout::isMainBus (patchLayout, static_cast<size_t> (i)) && suggestedSize == 0)
+            // FEATHER: hosts may disable auxiliary/sidechain buses; input endpoints are
+            // silence-backed and output endpoints are routed to discard scratch buffers.
+            if (! cmaj::audio_bus_layout::isMainBus (patchLayout, static_cast<size_t> (i)) && suggestedSize == 0)
                 continue;
 
             if (static_cast<int> (patchLayout.channelCount) != suggestedSize)
@@ -305,8 +304,8 @@ public:
         if (inputAudioBusGroups.empty() && outputAudioBusGroups.empty())
             const_cast<JUCEPluginBase*> (this)->updateCachedAudioBusLayoutFromPatch();
 
-        return isLayoutOK (inputAudioBusGroups,  layout.inputBuses,  true)
-            && isLayoutOK (outputAudioBusGroups, layout.outputBuses, false);
+        return isLayoutOK (inputAudioBusGroups,  layout.inputBuses)
+            && isLayoutOK (outputAudioBusGroups, layout.outputBuses);
     }
 
     bool applyBusLayouts (const BusesLayout& layouts) override
@@ -569,6 +568,8 @@ protected:
             return inputIndex == inputChannelPointers.size();
         };
 
+        // FEATHER: disabled auxiliary output buses still need patch-declared output pointers;
+        // route them to scratch so rendered samples are discarded without allocating here.
         auto mapOutputGroups = [&] (const auto& groups)
         {
             size_t outputIndex = 0;
