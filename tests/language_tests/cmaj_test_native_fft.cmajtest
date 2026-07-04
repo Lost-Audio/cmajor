@@ -1,0 +1,138 @@
+//
+//     ,ad888ba,                              88
+//    d8"'    "8b
+//   d8            88,dba,,adba,   ,aPP8A.A8  88     (C)2024 Cmajor Software Ltd
+//   Y8,           88    88    88  88     88  88
+//    Y8a.   .a8P  88    88    88  88,   ,88  88     https://cmajor.dev
+//     '"Y888Y"'   88    88    88  '"8bbP"Y8  88
+//                                           ,88
+//                                        888P"
+//
+//  This code may be used under either a GPLv3 or commercial
+//  license: see LICENSE.md for more details.
+
+
+## testFunction()
+
+bool near32 (float32 a, float32 b)  { return abs (a - b) < 0.0001f; }
+bool near64 (float64 a, float64 b)  { return abs (a - b) < 0.0001; }
+
+bool nearComplex32 (complex32 a, complex32 b)  { return near32 (a.real, b.real) && near32 (a.imag, b.imag); }
+bool nearComplex64 (complex64 a, complex64 b)  { return near64 (a.real, b.real) && near64 (a.imag, b.imag); }
+
+bool checkImpulse32<T> (T dummy)
+{
+    T data;
+    data[0] = complex32 (1.0f, 0.0f);
+
+    std::frequency::complexFFT (data);
+
+    for (wrap<T.size> i)
+        if (! nearComplex32 (data[i], complex32 (1.0f, 0.0f)))
+            return false;
+
+    std::frequency::complexIFFT (data);
+
+    if (! nearComplex32 (data[0], complex32 (1.0f, 0.0f)))
+        return false;
+
+    for (wrap<T.size> i = 1)
+        if (! nearComplex32 (data[i], complex32 (0.0f, 0.0f)))
+            return false;
+
+    return true;
+}
+
+bool checkImpulse64<T> (T dummy)
+{
+    T data;
+    data[0] = complex64 (1.0, 0.0);
+
+    std::frequency::complexFFT (data);
+
+    for (wrap<T.size> i)
+        if (! nearComplex64 (data[i], complex64 (1.0, 0.0)))
+            return false;
+
+    std::frequency::complexIFFT (data);
+
+    if (! nearComplex64 (data[0], complex64 (1.0, 0.0)))
+        return false;
+
+    for (wrap<T.size> i = 1)
+        if (! nearComplex64 (data[i], complex64 (0.0, 0.0)))
+            return false;
+
+    return true;
+}
+
+bool checkSingleBinSine32<T> (T dummy)
+{
+    T data, fft, ifft;
+
+    for (wrap<T.size> i)
+    {
+        let angle = 6.283185307179586f * float32 (i) / float32 (T.size);
+        data[i] = sin (angle);
+    }
+
+    std::frequency::realOnlyForwardFFT (data, fft);
+    std::frequency::realOnlyInverseFFT (fft, ifft);
+
+    for (wrap<T.size> i)
+        if (! near32 (data[i], ifft[i]))
+            return false;
+
+    return true;
+}
+
+bool checkSingleBinSine64<T> (T dummy)
+{
+    T data, fft, ifft;
+
+    for (wrap<T.size> i)
+        data[i] = sin (twoPi * float64 (i) / float64 (T.size));
+
+    std::frequency::realOnlyForwardFFT (data, fft);
+    std::frequency::realOnlyInverseFFT (fft, ifft);
+
+    for (wrap<T.size> i)
+        if (! near64 (data[i], ifft[i]))
+            return false;
+
+    return true;
+}
+
+bool testF32N8()     { return checkImpulse32 (complex32[8]())    && checkSingleBinSine32 (float32[8]()); }
+bool testF32N16()    { return checkImpulse32 (complex32[16]())   && checkSingleBinSine32 (float32[16]()); }
+bool testF32N64()    { return checkImpulse32 (complex32[64]())   && checkSingleBinSine32 (float32[64]()); }
+bool testF32N1024()  { return checkImpulse32 (complex32[1024]()) && checkSingleBinSine32 (float32[1024]()); }
+bool testF64N8()     { return checkImpulse64 (complex64[8]())    && checkSingleBinSine64 (float64[8]()); }
+bool testF64N16()    { return checkImpulse64 (complex64[16]())   && checkSingleBinSine64 (float64[16]()); }
+bool testF64N64()    { return checkImpulse64 (complex64[64]())   && checkSingleBinSine64 (float64[64]()); }
+bool testF64N1024()  { return checkImpulse64 (complex64[1024]()) && checkSingleBinSine64 (float64[1024]()); }
+
+## performanceTest ({ frequency:44100, minBlockSize:1, maxBlockSize:1, samplesToRender:256 })
+
+processor P [[ main ]]
+{
+    output stream float out;
+
+    complex32[1024] data;
+    wrap<1024> phase;
+
+    void main()
+    {
+        loop
+        {
+            for (wrap<1024> i)
+                data[i] = i == phase ? complex32 (1.0f, 0.0f) : complex32 (0.0f, 0.0f);
+
+            std::frequency::complexFFT (data);
+
+            out <- data[phase].real;
+            ++phase;
+            advance();
+        }
+    }
+}

@@ -22,6 +22,10 @@
 #include "../../codegen/cmaj_CodeGenHelpers.h"
 #include "../../validation/cmaj_ValidationUtilities.h"
 
+#if CMAJ_ENABLE_NATIVE_OVERRIDES
+ #include "../cmaj_NativeOverrides.h"
+#endif
+
 namespace cmaj::llvm
 {
 
@@ -60,18 +64,15 @@ struct LLVMCodeGenerator
             std::cout << cmaj::AST::print (program) << std::endl;
     }
 
-    void addNativeOverriddenFunctions (AST::ExternalFunctionManager& externalFunctionManager)
+    bool addNativeOverriddenFunctions (AST::ExternalFunctionManager& externalFunctionManager)
     {
-        // example of how to use this. Remove the commented-out stuff when there's something real in here..
-
+       #if CMAJ_ENABLE_NATIVE_OVERRIDES
+        // FEATHER: Register prepared native implementations for selected stdlib specialisations.
+        return native_overrides::registerNativeOverrides (program, externalFunctionManager) != 0;
+       #else
         (void) externalFunctionManager;
-        // if (auto f = program.rootNamespace.findQualifiedFunction (std::string_view ("std::intrinsics::wrap"),
-        //                                                           allocator.int32Type, allocator.int32Type))
-        //     externalFunctionManager.addFunctionWithImplementation (*f,
-        //         (void*) +[] (int32_t value, int32_t size)
-        //         {
-        //             if (size == 0) return 0; auto n = value % size; if (n < 0) return n + size; return n;
-        //         });
+        return false;
+       #endif
     }
 
     bool generate()
