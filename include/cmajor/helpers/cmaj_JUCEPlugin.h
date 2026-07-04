@@ -35,6 +35,7 @@
 #include <cstdint>
 #include <iostream>
 #include <mutex>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include "cmaj_AudioBusLayoutHelper.h"
@@ -798,11 +799,16 @@ protected:
         auto changes = juce::AudioProcessorListener::ChangeDetails::getDefaultFlags();
 
         auto newLatency = (int) patch->getFramesLatency();
+        auto parameterInfoChanged = updateParameters();
+        auto restoredPendingValues = applyPendingStateParameterValues();
 
         changes.latencyChanged           = newLatency != getLatencySamples();
-        changes.parameterInfoChanged     = updateParameters();
+        changes.parameterInfoChanged     = parameterInfoChanged;
         changes.programChanged           = false;
         changes.nonParameterStateChanged = true;
+
+        if (parameterInfoChanged && ! restoredPendingValues)
+            notifyCurrentParameterValuesToHost();
 
         setLatencySamples (newLatency);
 
@@ -959,6 +965,20 @@ protected:
         return state;
     }
 
+    std::unordered_map<std::string, float> getParameterValuesFromState (const juce::ValueTree& newState) const
+    {
+        std::unordered_map<std::string, float> values;
+
+        if (auto params = newState.getChildWithName (ids.PARAMS); params.isValid())
+            for (auto param : params)
+                if (auto endpointIDProp = param.getPropertyPointer (ids.ID))
+                    if (auto endpointID = endpointIDProp->toString().toStdString(); ! endpointID.empty())
+                        if (auto valProp = param.getPropertyPointer (ids.V))
+                            values[endpointID] = static_cast<float> (*valProp);
+
+        return values;
+    }
+
     void setNewStateAsync (juce::ValueTree&& newState)
     {
         auto m = std::make_unique<NewStateMessage>();
@@ -975,6 +995,8 @@ protected:
 
         if (newState.isValid() && ! newState.hasType (ids.Cmajor))
             return unload ("Failed to load: invalid state", true);
+
+        clearPendingStateParameterValues();
 
         Patch::LoadParams loadParams;
 
@@ -1004,6 +1026,8 @@ protected:
             lastEditorHeight = 0;
         }
 
+        stashPendingStateParameterValues (loadParams, newState);
+
         if (auto state = newState.getChildWithName (ids.STATE); state.isValid())
         {
             for (const auto& v : state)
@@ -1030,12 +1054,64 @@ protected:
 
     void readParametersFromState (Patch::LoadParams& loadParams, const juce::ValueTree& newState) const
     {
-        if (auto params = newState.getChildWithName (ids.PARAMS); params.isValid())
-            for (auto param : params)
-                if (auto endpointIDProp = param.getPropertyPointer (ids.ID))
-                    if (auto endpointID = endpointIDProp->toString().toStdString(); ! endpointID.empty())
-                        if (auto valProp = param.getPropertyPointer (ids.V))
-                            loadParams.parameterValues[endpointID] = static_cast<float> (*valProp);
+        auto values = getParameterValuesFromState (newState);
+        loadParams.parameterValues.insert (values.begin(), values.end());
+    }
+
+    void clearPendingStateParameterValues()
+    {
+        if constexpr (! DerivedType::isFixedPatch)
+        {
+            pendingStateParameterValues.clear();
+            hasPendingStateParameterValues = false;
+        }
+    }
+
+    void stashPendingStateParameterValues (const Patch::LoadParams& loadParams, const juce::ValueTree& newState)
+    {
+        if constexpr (! DerivedType::isFixedPatch)
+        {
+            // FEATHER: Dynamic loader state restore is asynchronous. Keep the
+            // restored parameter values until the loaded patch parameters have
+            // been rebound to the fixed host-facing parameter objects.
+            if (newState.getChildWithName (ids.PARAMS).isValid() && ! loadParams.parameterValues.empty())
+            {
+                pendingStateParameterValues = loadParams.parameterValues;
+                hasPendingStateParameterValues = true;
+            }
+        }
+    }
+
+    bool applyPendingStateParameterValues()
+    {
+        if constexpr (! DerivedType::isFixedPatch)
+        {
+            if (! hasPendingStateParameterValues || ! patch->isLoaded())
+                return false;
+
+            auto values = std::move (pendingStateParameterValues);
+            clearPendingStateParameterValues();
+
+            bool applied = false;
+
+            for (auto& param : patch->getParameterList())
+            {
+                auto found = values.find (param->properties.endpointID);
+
+                if (found != values.end())
+                {
+                    param->setValue (found->second, true, 0, 0);
+                    applied = true;
+                }
+            }
+
+            notifyCurrentParameterValuesToHost();
+            return applied;
+        }
+        else
+        {
+            return false;
+        }
     }
 
     static choc::value::Value convertVarToValue (const juce::var& v)
@@ -1181,6 +1257,9 @@ protected:
                 detachWithoutLock();
                 patchParam = std::move (p);
 
+                if (patchParam == nullptr)
+                    return true;
+
                 auto* boundParam = patchParam.get();
 
                 patchParam->valueChanged = [this, boundParam] (float v)
@@ -1215,6 +1294,8 @@ protected:
         {
             if (auto p = getPatchParam())
                 p->valueChanged (p->getCurrentValue());
+            else
+                sendValueChangedMessageToListeners (0.0f);
         }
 
         juce::String getParameterID() const override                { return paramID; }
@@ -1366,7 +1447,21 @@ protected:
         for (size_t i = 0; i < params.size(); ++i)
             changed = parameters[i]->setPatchParam (params[i]) || changed;
 
+        if constexpr (! DerivedType::isFixedPatch)
+            for (size_t i = params.size(); i < parameters.size(); ++i)
+                changed = parameters[i]->setPatchParam ({}) || changed;
+
         return changed;
+    }
+
+    void notifyCurrentParameterValuesToHost()
+    {
+        // FEATHER: Dynamic-loader parameters are fixed host-facing wrappers that
+        // are rebound after the patch has compiled. Tell the host their current
+        // values after every rebind so a pre-load normalized 0.0 cache cannot
+        // overwrite restored or init defaults.
+        for (auto* p : parameters)
+            p->forceValueChanged();
     }
 
     void ensureNumParameters (size_t num)
@@ -1380,6 +1475,8 @@ protected:
     }
 
     std::vector<Parameter*> parameters;
+    std::unordered_map<std::string, float> pendingStateParameterValues;
+    bool hasPendingStateParameterValues = false;
 
     static constexpr int defaultEditorWidth = 500, defaultEditorHeight = 400;
 
@@ -2286,8 +2383,9 @@ public:
 
         loadParams.manifest.initialiseWithFile (location);
 
-        if (! patch->isLoaded() || loadParams.manifest.manifestFile == patch->getPatchFile())
-            readParametersFromState (loadParams, newState);
+        // FEATHER: A host state blob can restore a different patch into an
+        // already-live dynamic loader, so PARAMS in state are authoritative.
+        readParametersFromState (loadParams, newState);
 
         return true;
     }
