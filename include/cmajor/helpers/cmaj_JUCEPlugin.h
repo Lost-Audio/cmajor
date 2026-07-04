@@ -36,6 +36,7 @@
 #include <utility>
 #include <vector>
 #include "../../choc/choc/memory/choc_xxHash.h"
+#include "cmaj_AudioBusLayoutHelper.h"
 #include "cmaj_PluginHelpers.h"
 #include "cmaj_PatchWebView.h"
 #include "cmaj_GeneratedCppEngine.h"
@@ -85,6 +86,10 @@ public:
 
         patch->patchChanged = [this]
         {
+            updateCachedAudioBusLayoutFromPatch();
+            resizeAudioChannelPointerStorage();
+            resizeSilentBusScratch (static_cast<uint32_t> (getBlockSize()));
+
             const auto executeOrDeferToMessageThread = [] (auto&& fn) -> void
             {
                 if (juce::MessageManager::getInstance()->isThisTheMessageThread())
@@ -105,9 +110,11 @@ public:
 
        #if CMAJ_USE_QUICKJS_WORKER
         enableQuickJSPatchWorker (*patch);
-       #else
-        enableWebViewPatchWorker (*patch);
-       #endif
+        #else
+         enableWebViewPatchWorker (*patch);
+        #endif
+
+        updateCachedAudioBusLayoutFromPatch();
     }
 
     ~JUCEPluginBase() override
@@ -263,18 +270,28 @@ public:
     {
     }
 
-    static bool isLayoutOK (const juce::Array<BusProperties>& patchLayouts,
+    static bool isLayoutOK (const std::vector<cmaj::audio_bus_layout::BusGroup>& patchLayouts,
                             const juce::Array<juce::AudioChannelSet>& suggestedLayouts)
     {
-        if (patchLayouts.isEmpty())
+        if (patchLayouts.empty())
             return suggestedLayouts.isEmpty() || suggestedLayouts.getReference(0).size() == 0;
 
-        if (suggestedLayouts.size() < patchLayouts.size())
+        if (suggestedLayouts.size() < static_cast<int> (patchLayouts.size()))
             return false;
 
-        for (int i = 0; i < juce::jmin (patchLayouts.size(), suggestedLayouts.size()); ++i)
-            if (patchLayouts.getReference(i).defaultLayout.size() != suggestedLayouts.getReference(i).size())
+        for (int i = 0; i < juce::jmin (static_cast<int> (patchLayouts.size()), suggestedLayouts.size()); ++i)
+        {
+            auto& patchLayout = patchLayouts[(size_t) i];
+            auto suggestedSize = suggestedLayouts.getReference(i).size();
+
+            // FEATHER: hosts may disable auxiliary/sidechain buses; input endpoints are
+            // silence-backed and output endpoints are routed to discard scratch buffers.
+            if (! cmaj::audio_bus_layout::isMainBus (patchLayout, static_cast<size_t> (i)) && suggestedSize == 0)
+                continue;
+
+            if (static_cast<int> (patchLayout.channelCount) != suggestedSize)
                 return false;
+        }
 
         return true;
     }
@@ -284,11 +301,11 @@ public:
         if (! patch->isLoaded())
             return true;
 
-        auto patchBuses = getBusesProperties (patch->getInputEndpoints(),
-                                              patch->getOutputEndpoints());
+        if (inputAudioBusGroups.empty() && outputAudioBusGroups.empty())
+            const_cast<JUCEPluginBase*> (this)->updateCachedAudioBusLayoutFromPatch();
 
-        return isLayoutOK (patchBuses.inputLayouts, layout.inputBuses)
-            && isLayoutOK (patchBuses.outputLayouts, layout.outputBuses);
+        return isLayoutOK (inputAudioBusGroups,  layout.inputBuses)
+            && isLayoutOK (outputAudioBusGroups, layout.outputBuses);
     }
 
     bool applyBusLayouts (const BusesLayout& layouts) override
@@ -359,14 +376,26 @@ public:
     {
         auto layout = getBusesLayout();
 
-        return Patch::PlaybackParams (rate, requestedBlockSize,
-                                      static_cast<choc::buffer::ChannelCount> (getTotalChannels (layout.inputBuses)),
-                                      static_cast<choc::buffer::ChannelCount> (getTotalChannels (layout.outputBuses)));
+        auto inputChannels = static_cast<choc::buffer::ChannelCount> (getTotalChannels (layout.inputBuses));
+        auto outputChannels = static_cast<choc::buffer::ChannelCount> (getTotalChannels (layout.outputBuses));
+
+        // FEATHER: when an auxiliary bus is disabled by the host, the JUCE layout reports
+        // fewer channels than the patch declares. Keep the patch's full bus shape prepared
+        // and back missing input channels with silence in refreshAudioChannelPointers().
+        if (patch->isLoaded())
+        {
+            inputChannels  = inputAudioChannelCount;
+            outputChannels = outputAudioChannelCount;
+        }
+
+        return Patch::PlaybackParams (rate, requestedBlockSize, inputChannels, outputChannels);
     }
 
     void applyRateAndBlockSize (double sampleRate, uint32_t samplesPerBlock)
     {
+        updateCachedAudioBusLayoutFromPatch();
         resizeAudioChannelPointerStorage();
+        resizeSilentBusScratch (samplesPerBlock);
 
         if (dllLoadedSuccessfully)
             patch->setPlaybackParams (getPlaybackParams (sampleRate, samplesPerBlock));
@@ -385,6 +414,9 @@ public:
 protected:
     uint64_t lastLoadedStateHash = 0;
     std::vector<float*> inputChannelPointers, outputChannelPointers;
+    std::vector<cmaj::audio_bus_layout::BusGroup> inputAudioBusGroups, outputAudioBusGroups;
+    choc::buffer::ChannelCount inputAudioChannelCount = 0, outputAudioChannelCount = 0;
+    juce::AudioBuffer<float> inputSilentBusScratch, outputDisabledBusScratch;
 
     //==============================================================================
     static bool initialiseDLL()
@@ -445,121 +477,161 @@ protected:
         return total;
     }
 
-    static bool hasAudioBusAnnotation (const EndpointDetails& endpoint)
-    {
-        return endpoint.annotation.isObject()
-            && (endpoint.annotation.hasObjectMember ("bus")
-                || endpoint.annotation.hasObjectMember ("role"));
-    }
-
-    static bool hasAnyAudioBusAnnotation (const EndpointDetailsList& endpoints)
-    {
-        for (auto& endpoint : endpoints)
-            if (endpoint.getNumAudioChannels() != 0 && hasAudioBusAnnotation (endpoint))
-                return true;
-
-        return false;
-    }
-
-    static juce::String getAudioBusName (const EndpointDetails& endpoint, bool isInput, const char* defaultName)
-    {
-        if (endpoint.annotation.isObject())
-        {
-            auto busName = endpoint.annotation["bus"].toString();
-
-            if (! busName.empty())
-                return busName;
-
-            auto role = endpoint.annotation["role"].toString();
-
-            if (role == "sidechain" || role == "sideChain" || role == "aux")
-                return "Sidechain";
-
-            if (role == "main")
-                return isInput ? "Input" : "Output";
-        }
-
-        return defaultName;
-    }
-
     static void addEndpointAudioBuses (BusesProperties& layout, bool isInput, const EndpointDetailsList& endpoints, const char* defaultName)
     {
-        struct AudioBusGroup
+        (void) defaultName;
+
+        // FEATHER: use the shared bus grouping helper so generated JUCE wrappers,
+        // dynamic JUCE wrappers, and CLAP wrappers interpret annotations identically.
+        for (auto& bus : cmaj::audio_bus_layout::groupEndpointsByBus (endpoints))
+            layout.addBus (isInput, juce::String (bus.name), juce::AudioChannelSet::canonicalChannelSet ((int) bus.channelCount), true);
+    }
+
+    void updateCachedAudioBusLayoutFromPatch()
+    {
+        inputAudioBusGroups.clear();
+        outputAudioBusGroups.clear();
+
+        if (patch->isLoaded())
         {
-            juce::String name;
-            uint32_t channelCount = 0;
-        };
-
-        if (! hasAnyAudioBusAnnotation (endpoints))
-        {
-            uint32_t channelCount = 0;
-
-            for (auto& endpoint : endpoints)
-                channelCount += endpoint.getNumAudioChannels();
-
-            if (channelCount != 0)
-                layout.addBus (isInput, defaultName, juce::AudioChannelSet::canonicalChannelSet ((int) channelCount), true);
-
-            return;
+            inputAudioBusGroups  = cmaj::audio_bus_layout::groupEndpointsByBus (patch->getInputEndpoints());
+            outputAudioBusGroups = cmaj::audio_bus_layout::groupEndpointsByBus (patch->getOutputEndpoints());
         }
 
-        std::vector<AudioBusGroup> busGroups;
-
-        for (auto& endpoint : endpoints)
-        {
-            auto channelCount = endpoint.getNumAudioChannels();
-
-            if (channelCount == 0)
-                continue;
-
-            auto busName = getAudioBusName (endpoint, isInput, defaultName);
-            auto bus = std::find_if (busGroups.begin(), busGroups.end(),
-                                     [&] (const AudioBusGroup& group) { return group.name == busName; });
-
-            if (bus == busGroups.end())
-                bus = busGroups.insert (busGroups.end(), AudioBusGroup { busName, 0 });
-
-            bus->channelCount += channelCount;
-        }
-
-        for (auto& bus : busGroups)
-            layout.addBus (isInput, bus.name, juce::AudioChannelSet::canonicalChannelSet ((int) bus.channelCount), true);
+        inputAudioChannelCount  = static_cast<choc::buffer::ChannelCount> (cmaj::audio_bus_layout::getTotalAudioChannels (inputAudioBusGroups));
+        outputAudioChannelCount = static_cast<choc::buffer::ChannelCount> (cmaj::audio_bus_layout::getTotalAudioChannels (outputAudioBusGroups));
     }
 
     void resizeAudioChannelPointerStorage()
     {
+        if (patch->isLoaded())
+        {
+            inputChannelPointers.resize  (inputAudioChannelCount);
+            outputChannelPointers.resize (outputAudioChannelCount);
+            return;
+        }
+
         inputChannelPointers.resize  (static_cast<size_t> (getTotalNumInputChannels()));
         outputChannelPointers.resize (static_cast<size_t> (getTotalNumOutputChannels()));
     }
 
+    void resizeSilentBusScratch (uint32_t numFrames)
+    {
+        inputSilentBusScratch.setSize  ((int) inputChannelPointers.size(),  (int) numFrames, false, false, true);
+        outputDisabledBusScratch.setSize ((int) outputChannelPointers.size(), (int) numFrames, false, false, true);
+    }
+
     bool refreshAudioChannelPointers (juce::AudioBuffer<float>& audio)
     {
-        if (inputChannelPointers.size()  != static_cast<size_t> (getTotalNumInputChannels())
-            || outputChannelPointers.size() != static_cast<size_t> (getTotalNumOutputChannels()))
+        if (inputChannelPointers.empty() && outputChannelPointers.empty())
+            return true;
+
+        if (inputSilentBusScratch.getNumSamples() < audio.getNumSamples()
+            || outputDisabledBusScratch.getNumSamples() < audio.getNumSamples())
             return false;
 
-        size_t inputIndex = 0;
+        if (inputSilentBusScratch.getNumChannels() < (int) inputChannelPointers.size()
+            || outputDisabledBusScratch.getNumChannels() < (int) outputChannelPointers.size())
+            return false;
 
-        for (int bus = 0; bus < getBusCount (true); ++bus)
+        inputSilentBusScratch.clear();
+        outputDisabledBusScratch.clear();
+
+        // FEATHER: walk declared bus groups rather than active JUCE channel totals. Disabled
+        // auxiliary input buses are represented by cleared scratch channels, so sidechain
+        // endpoints see silence instead of missing/null bus pointers.
+        auto mapInputGroups = [&] (const auto& groups)
         {
-            auto busBuffer = getBusBuffer (audio, true, bus);
+            size_t inputIndex = 0;
+            int scratchIndex = 0;
 
-            for (int channel = 0; channel < busBuffer.getNumChannels(); ++channel)
-                inputChannelPointers[inputIndex++] = busBuffer.getWritePointer (channel);
+            for (int bus = 0; bus < (int) groups.size(); ++bus)
+            {
+                auto busBuffer = bus < getBusCount (true) ? getBusBuffer (audio, true, bus)
+                                                          : juce::AudioBuffer<float>();
+
+                for (uint32_t channel = 0; channel < groups[(size_t) bus].channelCount; ++channel)
+                {
+                    if (channel < static_cast<uint32_t> (busBuffer.getNumChannels()))
+                    {
+                        if (auto* data = busBuffer.getWritePointer ((int) channel))
+                        {
+                            inputChannelPointers[inputIndex++] = data;
+                            continue;
+                        }
+                    }
+
+                    inputChannelPointers[inputIndex++] = inputSilentBusScratch.getWritePointer (scratchIndex++);
+                }
+            }
+
+            return inputIndex == inputChannelPointers.size();
+        };
+
+        // FEATHER: disabled auxiliary output buses still need patch-declared output pointers;
+        // route them to scratch so rendered samples are discarded without allocating here.
+        auto mapOutputGroups = [&] (const auto& groups)
+        {
+            size_t outputIndex = 0;
+            int scratchIndex = 0;
+
+            for (int bus = 0; bus < (int) groups.size(); ++bus)
+            {
+                auto busBuffer = bus < getBusCount (false) ? getBusBuffer (audio, false, bus)
+                                                           : juce::AudioBuffer<float>();
+
+                for (uint32_t channel = 0; channel < groups[(size_t) bus].channelCount; ++channel)
+                {
+                    if (channel < static_cast<uint32_t> (busBuffer.getNumChannels()))
+                    {
+                        if (auto* data = busBuffer.getWritePointer ((int) channel))
+                        {
+                            outputChannelPointers[outputIndex++] = data;
+                            continue;
+                        }
+                    }
+
+                    outputChannelPointers[outputIndex++] = outputDisabledBusScratch.getWritePointer (scratchIndex++);
+                }
+            }
+
+            return outputIndex == outputChannelPointers.size();
+        };
+
+        if (! patch->isLoaded())
+        {
+            if (inputChannelPointers.size()  != static_cast<size_t> (getTotalNumInputChannels())
+                || outputChannelPointers.size() != static_cast<size_t> (getTotalNumOutputChannels()))
+                return false;
+
+            size_t inputIndex = 0;
+
+            for (int bus = 0; bus < getBusCount (true); ++bus)
+            {
+                auto busBuffer = getBusBuffer (audio, true, bus);
+
+                for (int channel = 0; channel < busBuffer.getNumChannels(); ++channel)
+                    inputChannelPointers[inputIndex++] = busBuffer.getWritePointer (channel);
+            }
+
+            size_t outputIndex = 0;
+
+            for (int bus = 0; bus < getBusCount (false); ++bus)
+            {
+                auto busBuffer = getBusBuffer (audio, false, bus);
+
+                for (int channel = 0; channel < busBuffer.getNumChannels(); ++channel)
+                    outputChannelPointers[outputIndex++] = busBuffer.getWritePointer (channel);
+            }
+
+            return inputIndex == inputChannelPointers.size()
+                && outputIndex == outputChannelPointers.size();
         }
 
-        size_t outputIndex = 0;
+        if (! mapInputGroups (inputAudioBusGroups))
+            return false;
 
-        for (int bus = 0; bus < getBusCount (false); ++bus)
-        {
-            auto busBuffer = getBusBuffer (audio, false, bus);
-
-            for (int channel = 0; channel < busBuffer.getNumChannels(); ++channel)
-                outputChannelPointers[outputIndex++] = busBuffer.getWritePointer (channel);
-        }
-
-        return inputIndex == inputChannelPointers.size()
-            && outputIndex == outputChannelPointers.size();
+        return mapOutputGroups (outputAudioBusGroups);
     }
 
     void unload (const std::string& message, bool isError)
@@ -574,6 +646,15 @@ protected:
 
     void handlePatchChange()
     {
+        if (patch->isLoaded() && getSampleRate() > 0)
+            applyCurrentRateAndBlockSize();
+        else
+        {
+            updateCachedAudioBusLayoutFromPatch();
+            resizeAudioChannelPointerStorage();
+            resizeSilentBusScratch (static_cast<uint32_t> (getBlockSize()));
+        }
+
         auto changes = juce::AudioProcessorListener::ChangeDetails::getDefaultFlags();
 
         auto newLatency = (int) patch->getFramesLatency();
@@ -1923,6 +2004,8 @@ public:
 
     static BusesProperties getBusLayout()
     {
+        // FEATHER: this dynamic patch-loader layout is fixed at processor construction.
+        // Hot-swapping to a patch with a different bus shape requires reloading the plugin.
         BusesProperties layout;
         layout.addBus (true,  "Input",     juce::AudioChannelSet::stereo(), true);
         layout.addBus (true,  "Sidechain", juce::AudioChannelSet::stereo(), true);

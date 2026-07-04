@@ -21,6 +21,7 @@
 #include "choc/audio/choc_MIDIFile.h"
 #include "choc/gui/choc_WebView.h"
 #include "choc/audio/io/choc_RenderingAudioMIDIPlayer.h"
+#include "cmajor/helpers/cmaj_AudioBusLayoutHelper.h"
 #include "../../../modules/playback/include/cmaj_PatchPlayer.h"
 #include "../../../modules/playback/include/cmaj_AudioFileUtils.h"
 
@@ -97,6 +98,7 @@ struct RenderState
 
             audioOptions.sampleRate = static_cast<uint32_t> (reader->getProperties().sampleRate);
             audioOptions.inputChannelCount = numChannels;
+            inputAudioFileChannelCount = numChannels;
 
             if (framesToRender == 0)
                 framesToRender = numFrames;
@@ -132,6 +134,17 @@ struct RenderState
             throw std::runtime_error ("If no input file is provided, use --rate=<rate> to specify the sample-rate");
 
         sampleRate = static_cast<double> (audioOptions.sampleRate);
+
+        cmaj::PatchManifest manifest;
+        manifest.initialiseWithFile (options.patchFile);
+
+        if (! patchPlayer.patch.preload (manifest))
+            throw std::runtime_error ("Could not preload patch");
+
+        auto declaredInputChannels = cmaj::audio_bus_layout::getTotalAudioChannels (patchPlayer.patch.getInputEndpoints());
+
+        if (declaredInputChannels > audioOptions.inputChannelCount)
+            audioOptions.inputChannelCount = declaredInputChannels;
 
         writer = cmaj::audio_utils::createFileWriter (options.outputAudioFile, sampleRate,
                                                       audioOptions.outputChannelCount);
@@ -180,7 +193,16 @@ struct RenderState
 
         if (reader != nullptr)
         {
-            if (! reader->readFrames (framesRendered, audioInput))
+            audioInput.clear();
+
+            if (inputAudioFileChannelCount > audioInput.getNumChannels())
+            {
+                std::cerr << "Input file has more channels than the render input buffer" << std::endl;
+                stopped = true;
+                return false;
+            }
+
+            if (! reader->readFrames (framesRendered, audioInput.getFirstChannels (inputAudioFileChannelCount)))
             {
                 std::cerr << "Failed to read from audio input" << std::endl;
                 stopped = true;
@@ -236,6 +258,7 @@ struct RenderState
 
     std::unique_ptr<choc::audio::AudioFileReader> reader;
     std::unique_ptr<choc::audio::AudioFileWriter> writer;
+    choc::buffer::ChannelCount inputAudioFileChannelCount = 0;
 
     choc::midi::Sequence inputMIDI;
     choc::midi::Sequence::Iterator inputMIDIIterator { inputMIDI };

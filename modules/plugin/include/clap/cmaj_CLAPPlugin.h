@@ -23,6 +23,7 @@
 
 #include "cmajor/helpers/cmaj_PluginHelpers.h"
 #include "cmajor/helpers/cmaj_PatchHelpers.h"
+#include "cmajor/helpers/cmaj_AudioBusLayoutHelper.h"
 #include "cmajor/helpers/cmaj_Patch.h"
 #include "cmajor/helpers/cmaj_PatchWebView.h"
 
@@ -242,6 +243,8 @@ private:
     void updateParameterInfoCachesFromLoadedPatch();
     void updateAudioPortInfoCachesFromLoadedPatch();
     void updateNotePortInfoCachesFromLoadedPatch();
+    void prepareAudioProcessScratch();
+    bool isAudioProcessScratchPrepared (uint32_t blockSize) const;
 
     void resetIfRequestIsPending();
 
@@ -295,9 +298,13 @@ private:
 
     std::vector<clap_audio_port_info_t> infoForInputAudioPorts;
     std::vector<clap_audio_port_info_t> infoForOutputAudioPorts;
+    cmaj::EndpointDetailsList inputAudioPortEndpoints, outputAudioPortEndpoints;
+    std::vector<cmaj::audio_bus_layout::BusGroup> inputAudioBusGroups, outputAudioBusGroups;
 
     std::vector<const float*> flattenedInputChannelsScratchBuffer;
     std::vector<float*> flattenedOutputChannelsScratchBuffer;
+    std::vector<float> missingInputChannelsScratchBuffer;
+    std::vector<float> missingOutputChannelsScratchBuffer;
 
     double frequency = 0;
     uint32_t maxBlockSize = 0;
@@ -865,21 +872,11 @@ private:
         if (! patch.preload (manifest))
             return {};
 
-        const auto sumTotalChannelsAcrossAudioEndpoints = [] (const cmaj::EndpointDetailsList& endpoints) -> uint32_t
-        {
-            uint32_t totalChannelCount = 0;
-
-            for (const auto& endpoint : endpoints)
-                totalChannelCount += endpoint.getNumAudioChannels();
-
-            return totalChannelCount;
-        };
-
         patch.setPlaybackParams ({
             frequencyAndBlockSize.frequency,
             frequencyAndBlockSize.maxBlockSize,
-            sumTotalChannelsAcrossAudioEndpoints (patch.getInputEndpoints()),
-            sumTotalChannelsAcrossAudioEndpoints (patch.getOutputEndpoints()),
+            cmaj::audio_bus_layout::getTotalAudioChannels (patch.getInputEndpoints()),
+            cmaj::audio_bus_layout::getTotalAudioChannels (patch.getOutputEndpoints()),
         });
 
         if (! patch.loadPatch ({ manifest, initialParameterValues }, true))
@@ -889,9 +886,6 @@ private:
             return {};
 
         updatePatchWebViewForLoadedPatch (true);
-
-        flattenedInputChannelsScratchBuffer.resize (sumTotalChannelsAcrossAudioEndpoints (patch.getInputEndpoints()));
-        flattenedOutputChannelsScratchBuffer.resize (sumTotalChannelsAcrossAudioEndpoints (patch.getOutputEndpoints()));
 
         return true;
     }
@@ -1116,8 +1110,12 @@ inline void Plugin::Impl::updateAudioPortInfoCachesFromLoadedPatch()
 {
     infoForInputAudioPorts.clear();
     infoForOutputAudioPorts.clear();
+    inputAudioPortEndpoints = patch.getInputEndpoints();
+    outputAudioPortEndpoints = patch.getOutputEndpoints();
+    inputAudioBusGroups = cmaj::audio_bus_layout::groupEndpointsByBus (inputAudioPortEndpoints);
+    outputAudioBusGroups = cmaj::audio_bus_layout::groupEndpointsByBus (outputAudioPortEndpoints);
 
-    const auto mapEndpointsToPorts = [] (const auto& endpoints, auto& infoForPortsToAppendTo)
+    const auto mapEndpointsToPorts = [] (const auto& busGroups, auto& infoForPortsToAppendTo)
     {
         const auto toPortType = [] (uint32_t count) -> const char*
         {
@@ -1130,30 +1128,23 @@ inline void Plugin::Impl::updateAudioPortInfoCachesFromLoadedPatch()
             return nullptr;
         };
 
-        const auto toFlags = [] (uint32_t index, const cmaj::EndpointDetails&) -> uint32_t
-        {
-            // for now, first endpoint is implicitly main. there can only be one, and it must be index 0
-            return index == 0 ? CLAP_AUDIO_PORT_IS_MAIN : 0;
-        };
-
         uint32_t indexId = 0;
-        for (const auto& endpoint : endpoints)
+        for (const auto& busGroup : busGroups)
         {
-            if (const auto channelCount = endpoint.getNumAudioChannels())
-            {
-                clap_audio_port_info_t port {};
-                port.id = indexId;
-                copyAndNullTerminateTruncatingIfNecessary (endpoint.endpointID.toString(), port.name, CLAP_NAME_SIZE);
+            if (busGroup.channelCount == 0)
+                continue;
 
-                port.channel_count = channelCount;
-                port.flags = toFlags (indexId, endpoint);
-                port.port_type = toPortType (channelCount);
-                port.in_place_pair = CLAP_INVALID_ID; // we don't currently support in-place processing
+            clap_audio_port_info_t port {};
+            port.id = indexId;
+            copyAndNullTerminateTruncatingIfNecessary (busGroup.name, port.name, CLAP_NAME_SIZE);
 
-                infoForPortsToAppendTo.push_back (port);
+            port.channel_count = busGroup.channelCount;
+            port.flags = cmaj::audio_bus_layout::isMainBus (busGroup, indexId) ? CLAP_AUDIO_PORT_IS_MAIN : 0;
+            port.port_type = toPortType (busGroup.channelCount);
+            port.in_place_pair = CLAP_INVALID_ID; // we don't currently support in-place processing
 
-                ++indexId;
-            }
+            infoForPortsToAppendTo.push_back (port);
+            ++indexId;
         }
     };
 
@@ -1167,13 +1158,45 @@ inline void Plugin::Impl::updateAudioPortInfoCachesFromLoadedPatch()
 
     if (environment.engineType == Environment::EngineType::AOT || hostSupportsChangingPortList())
     {
-        mapEndpointsToPorts (patch.getInputEndpoints(), infoForInputAudioPorts);
-        mapEndpointsToPorts (patch.getOutputEndpoints(), infoForOutputAudioPorts);
+        // FEATHER: expose one CLAP audio port per shared bus group instead of one port per endpoint.
+        mapEndpointsToPorts (inputAudioBusGroups, infoForInputAudioPorts);
+        mapEndpointsToPorts (outputAudioBusGroups, infoForOutputAudioPorts);
     }
     else
     {
         // TODO: in the JIT case we need to fall back to stereo or something
     }
+
+    prepareAudioProcessScratch();
+}
+
+inline void Plugin::Impl::prepareAudioProcessScratch()
+{
+    const auto inputChannelCount  = cmaj::audio_bus_layout::getTotalAudioChannels (inputAudioBusGroups);
+    const auto outputChannelCount = cmaj::audio_bus_layout::getTotalAudioChannels (outputAudioBusGroups);
+
+    flattenedInputChannelsScratchBuffer.resize (inputChannelCount);
+    flattenedOutputChannelsScratchBuffer.resize (outputChannelCount);
+
+    const auto maximumInputSamples  = static_cast<size_t> (inputChannelCount)  * static_cast<size_t> (maxBlockSize);
+    const auto maximumOutputSamples = static_cast<size_t> (outputChannelCount) * static_cast<size_t> (maxBlockSize);
+
+    missingInputChannelsScratchBuffer.resize (maximumInputSamples);
+    missingOutputChannelsScratchBuffer.resize (maximumOutputSamples);
+
+    std::fill (missingInputChannelsScratchBuffer.begin(),  missingInputChannelsScratchBuffer.end(),  0.0f);
+    std::fill (missingOutputChannelsScratchBuffer.begin(), missingOutputChannelsScratchBuffer.end(), 0.0f);
+}
+
+inline bool Plugin::Impl::isAudioProcessScratchPrepared (uint32_t blockSize) const
+{
+    const auto inputChannelCount  = cmaj::audio_bus_layout::getTotalAudioChannels (inputAudioBusGroups);
+    const auto outputChannelCount = cmaj::audio_bus_layout::getTotalAudioChannels (outputAudioBusGroups);
+
+    return flattenedInputChannelsScratchBuffer.size() == inputChannelCount
+        && flattenedOutputChannelsScratchBuffer.size() == outputChannelCount
+        && missingInputChannelsScratchBuffer.size() >= static_cast<size_t> (inputChannelCount) * static_cast<size_t> (blockSize)
+        && missingOutputChannelsScratchBuffer.size() >= static_cast<size_t> (outputChannelCount) * static_cast<size_t> (blockSize);
 }
 
 inline void Plugin::Impl::updateNotePortInfoCachesFromLoadedPatch()
@@ -1297,7 +1320,7 @@ inline clap_process_status Plugin::Impl::clapPlugin_process (const clap_process_
             dispatchEvent (transport->header);
     };
 
-    const auto processInChunksDelimitedByEvent = [this] (const clap_process_t& state)
+    const auto processInChunksDelimitedByEvent = [this] (const clap_process_t& state) -> bool
     {
         const auto& inputQueue = *state.in_events;
         auto& outputQueue = *state.out_events;
@@ -1314,30 +1337,84 @@ inline clap_process_status Plugin::Impl::clapPlugin_process (const clap_process_
                 ||  e.type == CLAP_EVENT_PARAM_VALUE);
         };
 
-        const auto toChannelArrayView = [] (auto& scratch, const auto& portInfos, auto* clapBuffers, auto blockSize)
+        if (! isAudioProcessScratchPrepared (count))
+            return false;
+
+        const auto clearScratchChannels = [] (auto& scratch, uint32_t channelCount, uint32_t blockSize)
         {
-            // currently only handling single precision, i.e. data32. when setting up the audio ports we don't set any 64 bit flags.
-            const auto populateFlattenedChannelsScatchBuffer = [] (auto& flattened, const auto& info, auto* buffers)
-            {
-                size_t flattenedChannelsIndex = 0;
-
-                for (size_t i = 0; i < info.size(); ++i)
-                {
-                    const auto& buffer = buffers[i];
-                    const auto channelCount = info[i].channel_count;
-
-                    for (uint32_t channel = 0; channel < channelCount; ++channel)
-                        flattened[flattenedChannelsIndex++] = buffer.data32[channel];
-                }
-            };
-
-            populateFlattenedChannelsScatchBuffer (scratch, portInfos, clapBuffers);
-
-            return choc::buffer::createChannelArrayView (scratch.data(), static_cast<uint32_t> (scratch.size()), blockSize);
+            std::fill_n (scratch.data(), static_cast<size_t> (channelCount) * blockSize, 0.0f);
         };
 
-        auto inputChannels = toChannelArrayView (flattenedInputChannelsScratchBuffer, infoForInputAudioPorts, inputs, count);
-        auto outputChannels = toChannelArrayView (flattenedOutputChannelsScratchBuffer, infoForOutputAudioPorts, outputs, count);
+        const auto getScratchChannel = [] (auto& scratch, uint32_t channel, uint32_t blockSize)
+        {
+            return scratch.data() + static_cast<size_t> (channel) * blockSize;
+        };
+
+        // FEATHER: currently only handling single precision, i.e. data32. Missing input
+        // ports/channels are fed silence so a disabled sidechain bus cannot produce null reads.
+        const auto toInputChannelArrayView = [&] (auto& flattened, auto& missingScratch, const auto& busGroups,
+                                                  const clap_audio_buffer_t* clapBuffers, uint32_t clapBufferCount, uint32_t blockSize)
+        {
+            size_t flattenedChannelsIndex = 0;
+            uint32_t missingScratchIndex = 0;
+
+            for (size_t portIndex = 0; portIndex < busGroups.size(); ++portIndex)
+            {
+                auto* buffer = portIndex < clapBufferCount && clapBuffers != nullptr ? clapBuffers + portIndex : nullptr;
+
+                for (uint32_t channel = 0; channel < busGroups[portIndex].channelCount; ++channel)
+                {
+                    const float* channelData = nullptr;
+
+                    if (buffer != nullptr && buffer->data32 != nullptr && channel < buffer->channel_count)
+                        channelData = buffer->data32[channel];
+
+                    if (channelData == nullptr)
+                        channelData = getScratchChannel (missingScratch, missingScratchIndex++, blockSize);
+
+                    flattened[flattenedChannelsIndex++] = channelData;
+                }
+            }
+
+            return choc::buffer::createChannelArrayView (flattened.data(), static_cast<uint32_t> (flattened.size()), blockSize);
+        };
+
+        // FEATHER: missing output ports are rendered into scratch and discarded, matching the
+        // declared patch bus shape without assuming the host activated every aux port.
+        const auto toOutputChannelArrayView = [&] (auto& flattened, auto& missingScratch, const auto& busGroups,
+                                                   clap_audio_buffer_t* clapBuffers, uint32_t clapBufferCount, uint32_t blockSize)
+        {
+            size_t flattenedChannelsIndex = 0;
+            uint32_t missingScratchIndex = 0;
+
+            for (size_t portIndex = 0; portIndex < busGroups.size(); ++portIndex)
+            {
+                auto* buffer = portIndex < clapBufferCount && clapBuffers != nullptr ? clapBuffers + portIndex : nullptr;
+
+                for (uint32_t channel = 0; channel < busGroups[portIndex].channelCount; ++channel)
+                {
+                    float* channelData = nullptr;
+
+                    if (buffer != nullptr && buffer->data32 != nullptr && channel < buffer->channel_count)
+                        channelData = buffer->data32[channel];
+
+                    if (channelData == nullptr)
+                        channelData = getScratchChannel (missingScratch, missingScratchIndex++, blockSize);
+
+                    flattened[flattenedChannelsIndex++] = channelData;
+                }
+            }
+
+            return choc::buffer::createChannelArrayView (flattened.data(), static_cast<uint32_t> (flattened.size()), blockSize);
+        };
+
+        clearScratchChannels (missingInputChannelsScratchBuffer,  static_cast<uint32_t> (flattenedInputChannelsScratchBuffer.size()),  count);
+        clearScratchChannels (missingOutputChannelsScratchBuffer, static_cast<uint32_t> (flattenedOutputChannelsScratchBuffer.size()), count);
+
+        auto inputChannels = toInputChannelArrayView (flattenedInputChannelsScratchBuffer, missingInputChannelsScratchBuffer,
+                                                     inputAudioBusGroups, inputs, state.audio_inputs_count, count);
+        auto outputChannels = toOutputChannelArrayView (flattenedOutputChannelsScratchBuffer, missingOutputChannelsScratchBuffer,
+                                                       outputAudioBusGroups, outputs, state.audio_outputs_count, count);
 
         forEachFilteredEventRange ({ 0, count },
                                    inputQueue,
@@ -1397,11 +1474,15 @@ inline clap_process_status Plugin::Impl::clapPlugin_process (const clap_process_
                 }
             }, replaceOutput);
         });
+
+        return true;
     };
 
     consumeEventsFromEditor (*process->out_events);
     processTransportForBlock (process->transport);
-    processInChunksDelimitedByEvent (*process);
+
+    if (! processInChunksDelimitedByEvent (*process))
+        return CLAP_PROCESS_ERROR;
 
     return CLAP_PROCESS_CONTINUE;
 }
