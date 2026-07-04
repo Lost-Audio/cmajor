@@ -10,3 +10,8 @@ build-plugin/
 tools/mcp/node_modules/
 tools/mcp/dist/
 >>>>>>> feature/mcp-server
+
+# FEATHER: never commit license signing keys
+*.lekey-private
+signing-key*
+*.pem

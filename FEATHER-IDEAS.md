@@ -3,6 +3,19 @@
 Living document — features that make this fork *ours*, beyond what upstream Cmajor has.
 Add freely; move items to FEATHER-MODS.md when they ship.
 
+## Layer map (where each thing lives)
+
+| Layer | What it is | Items |
+|---|---|---|
+| **A · Patch** (.cmajor code) | Per-product DSP | Playbox player DSP, multi-out drum example, SpectralGate tilt fix |
+| **B · feather:: library** (standard_library/feather_*.cmajor) | Reusable DSP shipped in the fork | sampler primitives (zones/velocity/round-robin), AHDSR envelopes, utility DSP |
+| **C · Wrapper C++** (helpers / CmajPlugin / CLAP) | Patch-agnostic plugin features | rolling recorder, scaling persistence, modulation engine, MIDI learn, A/B compare, click-free bypass, latency/PDC, MIDI-out wiring, preset folders, licensing module, auto-update check, crash journaling |
+| **D · Svelte template** (view scaffold + components) | UI everyone gets | resize handle + scale menu UI, pro starter chrome, spectrum analyzer component, value entry/tooltips, themes, preset browser UI, activation UI, modulation rings |
+| **E · Toolchain** (cmaj CLI / codegen / natives) | Compiler-level | native overrides (PFFFT ✅, resampler, convolution), oversampling flag, `--ui=svelte-pro` flag |
+| **F · Infra/business** | Outside the plugin | license key generation + sales pipeline, update endpoint, CI |
+
+Rule of thumb: C+D features are patch-agnostic (build once, every product benefits) — highest leverage. A/B are per-product or shared-DSP. E is rare and reviewed hardest. F is business plumbing.
+
 ## In flight
 - **Loader-level RAM rolling recorder** — CmajPlugin continuously taps its audio into a lock-free ring buffer (last N seconds, configurable). UI button saves the capture to WAV on the message thread; stretch: drag the clip from the webview straight into the DAW timeline (JUCE OS drag-and-drop with a temp file). Patch-agnostic: every loaded patch gets capture for free. Nothing upstream has this.
 
@@ -25,7 +38,7 @@ Add freely; move items to FEATHER-MODS.md when they ship.
 - **Click-free bypass** — latency-compensated, crossfaded bypass instead of hard toggle.
 - **Latency reporting (PDC)** — verify patch latency (e.g. SpectralGate's 1024 samples) is forwarded to the host for delay compensation in all wrappers; fix if not. Quiet but essential for pro use.
 - **Per-voice multi-out** — drum/sampler plugins with per-pad output buses (our bus infra already supports arbitrary output buses via annotations — needs an example + DAW validation).
-- **Licensing/activation hooks** — you SELL these: wrapper-level serial/activation layer (offline-friendly), watermark-free trial mode. Worth designing early so it's uniform across products.
+- **Licensing/activation hooks** [layer C wrapper + F infra] — you SELL these: wrapper-level serial/activation layer (offline-friendly, Ed25519 signed license files), watermark-free trial mode. MEGA PRIORITY — design early so it's uniform across products. Standalone Codex prompt written at prompts/licensing-design.md (run in a separate terminal).
 - **Auto-update check** — plugin pings a Lost Audio endpoint for new versions, shows a gentle badge in the header (no nagging).
 - **Crash-safe state journaling** — periodically journal state so a DAW crash never loses a preset-in-progress.
 
