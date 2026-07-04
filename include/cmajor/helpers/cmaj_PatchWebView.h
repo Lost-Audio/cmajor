@@ -20,6 +20,7 @@
 
 #include <memory>
 #include "cmaj_Patch.h"
+#include "cmaj_PluginHelpers.h"
 #include "../../choc/choc/gui/choc_WebView.h"
 #include "../../choc/choc/network/choc_MIMETypes.h"
 
@@ -35,11 +36,16 @@ struct PatchWebView  : public PatchView
 
     void sendMessage (const choc::value::ValueView&) override;
     void reload();
+    void requestViewRebuildIfNeeded();
 
     choc::ui::WebView& getWebView();
 
     void setStatusMessage (const std::string& newMessage);
     bool isTextInputFocused() const;
+
+   #if FEATHER_WEBVIEW_DEBUG
+    void debugProbeDocumentState (const std::string& context);
+   #endif
 
     /// Provides a chunk of javascript that goes in a function which is run before the
     /// view element is added to its parent element.
@@ -55,6 +61,10 @@ private:
     // FEATHER: Tracks HTML text-entry focus so spacebar transport passthrough
     // can stay enabled without stealing spaces typed into patch UI fields.
     bool textInputFocused = false;
+   #if FEATHER_WEBVIEW_DEBUG
+    uint64_t debugRootFetchCount = 0;
+    uint64_t debugBeaconCount = 0;
+   #endif
     std::optional<choc::ui::WebView::Options::Resource> onRequest (const std::string&);
     void createBindings();
 };
@@ -76,6 +86,8 @@ private:
 inline PatchWebView::PatchWebView (Patch& p, const PatchManifest::View& view)
     : PatchView (p, view)
 {
+    CMAJ_FEATHER_WEBVIEW_LOG ("PatchWebView ctor this=" + plugin::debugPointerToString (this));
+
     choc::ui::WebView::Options options;
 
    #if CMAJ_ENABLE_WEBVIEW_DEV_TOOLS
@@ -90,6 +102,9 @@ inline PatchWebView::PatchWebView (Patch& p, const PatchManifest::View& view)
 
     options.webviewIsReady = [this] (choc::ui::WebView& w)
     {
+        CMAJ_FEATHER_WEBVIEW_LOG ("PatchWebView webviewIsReady this=" + plugin::debugPointerToString (this)
+                                  + " native=" + plugin::debugPointerToString (w.getViewHandle()));
+
         bool boundOK = w.bind ("cmaj_sendMessageToServer", [this] (const choc::value::ValueView& args) -> choc::value::Value
         {
             try
@@ -104,6 +119,15 @@ inline PatchWebView::PatchWebView (Patch& p, const PatchManifest::View& view)
 
             return {};
         });
+
+       #if FEATHER_WEBVIEW_DEBUG
+        boundOK = w.bind ("cmaj_debugLog", [] (const choc::value::ValueView& args) -> choc::value::Value
+        {
+            const auto message = args.isArray() && args.size() != 0 ? args[0].toString() : std::string {};
+            CMAJ_FEATHER_WEBVIEW_LOG ("PatchWebView JS " + message);
+            return {};
+        }) && boundOK;
+       #endif
 
         // FEATHER: JS focus tracking feeds native spacebar passthrough.
         boundOK = w.bind ("cmaj_setTextInputFocus", [this] (const choc::value::ValueView& args) -> choc::value::Value
@@ -166,6 +190,9 @@ inline choc::ui::WebView& PatchWebView::getWebView()
 
 inline void PatchWebView::setStatusMessage (const std::string& newMessage)
 {
+    CMAJ_FEATHER_WEBVIEW_LOG ("PatchWebView setStatusMessage this=" + plugin::debugPointerToString (this)
+                              + " message=" + newMessage);
+
     getWebView().evaluateJavascript ("window.setStatusMessage (" + choc::json::getEscapedQuotedString (newMessage) + ")");
 }
 
@@ -179,8 +206,152 @@ inline void PatchWebView::reload()
     // FEATHER: A reload drops DOM focus; keep the native passthrough predicate
     // conservative until JS reports the next focused editable element.
     textInputFocused = false;
-    getWebView().evaluateJavascript ("document.location.reload()");
+
+    CMAJ_FEATHER_WEBVIEW_LOG ("PatchWebView reload navigate-root this=" + plugin::debugPointerToString (this));
+
+    if (! getWebView().navigate ({}))
+        getWebView().evaluateJavascript ("document.location.reload()");
 }
+
+inline void PatchWebView::requestViewRebuildIfNeeded()
+{
+    CMAJ_FEATHER_WEBVIEW_LOG ("PatchWebView requestViewRebuildIfNeeded this=" + plugin::debugPointerToString (this));
+
+    getWebView().evaluateJavascript (R"(
+        (() => {
+            if (typeof window.cmaj_rebuildPatchViewIfNeeded === "function")
+                window.cmaj_rebuildPatchViewIfNeeded();
+        })();
+    )");
+}
+
+#if FEATHER_WEBVIEW_DEBUG
+inline void PatchWebView::debugProbeDocumentState (const std::string& context)
+{
+    const auto accepted = getWebView().evaluateJavascript (R"(
+        (() => {
+            const container = document.getElementById ("cmaj-view-container");
+            const debug = window.__cmajPatchDebug || {};
+            return JSON.stringify ({
+                href: document.location.href,
+                readyState: document.readyState,
+                bootCount: debug.bootCount || 0,
+                viewCreateCount: debug.viewCreateCount || 0,
+                statusWrites: debug.statusWrites || 0,
+                viewActive: debug.viewActive === true,
+                containerChildren: container ? container.children.length : -1,
+                bodyText: document.body?.innerText?.slice (0, 96) || ""
+            });
+        })();
+    )",
+        [context] (const std::string& error, const choc::value::ValueView& result)
+        {
+            CMAJ_FEATHER_WEBVIEW_LOG ("PatchWebView document-probe context=" + context
+                                      + " error=" + error
+                                      + " state=" + result.toString());
+        });
+
+    if (! accepted)
+        CMAJ_FEATHER_WEBVIEW_LOG ("PatchWebView document-probe context=" + context + " accepted=false");
+}
+#endif
+
+#if FEATHER_WEBVIEW_DEBUG
+inline int cmajor_patch_gui_debug_hex_value (char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+    if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+    return -1;
+}
+
+inline std::string cmajor_patch_gui_debug_decode_beacon_message (std::string_view path)
+{
+    const auto queryStart = path.find ('?');
+
+    if (queryStart == std::string_view::npos)
+        return std::string (path);
+
+    const auto messageStart = path.find ("m=", queryStart + 1);
+
+    if (messageStart == std::string_view::npos)
+        return std::string (path);
+
+    auto encoded = path.substr (messageStart + 2);
+
+    if (const auto end = encoded.find ('&'); end != std::string_view::npos)
+        encoded = encoded.substr (0, end);
+
+    std::string result;
+    result.reserve (encoded.size());
+
+    for (size_t i = 0; i < encoded.size(); ++i)
+    {
+        if (encoded[i] == '%' && i + 2 < encoded.size())
+        {
+            const auto hi = cmajor_patch_gui_debug_hex_value (encoded[i + 1]);
+            const auto lo = cmajor_patch_gui_debug_hex_value (encoded[i + 2]);
+
+            if (hi >= 0 && lo >= 0)
+            {
+                result.push_back (static_cast<char> ((hi << 4) | lo));
+                i += 2;
+                continue;
+            }
+        }
+
+        result.push_back (encoded[i] == '+' ? ' ' : encoded[i]);
+    }
+
+    return result;
+}
+
+static constexpr auto cmajor_patch_gui_debug_bootstrap = R"(
+window.__cmajPatchDebug = window.__cmajPatchDebug || {};
+window.__cmajPatchDebug.bootCount = (window.__cmajPatchDebug.bootCount || 0) + 1;
+window.__cmajPatchDebug.viewCreateCount = window.__cmajPatchDebug.viewCreateCount || 0;
+window.__cmajPatchDebug.statusWrites = window.__cmajPatchDebug.statusWrites || 0;
+window.__cmajPatchDebug.viewActive = false;
+window.__cmajPatchDebug.log = message =>
+{
+    try
+    {
+        fetch (`/cmaj_debug_log?m=${encodeURIComponent (message)}&t=${Date.now()}&r=${Math.random()}`, { cache: "no-store" }).catch (() => {});
+    }
+    catch {}
+
+    window.cmaj_debugLog?.(message);
+};
+window.__cmajPatchDebug.log (`boot bootCount=${window.__cmajPatchDebug.bootCount}`);
+)";
+
+static constexpr auto cmajor_patch_gui_debug_status_write = R"(
+    if (window.__cmajPatchDebug)
+    {
+        window.__cmajPatchDebug.statusWrites = (window.__cmajPatchDebug.statusWrites || 0) + 1;
+        window.__cmajPatchDebug.viewActive = false;
+        window.__cmajPatchDebug.log (`status-write count=${window.__cmajPatchDebug.statusWrites}`);
+    }
+)";
+
+static constexpr auto cmajor_patch_gui_debug_view_created = R"(
+        if (window.__cmajPatchDebug)
+        {
+            window.__cmajPatchDebug.viewCreateCount = (window.__cmajPatchDebug.viewCreateCount || 0) + 1;
+            window.__cmajPatchDebug.viewActive = true;
+            window.__cmajPatchDebug.log (`view-created count=${window.__cmajPatchDebug.viewCreateCount}`);
+        }
+)";
+
+static constexpr auto cmajor_patch_gui_debug_rebuild_check = R"(
+    window.__cmajPatchDebug?.log (`rebuild-check active=${isViewActive} bootCount=${window.__cmajPatchDebug.bootCount || 0} viewCreateCount=${window.__cmajPatchDebug.viewCreateCount || 0} statusWrites=${window.__cmajPatchDebug.statusWrites || 0}`);
+)";
+#else
+static constexpr auto cmajor_patch_gui_debug_bootstrap = "";
+static constexpr auto cmajor_patch_gui_debug_status_write = "";
+static constexpr auto cmajor_patch_gui_debug_view_created = "";
+static constexpr auto cmajor_patch_gui_debug_rebuild_check = "";
+#endif
 
 static constexpr auto cmajor_patch_gui_html = R"(
 <!DOCTYPE html>
@@ -212,6 +383,8 @@ const patchManifest = $MANIFEST$;
 
 const viewInfo = $VIEW_TO_USE$;
 
+$DEBUG_BOOTSTRAP_CODE$
+
 //==============================================================================
 class EmbeddedPatchConnection  extends PatchConnection
 {
@@ -236,6 +409,7 @@ class EmbeddedPatchConnection  extends PatchConnection
 //==============================================================================
 const container = document.getElementById ("cmaj-view-container");
 let isViewActive = false;
+let activePatchConnection;
 
 async function initialiseContainer()
 {
@@ -245,7 +419,15 @@ $EXTRA_SETUP_CODE$
 window.setStatusMessage = (newMessage) =>
 {
     isViewActive = false;
+$DEBUG_STATUS_WRITE_CODE$
     container.innerHTML = `<pre id="cmaj-error-text">${newMessage}</pre>`;
+};
+
+window.cmaj_rebuildPatchViewIfNeeded = () =>
+{
+$DEBUG_REBUILD_CHECK_CODE$
+    if (! isViewActive)
+        activePatchConnection?.requestStatusUpdate();
 };
 
 async function createViewIfNeeded (patchConnection)
@@ -263,6 +445,7 @@ async function createViewIfNeeded (patchConnection)
     {
         container.appendChild (view);
         isViewActive = true;
+$DEBUG_VIEW_CREATED_CODE$
     }
     else
     {
@@ -273,6 +456,7 @@ async function createViewIfNeeded (patchConnection)
 async function initialisePatch()
 {
     const patchConnection = new EmbeddedPatchConnection();
+    activePatchConnection = patchConnection;
 
     const statusListener = async status =>
     {
@@ -303,6 +487,18 @@ initialisePatch();
 
 inline std::optional<choc::ui::WebView::Options::Resource> PatchWebView::onRequest (const std::string& path)
 {
+   #if FEATHER_WEBVIEW_DEBUG
+    if (path.rfind ("/cmaj_debug_log", 0) == 0)
+    {
+        ++debugBeaconCount;
+        CMAJ_FEATHER_WEBVIEW_LOG ("PatchWebView JS beacon count=" + std::to_string (debugBeaconCount)
+                                  + " this=" + plugin::debugPointerToString (this)
+                                  + " message=" + cmajor_patch_gui_debug_decode_beacon_message (path));
+
+        return choc::ui::WebView::Options::Resource ("", "text/plain");
+    }
+   #endif
+
     const auto toMimeType = [this] (const auto& extension)
     {
         if (getMIMETypeForExtension)
@@ -316,6 +512,13 @@ inline std::optional<choc::ui::WebView::Options::Resource> PatchWebView::onReque
 
     if (relativePath.empty())
     {
+       #if FEATHER_WEBVIEW_DEBUG
+        ++debugRootFetchCount;
+        CMAJ_FEATHER_WEBVIEW_LOG ("PatchWebView root-fetch count=" + std::to_string (debugRootFetchCount)
+                                  + " this=" + plugin::debugPointerToString (this)
+                                  + " path=" + path);
+       #endif
+
         choc::value::Value manifestObject;
         cmaj::PatchManifest::View viewToUse;
 
@@ -330,7 +533,11 @@ inline std::optional<choc::ui::WebView::Options::Resource> PatchWebView::onReque
         return choc::ui::WebView::Options::Resource (choc::text::replace (cmajor_patch_gui_html,
                                                         "$MANIFEST$", choc::json::toString (manifestObject, true),
                                                         "$VIEW_TO_USE$", choc::json::toString (viewToUse.view, true),
-                                                        "$EXTRA_SETUP_CODE$", extraSetupCode),
+                                                        "$EXTRA_SETUP_CODE$", extraSetupCode,
+                                                        "$DEBUG_BOOTSTRAP_CODE$", cmajor_patch_gui_debug_bootstrap,
+                                                        "$DEBUG_STATUS_WRITE_CODE$", cmajor_patch_gui_debug_status_write,
+                                                        "$DEBUG_VIEW_CREATED_CODE$", cmajor_patch_gui_debug_view_created,
+                                                        "$DEBUG_REBUILD_CHECK_CODE$", cmajor_patch_gui_debug_rebuild_check),
                                                      "text/html");
     }
 

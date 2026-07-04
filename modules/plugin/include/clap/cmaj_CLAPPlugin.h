@@ -478,6 +478,7 @@ private:
     {
         std::atomic<uint32_t> generation { 0 };
         std::atomic<bool> pingOK { false };
+        std::atomic<bool> pingInFlight { false };
     };
 
     std::optional<double> cachedViewScaleFactor; // workaround Bitwig only passing the scale factor the first time the view is shown
@@ -526,6 +527,7 @@ private:
         {
             // FEATHER: CLAP persistent view mirrors the JUCE processor-owned
             // lifetime: recreate only when the loaded patch/view identity changes.
+            CMAJ_FEATHER_WEBVIEW_LOG ("CLAP getOrCreatePatchWebView create identity=" + nextIdentity);
             webview = std::make_unique<cmaj::PatchWebView> (patch, findDefaultViewForPatch (patch));
             webviewIdentity = nextIdentity;
             guiSoftRecoveryAttempted = false;
@@ -568,6 +570,8 @@ private:
 
     void destroyPersistentWebView()
     {
+        CMAJ_FEATHER_WEBVIEW_LOG ("CLAP destroyPersistentWebView");
+
         if (webview != nullptr)
         {
             parkWebView (*webview);
@@ -615,6 +619,9 @@ private:
 
     void updatePatchWebViewForLoadedPatch (bool forceReload)
     {
+        CMAJ_FEATHER_WEBVIEW_LOG ("CLAP updatePatchWebViewForLoadedPatch forceReload="
+                                  + std::string (forceReload ? "true" : "false"));
+
         const auto usePersistentView = shouldUsePersistentGuiView();
         const auto nextPersistentIdentity = usePersistentView ? cmaj::plugin::getPersistentViewIdentity (patch) : std::string {};
         const auto persistentIdentityChanged = usePersistentView && webview != nullptr && webviewIdentity != nextPersistentIdentity;
@@ -660,6 +667,10 @@ private:
 
     void updatePatchWebViewInstance (cmaj::PatchWebView& view, bool forceReload)
     {
+        CMAJ_FEATHER_WEBVIEW_LOG ("CLAP updatePatchWebViewInstance forceReload="
+                                  + std::string (forceReload ? "true" : "false")
+                                  + " playable=" + std::string (patch.isPlayable() ? "true" : "false"));
+
         view.setActive (patch.isPlayable());
 
         if (! patch.isPlayable())
@@ -672,10 +683,18 @@ private:
 
         if (forceReload)
             view.reload();
+        else
+            view.requestViewRebuildIfNeeded();
+
+       #if FEATHER_WEBVIEW_DEBUG
+        view.debugProbeDocumentState ("clap-update-force-" + std::string (forceReload ? "true" : "false"));
+       #endif
     }
 
     void detachEditorToParking()
     {
+        CMAJ_FEATHER_WEBVIEW_LOG ("CLAP detachEditorToParking");
+
         if (editor)
             editor->detachToParking();
         else if (auto* view = getActiveGuiWebView())
@@ -684,14 +703,49 @@ private:
 
     void parkWebView (cmaj::PatchWebView& view)
     {
+        CMAJ_FEATHER_WEBVIEW_LOG ("CLAP parkWebView");
         cmaj::plugin::parkChildView (webviewParkingWindow, view.getWebView().getViewHandle());
     }
 
     void markGuiDetached()
     {
+        CMAJ_FEATHER_WEBVIEW_LOG ("CLAP gui state detached");
+
         guiAttachProbe->pingOK.store (false);
+        guiAttachProbe->pingInFlight.store (false);
         guiAttachHealthStartMs = 0;
         guiAttachState = GuiAttachState::detached;
+    }
+
+    bool sendGuiAttachHealthPing (cmaj::PatchWebView& view)
+    {
+        if (! view.getWebView().isReady())
+        {
+            CMAJ_FEATHER_WEBVIEW_LOG ("CLAP gui attach health waiting for webview ready");
+            return false;
+        }
+
+        bool expected = false;
+
+        if (! guiAttachProbe->pingInFlight.compare_exchange_strong (expected, true))
+            return true;
+
+        const auto generation = guiAttachProbe->generation.fetch_add (1) + 1;
+        auto probe = guiAttachProbe;
+
+        const auto accepted = view.getWebView().evaluateJavascript ("1",
+            [probe, generation] (const std::string& error, const choc::value::ValueView&)
+            {
+                probe->pingInFlight.store (false);
+
+                if (error.empty() && probe->generation.load() == generation)
+                    probe->pingOK.store (true);
+            });
+
+        if (! accepted)
+            guiAttachProbe->pingInFlight.store (false);
+
+        return accepted;
     }
 
     void startGuiAttachHealthProbe (bool recoveryAttempt)
@@ -701,23 +755,23 @@ private:
         if (view == nullptr)
             return;
 
+        CMAJ_FEATHER_WEBVIEW_LOG ("CLAP startGuiAttachHealthProbe recovery="
+                                  + std::string (recoveryAttempt ? "true" : "false"));
+
         installSpacebarPassthrough (*view);
 
         guiAttachProbe->pingOK.store (false);
+        guiAttachProbe->pingInFlight.store (false);
         guiAttachHealthStartMs = getMillisecondsNow();
         guiAttachState = recoveryAttempt ? GuiAttachState::recovering : GuiAttachState::attaching;
 
-        const auto generation = guiAttachProbe->generation.fetch_add (1) + 1;
-        auto probe = guiAttachProbe;
-
-        view->getWebView().evaluateJavascript ("1",
-            [probe, generation] (const std::string& error, const choc::value::ValueView&)
-            {
-                if (error.empty() && probe->generation.load() == generation)
-                    probe->pingOK.store (true);
-            });
+        sendGuiAttachHealthPing (*view);
 
         requestMainThreadCallback();
+
+       #if FEATHER_WEBVIEW_DEBUG
+        view->debugProbeDocumentState ("clap-attach-probe");
+       #endif
     }
 
     void requestMainThreadCallback()
@@ -744,11 +798,27 @@ private:
             return;
         }
 
+        if (! editor->getPatchWebView().getWebView().isReady())
+        {
+            // FEATHER: Do not hard-recover a WebView whose CoreWebView is still
+            // being created; that tears down the pending document bootstrap.
+            guiAttachHealthStartMs = getMillisecondsNow();
+            requestMainThreadCallback();
+            return;
+        }
+
+        sendGuiAttachHealthPing (editor->getPatchWebView());
+
         if (guiAttachProbe->pingOK.load() && editor->isNativeViewAttached())
         {
             guiAttachState = GuiAttachState::attached;
             guiSoftRecoveryAttempted = false;
             guiHardRecoveryAttempted = false;
+            CMAJ_FEATHER_WEBVIEW_LOG ("CLAP gui state attached");
+
+           #if FEATHER_WEBVIEW_DEBUG
+            editor->getPatchWebView().debugProbeDocumentState ("clap-attached");
+           #endif
             return;
         }
 
@@ -769,6 +839,7 @@ private:
         {
             guiSoftRecoveryAttempted = true;
             guiAttachState = GuiAttachState::recovering;
+            CMAJ_FEATHER_WEBVIEW_LOG ("CLAP gui soft recovery");
             editor->detachToParking();
 
             if (parent != nullptr)
@@ -782,6 +853,7 @@ private:
         {
             guiHardRecoveryAttempted = true;
             guiAttachState = GuiAttachState::recovering;
+            CMAJ_FEATHER_WEBVIEW_LOG ("CLAP gui hard recovery");
             recreateEditorWebViewAfterHardRecovery (parent);
             requestMainThreadCallback();
             return;
@@ -1956,6 +2028,8 @@ inline bool Plugin::Impl::clapGui_getPreferredApi (const char** api, bool* float
 
 inline bool Plugin::Impl::clapGui_create (const char* api, bool floating)
 {
+    CMAJ_FEATHER_WEBVIEW_LOG ("CLAP clapGui_create");
+
     if (! clapGui_isApiSupported (api, floating))
         return false;
 
@@ -1983,6 +2057,8 @@ inline bool Plugin::Impl::clapGui_create (const char* api, bool floating)
 
 inline void Plugin::Impl::clapGui_destroy()
 {
+    CMAJ_FEATHER_WEBVIEW_LOG ("CLAP clapGui_destroy");
+
     detachEditorToParking();
     editor.reset();
 

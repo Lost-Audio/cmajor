@@ -28,6 +28,13 @@
 #endif
 
 #include <algorithm>
+#if FEATHER_WEBVIEW_DEBUG
+ #include <chrono>
+ #include <cstdlib>
+ #include <fstream>
+ #include <sstream>
+ #include <thread>
+#endif
 #include <filesystem>
 #include <functional>
 #include <istream>
@@ -44,6 +51,58 @@
 
 namespace cmaj::plugin
 {
+
+//==============================================================================
+#if FEATHER_WEBVIEW_DEBUG
+inline std::string debugPointerToString (const void* ptr)
+{
+    std::ostringstream out;
+    out << ptr;
+    return out.str();
+}
+
+inline std::filesystem::path getWebViewDebugLogFile()
+{
+    if (auto* path = std::getenv ("FEATHER_WEBVIEW_DEBUG_LOG"))
+        if (*path != 0)
+            return path;
+
+  #if CHOC_WINDOWS
+    char tempPath[MAX_PATH + 1] = {};
+    const auto length = GetTempPathA (MAX_PATH, tempPath);
+
+    if (length != 0 && length <= MAX_PATH)
+        return std::filesystem::path (tempPath) / "feather-webview-debug.log";
+  #endif
+
+    return std::filesystem::temp_directory_path() / "feather-webview-debug.log";
+}
+
+inline void debugLogWebViewLifecycle (const std::string& message)
+{
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock (mutex);
+
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds> (
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+
+    std::ostringstream line;
+    line << "[" << now << " tid=" << std::this_thread::get_id() << "] "
+         << message << "\n";
+
+  #if CHOC_WINDOWS
+    OutputDebugStringA (line.str().c_str());
+  #endif
+
+    std::ofstream out (getWebViewDebugLogFile(), std::ios::app);
+    out << line.str();
+}
+
+ #define CMAJ_FEATHER_WEBVIEW_LOG(message) \
+    do { ::cmaj::plugin::debugLogWebViewLifecycle ((message)); } while (false)
+#else
+ #define CMAJ_FEATHER_WEBVIEW_LOG(message) do {} while (false)
+#endif
 
 //==============================================================================
 struct Environment
@@ -598,6 +657,9 @@ inline void unwatchAllNativeWindowDestroy (void* owner)
 //==============================================================================
 inline bool addChildView (void* parent, void* child)
 {
+    CMAJ_FEATHER_WEBVIEW_LOG ("addChildView parent=" + debugPointerToString (parent)
+                              + " child=" + debugPointerToString (child));
+
   #if CHOC_OSX || defined (__APPLE__)
     try
     {
@@ -633,6 +695,8 @@ inline bool removeChildView (void* child)
     if (child == nullptr)
         return false;
 
+    CMAJ_FEATHER_WEBVIEW_LOG ("removeChildView child=" + debugPointerToString (child));
+
   #if CHOC_OSX || defined (__APPLE__)
     try
     {
@@ -659,6 +723,9 @@ inline bool parkChildView (WebViewParkingWindow& parkingWindow, void* child)
 {
     if (child == nullptr)
         return false;
+
+    CMAJ_FEATHER_WEBVIEW_LOG ("parkChildView parking=" + debugPointerToString (parkingWindow.getHandle())
+                              + " child=" + debugPointerToString (child));
 
   #if CHOC_WINDOWS
     if (auto* parkingHandle = static_cast<HWND> (parkingWindow.getHandle()))

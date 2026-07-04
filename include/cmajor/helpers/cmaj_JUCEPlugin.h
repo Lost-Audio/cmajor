@@ -709,8 +709,14 @@ protected:
 
     void deliverStatusMessageToPatchWebView()
     {
-        if (patchWebView != nullptr && ! statusMessage.empty())
+        if (patchWebView != nullptr && shouldDisplayStatusMessageInPatchView())
             patchWebView->setStatusMessage (statusMessage);
+    }
+
+    bool shouldDisplayStatusMessageInPatchView()
+    {
+        return ! statusMessage.empty()
+            && (isStatusMessageError || ! static_cast<DerivedType&> (*this).isViewVisible());
     }
 
     void notifyEditorStatusMessageChanged()
@@ -1234,6 +1240,7 @@ protected:
         {
             // FEATHER: Processor-owned WebView. This is reused while the same
             // patch rebuilds, and recreated only when the manifest/view identity changes.
+            CMAJ_FEATHER_WEBVIEW_LOG ("JUCE getOrCreatePatchWebView create identity=" + nextIdentity);
             patchWebView = std::make_unique<cmaj::PatchWebView> (*patch, derivePatchViewSize());
             patchWebViewIdentity = nextIdentity;
             patchWebViewSoftRecoveryAttempted = false;
@@ -1251,6 +1258,10 @@ protected:
 
     void updatePatchWebViewForCurrentPatch (bool forceReload)
     {
+        CMAJ_FEATHER_WEBVIEW_LOG ("JUCE updatePatchWebViewForCurrentPatch forceReload="
+                                  + std::string (forceReload ? "true" : "false")
+                                  + " playable=" + std::string (static_cast<DerivedType&> (*this).isViewVisible() ? "true" : "false"));
+
         if (! shouldUsePersistentPatchWebView())
         {
             destroyPatchWebView();
@@ -1270,14 +1281,20 @@ protected:
 
             if (forceReload)
                 patchWebView->reload();
+            else
+                patchWebView->requestViewRebuildIfNeeded();
         }
         else
         {
             patchWebView->setActive (false);
 
-            if (! statusMessage.empty())
+            if (shouldDisplayStatusMessageInPatchView())
                 patchWebView->setStatusMessage (statusMessage);
         }
+
+       #if FEATHER_WEBVIEW_DEBUG
+        patchWebView->debugProbeDocumentState ("juce-update-force-" + std::string (forceReload ? "true" : "false"));
+       #endif
     }
 
     enum class PatchWebViewAttachState
@@ -1292,25 +1309,31 @@ protected:
     {
         std::atomic<uint32_t> generation { 0 };
         std::atomic<bool> pingOK { false };
+        std::atomic<bool> pingInFlight { false };
     };
 
     void clearPatchWebViewAttachHealthState()
     {
         patchWebViewAttachProbe->pingOK.store (false);
+        patchWebViewAttachProbe->pingInFlight.store (false);
         patchWebViewAttachHealthStartMs = 0;
     }
 
-    void startPatchWebViewAttachHealthProbe (bool recoveryAttempt)
+    bool sendPatchWebViewAttachHealthPing()
     {
         if (patchWebView == nullptr)
-            return;
+            return false;
 
-        installPersistentPatchWebViewSpacebarPassthrough();
+        if (! patchWebView->getWebView().isReady())
+        {
+            CMAJ_FEATHER_WEBVIEW_LOG ("JUCE attach health waiting for webview ready");
+            return false;
+        }
 
-        patchWebViewAttachProbe->pingOK.store (false);
-        patchWebViewAttachHealthStartMs = juce::Time::getMillisecondCounter();
-        patchWebViewAttachState = recoveryAttempt ? PatchWebViewAttachState::recovering
-                                                  : PatchWebViewAttachState::attaching;
+        bool expected = false;
+
+        if (! patchWebViewAttachProbe->pingInFlight.compare_exchange_strong (expected, true))
+            return true;
 
         const auto generation = patchWebViewAttachProbe->generation.fetch_add (1) + 1;
         auto probe = patchWebViewAttachProbe;
@@ -1318,12 +1341,39 @@ protected:
         const auto accepted = patchWebView->getWebView().evaluateJavascript ("1",
             [probe, generation] (const std::string& error, const choc::value::ValueView&)
             {
+                probe->pingInFlight.store (false);
+
                 if (error.empty() && probe->generation.load() == generation)
                     probe->pingOK.store (true);
             });
 
         if (! accepted)
-            patchWebViewAttachHealthStartMs = juce::Time::getMillisecondCounter();
+            patchWebViewAttachProbe->pingInFlight.store (false);
+
+        return accepted;
+    }
+
+    void startPatchWebViewAttachHealthProbe (bool recoveryAttempt)
+    {
+        if (patchWebView == nullptr)
+            return;
+
+        CMAJ_FEATHER_WEBVIEW_LOG ("JUCE startAttachHealthProbe recovery="
+                                  + std::string (recoveryAttempt ? "true" : "false"));
+
+        installPersistentPatchWebViewSpacebarPassthrough();
+
+        patchWebViewAttachProbe->pingOK.store (false);
+        patchWebViewAttachProbe->pingInFlight.store (false);
+        patchWebViewAttachHealthStartMs = juce::Time::getMillisecondCounter();
+        patchWebViewAttachState = recoveryAttempt ? PatchWebViewAttachState::recovering
+                                                  : PatchWebViewAttachState::attaching;
+
+        sendPatchWebViewAttachHealthPing();
+
+       #if FEATHER_WEBVIEW_DEBUG
+        patchWebView->debugProbeDocumentState ("juce-attach-probe");
+       #endif
     }
 
     void markPatchWebViewNativeAttached (bool recoveryAttempt)
@@ -1333,6 +1383,8 @@ protected:
 
     void detachPatchWebViewFromEditor()
     {
+        CMAJ_FEATHER_WEBVIEW_LOG ("JUCE detachPatchWebViewFromEditor");
+
         clearPatchWebViewAttachHealthState();
         patchWebViewAttachState = PatchWebViewAttachState::detached;
 
@@ -1346,6 +1398,8 @@ protected:
 
     void destroyPatchWebView()
     {
+        CMAJ_FEATHER_WEBVIEW_LOG ("JUCE destroyPatchWebView");
+
         detachPatchWebViewFromEditor();
 
         if (patchWebView != nullptr)
@@ -1621,6 +1675,8 @@ protected:
         Editor (DerivedType& p)
             : juce::AudioProcessorEditor (p), owner (p)
         {
+            CMAJ_FEATHER_WEBVIEW_LOG ("JUCE Editor ctor");
+
             setResizeLimits (250, 160, 32768, 32768);
 
             lookAndFeel.setColour (juce::TextEditor::outlineColourId, juce::Colours::transparentBlack);
@@ -1649,6 +1705,8 @@ protected:
 
         ~Editor() override
         {
+            CMAJ_FEATHER_WEBVIEW_LOG ("JUCE Editor dtor");
+
             stopTimer();
             owner.editorBeingDeleted (this);
             setLookAndFeel (nullptr);
@@ -1745,13 +1803,16 @@ protected:
         {
             owner.refreshExtraComp (extraComp.get());
 
-            if (! owner.statusMessage.empty())
+            if (owner.shouldDisplayStatusMessageInPatchView())
                 if (auto* view = getCurrentPatchWebView())
                     view->setStatusMessage (owner.statusMessage);
         }
 
         void onPatchChanged (bool forceReload = true)
         {
+            CMAJ_FEATHER_WEBVIEW_LOG ("JUCE Editor onPatchChanged forceReload="
+                                      + std::string (forceReload ? "true" : "false"));
+
             bindPatchWebViewHolder (forceReload && ! owner.shouldUsePersistentPatchWebView());
 
             if (patchWebViewHolder == nullptr)
@@ -1819,6 +1880,8 @@ protected:
         {
             if (! usingPersistentView)
                 return;
+
+            CMAJ_FEATHER_WEBVIEW_LOG ("JUCE Editor hardRecovery recreate persistent PatchWebView");
 
             detachAndResetPatchWebViewHolder();
             owner.destroyPatchWebView();
@@ -1923,11 +1986,27 @@ protected:
             return;
         }
 
+        if (! patchWebView->getWebView().isReady())
+        {
+            // FEATHER: WebView2 may take several seconds to finish creating its
+            // CoreWebView. Hard recovery before that point just destroys the
+            // in-flight browser and can prevent the document from ever loading.
+            patchWebViewAttachHealthStartMs = juce::Time::getMillisecondCounter();
+            return;
+        }
+
+        sendPatchWebViewAttachHealthPing();
+
         if (patchWebViewAttachProbe->pingOK.load() && holder->isNativeViewAttached())
         {
             patchWebViewAttachState = PatchWebViewAttachState::attached;
             patchWebViewSoftRecoveryAttempted = false;
             patchWebViewHardRecoveryAttempted = false;
+            CMAJ_FEATHER_WEBVIEW_LOG ("JUCE attach state attached");
+
+           #if FEATHER_WEBVIEW_DEBUG
+            patchWebView->debugProbeDocumentState ("juce-attached");
+           #endif
             return;
         }
 
@@ -1943,6 +2022,7 @@ protected:
         {
             patchWebViewSoftRecoveryAttempted = true;
             patchWebViewAttachState = PatchWebViewAttachState::recovering;
+            CMAJ_FEATHER_WEBVIEW_LOG ("JUCE attach soft recovery");
             holder->detachNativeView();
             holder->refreshNativeAttachment (true);
             return;
@@ -1952,6 +2032,7 @@ protected:
         {
             patchWebViewHardRecoveryAttempted = true;
             patchWebViewAttachState = PatchWebViewAttachState::recovering;
+            CMAJ_FEATHER_WEBVIEW_LOG ("JUCE attach hard recovery");
             editor.recreatePersistentPatchWebViewAfterHardRecovery();
             return;
         }
