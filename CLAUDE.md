@@ -460,7 +460,16 @@ echo "EXIT: $?"; tail -10 .feather/reports/<name>-exec.log
 ```
 
 Hard rules (each learned the painful way):
-- **NEVER dispatch through the codex plugin's broker/companion (`task --background`)** — the broker runs detached from any console, so every sub
+- **NEVER dispatch through the codex plugin's broker/companion (`task --background`)** — the broker runs detached from any console, so every subprocess Codex spawns (pwsh/cmake/git) opens a NEW visible cmd window and steals the user's keyboard focus. Direct `codex exec` under the harness Bash inherits its hidden console → zero flashes.
+- **Always `< /dev/null`** — headless `codex exec` hangs at a stdin prompt without it (no completion notification ever fires).
+- **Long prompts via `"$(cat brief-file)"`**, never inline-quoted; write the brief to `.feather/<name>-brief.txt` first.
+- **Prefix the vendor Codex dir onto PATH** or the wrong shim resolves: `export PATH="/c/Users/jupeo/AppData/Roaming/npm/node_modules/@openai/codex/node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin:$PATH"`.
+- **Codex cannot write `.git`** (workspace-write sandbox) — the orchestrator does ALL git ops after Codex returns.
+- **Resume a session**: `codex exec --sandbox … -c … resume <session-id> "…"` — flags BEFORE `resume`.
+- **No status-poller loops** — they spawn flashing subprocesses too. Rely on the harness background-exit notification, or grep the job's state JSON once on wake.
+- **Use `read-only` sandbox for audits/reviews**; `workspace-write` for implementation.
+
+## Picking the right models for workflows and subagents
 
 Rankings, higher = better. Cost reflects what I actually pay (OpenAI has really generous limits), not list price. Intelligence is how hard a problem you can hand the model unsupervised. Taste covers UI/UX, code quality, API design, and copy.
 
