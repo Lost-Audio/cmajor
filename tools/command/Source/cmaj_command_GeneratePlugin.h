@@ -320,6 +320,7 @@ if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
     message ("Using webkit ${WEBKIT2_GTK_VERSION}")
 endif()
 
+# FEATHER: cmaj_JUCEPlugin.h derives plugin bus layouts from endpoint bus/role annotations.
 juce_add_plugin(${productName}
     FORMATS ${pluginFormats}
     DESCRIPTION "${description}"

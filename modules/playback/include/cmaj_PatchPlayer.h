@@ -65,6 +65,10 @@ struct PatchPlayer  : public choc::audio::io::AudioMIDICallback
         {
             auto& options = audioPlayer->options;
 
+            // FEATHER: the player exposes one flat device channel array to Patch.
+            // Bus groups consume channels in declaration order: main/default first,
+            // then aux/sidechain groups take the remaining input channels; outputs
+            // are flattened back to the device in the same bus-group order.
             params.blockSize          = options.blockSize;
             params.sampleRate         = options.sampleRate;
             params.numInputChannels   = options.inputChannelCount;
