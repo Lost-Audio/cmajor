@@ -142,18 +142,19 @@ export default {
 
 static constexpr auto viewTSConfig = R"cmaj_view(
 {
-  "extends": "./tsconfig.node.json",
   "compilerOptions": {
-    "allowJs": true,
-    "checkJs": true,
     "isolatedModules": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "module": "ESNext",
     "moduleResolution": "Bundler",
+    "noEmit": true,
+    "skipLibCheck": true,
     "strict": true,
     "target": "ES2022",
     "types": ["svelte", "vite/client"]
   },
-  "include": ["src/**/*.ts", "src/**/*.svelte", "vite.config.ts", "svelte.config.js"]
+  "include": ["src/**/*.d.ts", "src/**/*.ts", "src/**/*.svelte"],
+  "exclude": ["node_modules", "dist", "src/dev/**", "vite.config.ts", "svelte.config.js"]
 }
 )cmaj_view";
 
@@ -163,11 +164,14 @@ static constexpr auto viewTSConfigNode = R"cmaj_view(
     "composite": true,
     "module": "ESNext",
     "moduleResolution": "Bundler",
+    "noEmit": true,
+    "skipLibCheck": true,
     "strict": true,
     "target": "ES2022",
     "types": ["node"]
   },
-  "include": ["vite.config.ts"]
+  "include": ["vite.config.ts"],
+  "exclude": ["node_modules", "dist"]
 }
 )cmaj_view";
 
@@ -305,13 +309,14 @@ input {
 
 static constexpr auto viewMainTS = R"cmaj_view(
 import './index.css'
+import { mount } from 'svelte'
 import App from './App.svelte'
 import { createPreviewPatchConnection } from './lib/cmajor'
 
 const target = document.getElementById('app')
 
 if (target) {
-  new App({
+  mount(App, {
     target,
     props: {
       patchConnection: createPreviewPatchConnection(),
@@ -322,6 +327,7 @@ if (target) {
 
 static constexpr auto viewCreatePatchViewTS = R"cmaj_view(
 import './index.css'
+import { mount } from 'svelte'
 import App from './App.svelte'
 import type { PatchConnection } from './lib/cmajor'
 
@@ -329,7 +335,7 @@ export default function createPatchView(patchConnection: PatchConnection): HTMLE
   const container = document.createElement('div')
   container.className = 'cmajor-view-root'
 
-  new App({
+  mount(App, {
     target: container,
     props: { patchConnection },
   })
@@ -386,9 +392,8 @@ export function animateElement(
 static constexpr auto viewMotionGPUShimTS = R"cmaj_view(
 export async function loadMotionGpu() {
   try {
-    // TODO: Verify @motion-core/motion-gpu's final published API when network access is available.
-    // The package is optional; the demo falls back to raw WebGPU if it is not installed.
-    return await import('@motion-core/motion-gpu')
+    const packageName = '@motion-core/motion-gpu'
+    return await import(/* @vite-ignore */ packageName)
   } catch {
     return null
   }
@@ -831,16 +836,16 @@ function stringFrom(value: unknown) {
 
 static constexpr auto viewAppSvelte = R"cmaj_view(
 <script lang="ts">
-  import { onDestroy } from 'svelte'
+  import { onDestroy, untrack } from 'svelte'
   import MotionExample from './components/MotionExample.svelte'
   import WebGpuDemo from './components/WebGpuDemo.svelte'
   import ParamToggle from './lib/components/ui/param-toggle.svelte'
   import RotaryKnob from './lib/components/ui/rotary-knob.svelte'
   import { createCmajorPatch, type PatchConnection, type ParameterRuneStore } from './lib/cmajor'
 
-  let { patchConnection }: { patchConnection: PatchConnection } = $props()
+  const { patchConnection }: { patchConnection: PatchConnection } = $props()
 
-  const patch = createCmajorPatch(patchConnection)
+  const patch = untrack(() => createCmajorPatch(patchConnection))
 
   let gain: ParameterRuneStore | null = $state(null)
   let enabled: ParameterRuneStore | null = $state(null)
@@ -1333,7 +1338,7 @@ static constexpr auto viewWebGpuDemoSvelte = R"cmaj_view(
 
       if (cancelled || !canvas) return
 
-      label = motionGpu ? 'motion-gpu ready' : navigator.gpu ? 'raw WebGPU ready' : 'WebGPU unavailable'
+      label = motionGpu ? 'motion-gpu ready' : 'gpu' in navigator ? 'raw WebGPU ready' : 'WebGPU unavailable'
 
       const context = canvas.getContext('2d')
       if (!context) return

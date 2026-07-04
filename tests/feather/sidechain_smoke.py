@@ -45,14 +45,14 @@ def find_cmaj(explicit):
     if env:
         candidates.append(pathlib.Path(env))
 
-    path_hit = shutil.which("cmaj")
-    if path_hit:
-        candidates.append(pathlib.Path(path_hit))
-
     for root in (REPO_ROOT / "build", REPO_ROOT / "build-plugin"):
         if root.exists():
             candidates.extend(root.rglob("cmaj.exe"))
             candidates.extend(p for p in root.rglob("cmaj") if p.is_file())
+
+    path_hit = shutil.which("cmaj")
+    if path_hit:
+        candidates.append(pathlib.Path(path_hit))
 
     for candidate in candidates:
         if candidate.exists() and candidate.is_file():
@@ -220,7 +220,7 @@ def main():
 
     cmaj = find_cmaj(args.cmaj)
 
-    with tempfile.TemporaryDirectory(prefix="cmaj_sidechain_smoke_", dir=REPO_ROOT / "tests" / "feather") as temp_dir:
+    with tempfile.TemporaryDirectory(prefix="cmaj_sidechain_smoke_") as temp_dir:
         temp = pathlib.Path(temp_dir)
         pulsed_in = temp / "main_with_sidechain.wav"
         silent_in = temp / "main_silent_sidechain.wav"
