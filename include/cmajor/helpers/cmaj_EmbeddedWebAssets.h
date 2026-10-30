@@ -4236,7 +4236,7 @@ struct EmbeddedWebAssets
         File { "cmaj-server-session.js", std::string_view (cmajserversession_js, 20324) },
         File { "cmaj-types.d.ts", std::string_view (cmajtypes_d_ts, 2080) },
         File { "jsconfig.json", std::string_view (jsconfig_json, 374) },
-        File { "assets\\cmajor-logo.svg", std::string_view (assetscmajorlogo_svg, 2920) }
+        File { "assets/cmajor-logo.svg", std::string_view (assetscmajorlogo_svg, 2920) }
     };
 
 };

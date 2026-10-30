@@ -2880,14 +2880,14 @@ struct Files
         File { "embedded_patch_chooser_template.html", std::string_view (embedded_patch_chooser_template_html, 315) },
         File { "embedded_patch_runner_template.html", std::string_view (embedded_patch_runner_template_html, 949) },
         File { "embedded_patch_session_template.js", std::string_view (embedded_patch_session_template_js, 2121) },
-        File { "panel_api\\cmaj-cpu-meter.js", std::string_view (panel_apicmajcpumeter_js, 3734) },
-        File { "panel_api\\cmaj-graph.js", std::string_view (panel_apicmajgraph_js, 3063) },
-        File { "panel_api\\cmaj-patch-panel.css", std::string_view (panel_apicmajpatchpanel_css, 7821) },
-        File { "panel_api\\cmaj-patch-panel.html", std::string_view (panel_apicmajpatchpanel_html, 2343) },
-        File { "panel_api\\cmaj-patch-panel.js", std::string_view (panel_apicmajpatchpanel_js, 46616) },
-        File { "panel_api\\helpers\\cmaj-image-strip-control.js", std::string_view (panel_apihelperscmajimagestripcontrol_js, 5816) },
-        File { "panel_api\\helpers\\cmaj-level-meter.js", std::string_view (panel_apihelperscmajlevelmeter_js, 6985) },
-        File { "panel_api\\helpers\\cmaj-waveform-display.js", std::string_view (panel_apihelperscmajwaveformdisplay_js, 5202) }
+        File { "panel_api/cmaj-cpu-meter.js", std::string_view (panel_apicmajcpumeter_js, 3734) },
+        File { "panel_api/cmaj-graph.js", std::string_view (panel_apicmajgraph_js, 3063) },
+        File { "panel_api/cmaj-patch-panel.css", std::string_view (panel_apicmajpatchpanel_css, 7821) },
+        File { "panel_api/cmaj-patch-panel.html", std::string_view (panel_apicmajpatchpanel_html, 2343) },
+        File { "panel_api/cmaj-patch-panel.js", std::string_view (panel_apicmajpatchpanel_js, 46616) },
+        File { "panel_api/helpers/cmaj-image-strip-control.js", std::string_view (panel_apihelperscmajimagestripcontrol_js, 5816) },
+        File { "panel_api/helpers/cmaj-level-meter.js", std::string_view (panel_apihelperscmajlevelmeter_js, 6985) },
+        File { "panel_api/helpers/cmaj-waveform-display.js", std::string_view (panel_apihelperscmajwaveformdisplay_js, 5202) }
     };
 
 };

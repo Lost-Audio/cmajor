@@ -147,7 +147,8 @@ def createCppFileData (files):
     first = True
 
     for f in files:
-        name = f[0]
+        # these names are looked up as URL paths, so they must use '/' even when generated on Windows
+        name = f[0].replace ("\\", "/")
         identifier = makeSafeIdentifier (name)
         content = f[1]
 

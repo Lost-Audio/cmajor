@@ -3030,8 +3030,8 @@ struct EmbeddedWamAssets
 
     static constexpr std::array files =
     {
-        File { "sdk\\index.js", std::string_view (sdkindex_js, 61323) },
-        File { "sdk\\parammgr.js", std::string_view (sdkparammgr_js, 41006) }
+        File { "sdk/index.js", std::string_view (sdkindex_js, 61323) },
+        File { "sdk/parammgr.js", std::string_view (sdkparammgr_js, 41006) }
     };
 
 };
