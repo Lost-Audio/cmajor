@@ -9,7 +9,7 @@
     "isInstrument":     false,
     "latencySamples":   8528,
 
-    "source":           "Smear.cmajor",
+    "source":           ["Smear.cmajor", "SmearClassic.cmajor"],
 
     "view":             {
                             "src": "view/index.js",

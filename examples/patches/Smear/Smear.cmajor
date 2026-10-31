@@ -30,9 +30,15 @@
 
     With everything at neutral it passes the sound straight through, 8528 samples late (the
     dry signal is delayed to match, so Mix doesn't comb-filter).
+
+    Pull Mode picks between this way of working (Precise) and the one Smear had before it
+    (Classic, in SmearClassic.cmajor), which pulls every partial on its own on 2048-sample
+    frames, for a grainier, more obviously tuned sound. Both run as nodes of the graph below
+    and are added together; whichever isn't chosen does nothing, and changing the mode warms
+    the new one up unheard for 0.4 seconds and then crossfades.
 */
 
-processor Smear  [[ main ]]
+graph Smear  [[ main ]]
 {
     input stream float<2> in;
     output stream float<2> out;
@@ -71,8 +77,95 @@ processor Smear  [[ main ]]
     input value float tilt         [[ name: "Tilt",           min: -12, max: 12,    init: 0,    unit: "dB/oct" ]];
     input value float mix          [[ name: "Mix",            min: 0,   max: 1,     init: 1 ]];
     input value float volume       [[ name: "Output",         min: -24, max: 12,    init: 0,    unit: "dB" ]];
+    input value int   pullMode     [[ name: "Pull Mode",      min: 0,   max: 1,     init: 0,    text: "Precise|Classic" ]];
+
+    node precise = SmearPrecise;
+    node classic = SmearClassic;
+
+    connection
+    {
+        in -> precise.in, classic.in;
+        precise.out, classic.out -> out;
+        precise.spectrumOut, classic.spectrumOut -> spectrumOut;
+
+        lowCross -> precise.lowCross, classic.lowCross;
+        highCross -> precise.highCross, classic.highCross;
+        lowFreeze -> precise.lowFreeze, classic.lowFreeze;
+        lowSmear -> precise.lowSmear, classic.lowSmear;
+        lowShift -> precise.lowShift, classic.lowShift;
+        lowPeaks -> precise.lowPeaks, classic.lowPeaks;
+        lowScatter -> precise.lowScatter, classic.lowScatter;
+        lowLevel -> precise.lowLevel, classic.lowLevel;
+        midFreeze -> precise.midFreeze, classic.midFreeze;
+        midSmear -> precise.midSmear, classic.midSmear;
+        midShift -> precise.midShift, classic.midShift;
+        midPeaks -> precise.midPeaks, classic.midPeaks;
+        midScatter -> precise.midScatter, classic.midScatter;
+        midLevel -> precise.midLevel, classic.midLevel;
+        highFreeze -> precise.highFreeze, classic.highFreeze;
+        highSmear -> precise.highSmear, classic.highSmear;
+        highShift -> precise.highShift, classic.highShift;
+        highPeaks -> precise.highPeaks, classic.highPeaks;
+        highScatter -> precise.highScatter, classic.highScatter;
+        highLevel -> precise.highLevel, classic.highLevel;
+        magnet -> precise.magnet, classic.magnet;
+        key -> precise.key, classic.key;
+        scale -> precise.scale, classic.scale;
+        transients -> precise.transients, classic.transients;
+        phaseMode -> precise.phaseMode, classic.phaseMode;
+        tilt -> precise.tilt, classic.tilt;
+        mix -> precise.mix, classic.mix;
+        volume -> precise.volume, classic.volume;
+        pullMode -> precise.pullMode, classic.pullMode;
+    }
+}
+
+//==============================================================================
+processor SmearPrecise
+{
+    input stream float<2> in;
+    output stream float<2> out;
+    output event smear::Spectrum spectrumOut;
+
+    input value float lowCross;
+    input value float highCross;
+
+    input value int   lowFreeze;
+    input value float lowSmear;
+    input value float lowShift;
+    input value float lowPeaks;
+    input value float lowScatter;
+    input value float lowLevel;
+
+    input value int   midFreeze;
+    input value float midSmear;
+    input value float midShift;
+    input value float midPeaks;
+    input value float midScatter;
+    input value float midLevel;
+
+    input value int   highFreeze;
+    input value float highSmear;
+    input value float highShift;
+    input value float highPeaks;
+    input value float highScatter;
+    input value float highLevel;
+
+    input value float magnet;
+    input value int   key;
+    input value int   scale;
+
+    input value float transients;
+    input value int   phaseMode;
+    input value float tilt;
+    input value float mix;
+    input value float volume;
+    input value int   pullMode;
 
     processor.latency = smear::lowLatency + smear::shortSize;
+
+    let algorithm = 0;   // which Pull Mode this is
+    smear::Switcher switcher;
 
     //==============================================================================
     namespace frames = smear::stft (smear::fftSize);
@@ -151,13 +244,20 @@ processor Smear  [[ main ]]
         for (wrap<shortSize> i)
             shortWindow[i] = 0.5f - 0.5f * cos (float (twoPi) * float (i) / float (shortSize));
 
+        smear::startSwitcher (switcher, pullMode == algorithm);
+
         setUpOnsetDetector();
 
         let powerCoefficient = 1.0f - exp (-1.0f / (0.4f * float (processor.frequency)));
+        let warmingPowerCoefficient = 1.0f - exp (-1.0f / (0.1f * float (processor.frequency)));
         let limitRelease = 1.0f - exp (-1.0f / (0.1f * float (processor.frequency)));
 
         loop
         {
+            // while it's neither chosen nor heard, it does nothing
+            while (! smear::updateSwitcher (switcher, pullMode == algorithm, processor.frequency))
+                advance();
+
             // The splitter: what went in shortSize samples ago, and the onsets picked out of it
             let delayedIn = float<2> (leftShort.incoming[shortPosition], rightShort.incoming[shortPosition]);
             let onset = float<2> (leftShort.outgoing[shortPosition], rightShort.outgoing[shortPosition]);
@@ -185,10 +285,21 @@ processor Smear  [[ main ]]
             let dry = steadyDry + keptDry;
             let wet = runLowEngine (steady) + frames::exchange (upperEngine, held.steady, held.kept);
 
-            if (lowFreeze == 0 || midFreeze == 0 || highFreeze == 0)
+            // while its frames fill after a warm-up began, what it measured before is forgotten
+            if (smear::isFilling (switcher))
             {
-                dryPower += (steadyDry[0] * steadyDry[0] + steadyDry[1] * steadyDry[1] - dryPower) * powerCoefficient;
-                wetPower += (wet[0] * wet[0] + wet[1] * wet[1] - wetPower) * powerCoefficient;
+                dryPower = 0.0f;
+                wetPower = 0.0f;
+            }
+            else if (lowFreeze == 0 || midFreeze == 0 || highFreeze == 0)
+            {
+                // and while it warms up unheard it measures over a shorter time and catches up
+                // both ways quickly, so it comes in at the right level
+                let isWarming = smear::isWarming (switcher);
+                let coefficient = isWarming ? warmingPowerCoefficient : powerCoefficient;
+
+                dryPower += (steadyDry[0] * steadyDry[0] + steadyDry[1] * steadyDry[1] - dryPower) * coefficient;
+                wetPower += (wet[0] * wet[0] + wet[1] * wet[1] - wetPower) * coefficient;
 
                 // the level matcher aims for the dry level times what the band levels ask for
                 let unlevelled = lowEngine.unlevelled + upperEngine.unlevelled;
@@ -199,7 +310,7 @@ processor Smear  [[ main ]]
                 if (dryPower > 1.0e-8f && wetPower > 1.0e-10f)
                 {
                     let target = clamp (sqrt (dryPower * intendedPower / wetPower), 0.25f, 2.0f);
-                    levelMatch += (target - levelMatch) * (target > levelMatch ? 0.00005f : 0.001f);
+                    levelMatch += (target - levelMatch) * (target > levelMatch && ! isWarming ? 0.00005f : 0.001f);
                 }
             }
 
@@ -210,7 +321,7 @@ processor Smear  [[ main ]]
             wetLimit = wetPeak * wetLimit > 1.0f ? 1.0f / wetPeak : wetLimit + (1.0f - wetLimit) * limitRelease;
 
             gain += (pow (10.0f, volume / 20.0f) - gain) * 0.001f;
-            out <- (dry * (1.0f - mix) + (matchedWet * wetLimit + keptDry) * mix) * gain;
+            out <- (dry * (1.0f - mix) + (matchedWet * wetLimit + keptDry) * mix) * gain * switcher.gain;
 
             ++shortPosition;
 
@@ -229,7 +340,8 @@ processor Smear  [[ main ]]
                 if (--framesUntilSpectrum <= 0)
                 {
                     framesUntilSpectrum = 2;
-                    sendSpectrum();
+                    if (smear::isHeard (switcher))
+                        sendSpectrum();
                 }
             }
 
@@ -338,9 +450,12 @@ processor Smear  [[ main ]]
     //==============================================================================
     void gatherControls()
     {
-        controls.bands[0] = smear::makeSettings (lowFreeze,  lowSmear,  lowShift,  lowPeaks,  lowScatter,  lowLevel);
-        controls.bands[1] = smear::makeSettings (midFreeze,  midSmear,  midShift,  midPeaks,  midScatter,  midLevel);
-        controls.bands[2] = smear::makeSettings (highFreeze, highSmear, highShift, highPeaks, highScatter, highLevel);
+        // while its frames are filling after a warm-up began, it neither smears nor freezes
+        let filling = smear::isFilling (switcher);
+
+        controls.bands[0] = smear::makeSettings (filling ? 0 : lowFreeze, filling ? 0.0f : lowSmear, lowShift,  lowPeaks,  lowScatter,  lowLevel);
+        controls.bands[1] = smear::makeSettings (filling ? 0 : midFreeze, filling ? 0.0f : midSmear, midShift,  midPeaks,  midScatter,  midLevel);
+        controls.bands[2] = smear::makeSettings (filling ? 0 : highFreeze, filling ? 0.0f : highSmear, highShift, highPeaks, highScatter, highLevel);
 
         controls.lowCross = lowCross;
         controls.highCross = highCross;
@@ -496,6 +611,76 @@ namespace smear
     let shortSize = 256;          // the transient splitter's frames
     let numBands = 3;
     let numDisplayBands = 64;
+
+    /// Fades one of the two Pull Modes in or out when the choice changes. One coming in from
+    /// silence first runs unheard for long enough to fill its frames and delay lines and
+    /// settle its trackers, while the one going out holds on at full level; then the two
+    /// crossfade. For the first half of that, while its frames are still filling with what's
+    /// playing now, it neither smears, freezes nor matches levels, so it doesn't carry on
+    /// from whatever it last heard; in the second half it builds them up again. One switched
+    /// back before it's finished fading just turns round. One that's neither chosen nor
+    /// heard does nothing at all.
+    struct Switcher
+    {
+        bool isWanted;
+        int countdown, fillCountdown;
+        float gain;
+    }
+
+    let warmUpSeconds = 0.4f;
+    let fadeSeconds = 0.05f;
+
+    void startSwitcher (Switcher& s, bool isWanted)
+    {
+        s.isWanted = isWanted;
+        s.gain = isWanted ? 1.0f : 0.0f;
+    }
+
+    /// Moves the switcher on a sample, and says whether there's anything to run
+    bool updateSwitcher (Switcher& s, bool isWanted, float64 sampleRate)
+    {
+        if (isWanted != s.isWanted)
+        {
+            // coming in from silence it warms up, and going out from full it waits for that
+            let waits = isWanted ? s.gain == 0.0f : s.gain == 1.0f;
+            s.isWanted = isWanted;
+            s.countdown = waits ? max (int (warmUpSeconds * float (sampleRate)), 2 * (lowLatency + shortSize)) : 0;
+            s.fillCountdown = isWanted && waits ? s.countdown / 2 : 0;
+        }
+
+        if (s.fillCountdown > 0)
+            --s.fillCountdown;
+
+        if (s.countdown > 0)
+        {
+            --s.countdown;
+        }
+        else
+        {
+            let step = 1.0f / (fadeSeconds * float (sampleRate));
+            s.gain = isWanted ? min (1.0f, s.gain + step) : max (0.0f, s.gain - step);
+        }
+
+        return isWanted || s.gain > 0.0f;
+    }
+
+    /// Whether it's warming up to come in, and not heard yet
+    bool isWarming (const Switcher& s)
+    {
+        return s.isWanted && s.countdown > 0;
+    }
+
+    /// Whether its frames are still filling with what's playing now, after a warm-up began
+    bool isFilling (const Switcher& s)
+    {
+        return s.fillCountdown > 0;
+    }
+
+    /// Whether this is the one being heard, which is the one that shows its spectrum
+    bool isHeard (const Switcher& s)
+    {
+        return s.gain >= 0.5f;
+    }
 
     /// One channel of the transient splitter's short frames
     struct ShortChannel
@@ -1022,8 +1207,9 @@ namespace smear
         // others, and it mustn't be pulled harder or softer in time with it. A pitch that's
         // jumped by more than 60 cents since the last frame, and is more than 85 cents from
         // where it was centred, is a new note and starts afresh (vibrato does the first but
-        // not both). Until a new note fills the frame (youngFrames), its pitch is taken as it
-        // comes, not smoothed.
+        // not both). Until a new note has filled the frame (youngFrames), its pitch is taken as
+        // it comes, and its history starts from there rather than from its first frames; for
+        // the next couple it's centred on the average of what it's had so far.
         void trackPeaks (Engine& e)
         {
             let binWidth = e.sampleRate / float (fftSize);
@@ -1041,10 +1227,19 @@ namespace smear
                 e.peakEarlierPitches.at (p) = float<2> (lastPitch, earlier[0]);
                 e.peakAge.at (p) = age;
 
-                if (age < youngFrames)
+                if (age <= youngFrames)
                 {
+                    e.peakEarlierPitches.at (p) = float<2> (pitch);
                     e.peakSmoothed.at (p) = pitch;
                     e.peakCentre.at (p) = pitch;
+                }
+                else if (age < youngFrames + 3)
+                {
+                    // while it settles in, it's centred on the average of what it's had so far
+                    let averaged = age == youngFrames + 1 ? 0.5f * (pitch + lastPitch)
+                                                          : (pitch + lastPitch + earlier[0]) / 3.0f;
+                    e.peakSmoothed.at (p) = averaged;
+                    e.peakCentre.at (p) = averaged;
                 }
                 else
                 {
@@ -1052,6 +1247,10 @@ namespace smear
                     let smoothed = followPitch (e.lastSmoothed.at (bin), averaged, e.centreCoefficient);
                     e.peakSmoothed.at (p) = smoothed;
                     e.peakCentre.at (p) = followPitch (e.lastCentre.at (bin), smoothed, e.centreCoefficient);
+                }
+
+                if (age > youngFrames)
+                {
                     let tonality = e.peakTonality.at (p);
                     let last = e.lastTonality.at (bin);
                     e.peakTonality.at (p) = last + (tonality - last) * (tonality > last ? 0.5f : 0.15f);
@@ -1179,16 +1378,20 @@ namespace smear
         // scale nearest the pitch it's centred on (holding on to the note it went to last time
         // unless another is clearly nearer), all the way once it's clearly a tone and less
         // for one that's only just tonal; a harmonic
-        // by the same ratio as its root, and noise only by Shift. A note that hasn't been
-        // moved yet is left alone while it's within 2 cents of its note (15 cents while it's
-        // still filling the frame and its pitch is only roughly known), but once it's been
-        // moved it's taken all the way, so it never jumps back. Each region moves by whole
-        // bins, and its phases are turned to make up the exact frequency: by how far they've
-        // turned so far, which carries on from frame to frame (from nothing for a new note),
-        // plus the part of a bin the move couldn't make. A region that isn't moving is left
-        // just as it was, rather than keeping whatever turn an earlier peak there had. (The
-        // frames start at their first sample rather than their middle, so moving by a bin
-        // also flips the sign; the same term takes care of that.)
+        // by the same ratio as its root, and noise only by Shift. A new note is left as it is
+        // until it fills the frame (before then its pitch can be misread by a semitone, most of
+        // all in a chord), and is then eased onto its note over the next three frames,
+        // choosing the note afresh each time until it's all the way there. A note
+        // that hasn't been moved yet is left alone while it's within 2 cents of its note, but
+        // once it's been moved it's taken all the way, so it never jumps back. Each region
+        // moves by whole bins, and its phases are turned to make up the exact frequency: on
+        // from how far they'd turned by the middle of the last frame to the middle of this one
+        // (from nothing for a new note). Counting at the middle of the frame means a move that
+        // changes from one frame to the next turns them smoothly, without a kick that would
+        // overshoot. A region that isn't moving is left just as it was, rather than keeping
+        // whatever turn an earlier peak there had. (The frames start at their first sample
+        // rather than their middle, so moving by a whole bin also flips the sign of every
+        // other one; the angle takes that back off.)
         //
         // Within the analyser's reach, the upper engine moves each bin the way the analyser
         // moved that frequency, blending between its frames either side, with the phases turned
@@ -1247,14 +1450,18 @@ namespace smear
                     ratio = e.peakRatio.at (root);
                     note = e.peakNote.at (root);
                 }
-                else if (e.isAnalyser && c.magnet > 0.0f && ! isNew && e.peakTonality.at (p) > 0.5f && frequency * shiftRatio >= 20.0f)
+                else if (e.isAnalyser && c.magnet > 0.0f && e.peakAge.at (p) >= youngFrames
+                          && e.peakTonality.at (p) > 0.5f && frequency * shiftRatio >= 20.0f)
                 {
+                    let isSettling = e.peakAge.at (p) < youngFrames + 3;
                     let centre = e.peakCentre.at (p) + shiftSemitones - float (c.key);
-                    note = nearestNote (centre, c.scaleMask, note);
+                    note = nearestNote (centre, c.scaleMask, isSettling ? -1000 : note);
                     let distance = float (note) - centre;
+                    let sureness = min (1.0f, 4.0f * (e.peakTonality.at (p) - 0.5f));
+                    let easeIn = isSettling ? float (e.peakAge.at (p) - youngFrames + 1) / 3.0f : 1.0f;
 
-                    if (e.plans[b].rotation.at (bin) != 0.0f || abs (distance) >= (e.peakAge.at (p) < youngFrames ? 0.15f : 0.02f))
-                        ratio *= pow (2.0f, distance * c.magnet * min (1.0f, 4.0f * (e.peakTonality.at (p) - 0.5f)) / 12.0f);
+                    if (e.plans[b].rotation.at (bin) != 0.0f || abs (distance) >= 0.02f)
+                        ratio *= pow (2.0f, distance * c.magnet * sureness * easeIn / 12.0f);
                 }
 
                 e.peakRatio.at (p) = ratio;
@@ -1267,10 +1474,12 @@ namespace smear
                                                    : original;
                 let delta = steadyFrequency * (ratio - 1.0f);
                 let move = int (floor (delta + 0.5f));
-                let turned = isFollowed ? e.plans[b].rotation.at (bin)
-                                        : delta == 0.0f ? 0.0f
-                                                        : wrapPhase ((isNew ? 0.0f : e.plans[b].rotation.at (bin)) + delta * phaseStep);
-                let angle = turned + float (pi) * (delta - float (move));
+                let lastMiddleTurn = e.plans[b].rotation.at (bin) + float (pi) * e.plans[b].delta.at (bin);
+                let middleTurn = isFollowed ? lastMiddleTurn
+                                            : delta == 0.0f ? 0.0f
+                                                            : wrapPhase ((isNew ? 0.0f : lastMiddleTurn) + delta * phaseStep);
+                let turned = wrapPhase (middleTurn - float (pi) * delta);
+                let angle = middleTurn - float (pi) * float (move);
 
                 e.peakMove.at (p) = move;
                 e.peakDelta.at (p) = delta;

@@ -3,8 +3,9 @@
     The GUI for Smear. Under the wordmark and Freeze (which freezes all three bands), the
     output's spectrum is drawn as it plays, from 30Hz on the left to 16kHz on the right,
     with the two crossovers on it as lines you can drag. Below that are the three bands'
-    controls side by side, then the crossovers, the scale the spectrum is pulled towards,
-    and the output (with how much of each hit is kept clean, and minimum phase).
+    controls side by side, then the crossovers, the scale the spectrum is pulled towards
+    (with a switch to the Classic Pull algorithm), and the output (with how much of each
+    hit is kept clean, and minimum phase).
     Parameter ranges and defaults come from the patch's own annotations.
 */
 
@@ -13,7 +14,8 @@ const bandParams = [["Smear", "Smear"], ["Shift", "Shift"], ["Peaks", "Peaks"], 
 
 const globalModules = [
     { title: "Crossovers", params: [["lowCross", "Low"], ["highCross", "High"]] },
-    { title: "Scale",      params: [["magnet", "Pull"], ["key", "Key"], ["scale", "Scale"]] },
+    { title: "Scale",      params: [["magnet", "Pull"], ["key", "Key"], ["scale", "Scale"]],
+      toggle: { id: "pullMode", label: "Classic", title: "Classic Pull: the original algorithm, which pulls every partial on its own for a grainier, more obviously tuned sound" } },
     { title: "Output",     params: [["transients", "Transients"], ["tilt", "Tilt"], ["mix", "Mix"], ["volume", "Output"]],
       toggle: { id: "phaseMode", label: "Min Phase", title: "Minimum phase: ringing from the reshaping comes after a hit instead of before it" } }
 ];
