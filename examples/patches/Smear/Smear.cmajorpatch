@@ -1,0 +1,20 @@
+{
+    "CmajorVersion":    1,
+    "ID":               "dev.cmajor.examples.smear",
+    "version":          "1.0",
+    "name":             "Smear",
+    "description":      "Multiband spectral effect: freeze, smear, shift, thin to the peaks and scatter the phases of the lows, mids and highs separately",
+    "category":         "effect",
+    "manufacturer":     "Cmajor Software Ltd",
+    "isInstrument":     false,
+    "latencySamples":   2304,
+
+    "source":           "Smear.cmajor",
+
+    "view":             {
+                            "src": "view/index.js",
+                            "width": 1040,
+                            "height": 640,
+                            "resizable": true
+                        }
+}

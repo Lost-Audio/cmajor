@@ -1,0 +1,772 @@
+/**
+    Smear - a multiband spectral effect for drums, rumbles and anything else.
+
+    The input is cut into overlapping 2048-sample frames, turned into a spectrum, reshaped,
+    and turned back into sound. Each bin's true frequency is measured from how far its
+    phase moved since the last frame (a phase vocoder), which is what lets the spectrum be
+    shifted in pitch and frozen into a steady drone without going rough.
+
+    The spectrum is split into three bands (low, mid and high) by two crossovers with soft
+    edges, and each band is reshaped on its own: Freeze holds it and keeps playing it, Smear
+    blurs every bin's level over time, Shift moves it up or down, Peaks throws away all but
+    its loudest bins, Scatter randomises its phases so it turns breathy and diffuse, and
+    Level sets how loud it comes back. Pull drags every partial towards the nearest note of
+    the chosen key and scale, so even a drum loop ends up tuned. Tilt then leans the whole
+    balance towards the lows or highs without changing the loudness.
+
+    Alongside the long frames runs a short 256-sample FFT that picks out onsets as they arrive.
+    Transients sets how much of them goes around the long frames and is added back untouched,
+    so hits stay sharp however smeared or frozen the rest is. Phase on Minimum makes any
+    ringing from the reshaping come after a hit instead of before it.
+
+    With everything at neutral it passes the sound straight through, 2304 samples late (the
+    dry signal is delayed to match, so Mix doesn't comb-filter).
+*/
+
+processor Smear  [[ main ]]
+{
+    input stream float<2> in;
+    output stream float<2> out;
+    output event smear::Spectrum spectrumOut;   // the output's spectrum, about 45 times a second, for the GUI
+
+    input value float lowCross     [[ name: "Low Crossover",  min: 40,  max: 1000,  init: 200,  unit: "Hz" ]];
+    input value float highCross    [[ name: "High Crossover", min: 500, max: 10000, init: 2500, unit: "Hz" ]];
+
+    input value int   lowFreeze    [[ name: "Low Freeze",     min: 0,   max: 1,     init: 0,    text: "Off|On" ]];
+    input value float lowSmear     [[ name: "Low Smear",      min: 0,   max: 1,     init: 0.3 ]];
+    input value float lowShift     [[ name: "Low Shift",      min: -24, max: 24,    init: 0,    unit: "st" ]];
+    input value float lowPeaks     [[ name: "Low Peaks",      min: 0,   max: 1,     init: 0 ]];
+    input value float lowScatter   [[ name: "Low Scatter",    min: 0,   max: 1,     init: 0 ]];
+    input value float lowLevel     [[ name: "Low Level",      min: -36, max: 12,    init: 0,    unit: "dB" ]];
+
+    input value int   midFreeze    [[ name: "Mid Freeze",     min: 0,   max: 1,     init: 0,    text: "Off|On" ]];
+    input value float midSmear     [[ name: "Mid Smear",      min: 0,   max: 1,     init: 0.3 ]];
+    input value float midShift     [[ name: "Mid Shift",      min: -24, max: 24,    init: 0,    unit: "st" ]];
+    input value float midPeaks     [[ name: "Mid Peaks",      min: 0,   max: 1,     init: 0 ]];
+    input value float midScatter   [[ name: "Mid Scatter",    min: 0,   max: 1,     init: 0 ]];
+    input value float midLevel     [[ name: "Mid Level",      min: -36, max: 12,    init: 0,    unit: "dB" ]];
+
+    input value int   highFreeze   [[ name: "High Freeze",    min: 0,   max: 1,     init: 0,    text: "Off|On" ]];
+    input value float highSmear    [[ name: "High Smear",     min: 0,   max: 1,     init: 0.3 ]];
+    input value float highShift    [[ name: "High Shift",     min: -24, max: 24,    init: 0,    unit: "st" ]];
+    input value float highPeaks    [[ name: "High Peaks",     min: 0,   max: 1,     init: 0 ]];
+    input value float highScatter  [[ name: "High Scatter",   min: 0,   max: 1,     init: 0 ]];
+    input value float highLevel    [[ name: "High Level",     min: -36, max: 12,    init: 0,    unit: "dB" ]];
+
+    input value float magnet       [[ name: "Pull",           min: 0,   max: 1,     init: 0 ]];
+    input value int   key          [[ name: "Key",            min: 0,   max: 11,    init: 0,    text: "C|C#|D|D#|E|F|F#|G|G#|A|A#|B" ]];
+    input value int   scale        [[ name: "Scale",          min: 0,   max: 11,    init: 1,    text: "Major|Minor|Dorian|Phrygian|Lydian|Mixolydian|Harm Minor|Pent Major|Pent Minor|Whole Tone|Fifths|Octaves" ]];
+
+    input value float transients   [[ name: "Transients",     min: 0,   max: 1,     init: 0.5 ]];
+    input value int   phaseMode    [[ name: "Phase",          min: 0,   max: 1,     init: 1,    text: "Original|Minimum" ]];
+    input value float tilt         [[ name: "Tilt",           min: -12, max: 12,    init: 0,    unit: "dB/oct" ]];
+    input value float mix          [[ name: "Mix",            min: 0,   max: 1,     init: 1 ]];
+    input value float volume       [[ name: "Output",         min: -24, max: 12,    init: 0,    unit: "dB" ]];
+
+    processor.latency = smear::fftSize + smear::shortSize;
+
+    //==============================================================================
+    let fftSize = smear::fftSize;
+    let numBands = smear::numBands;
+    let hopSize = fftSize / 4;
+    let numBins = fftSize / 2 + 1;
+    let nyquist = fftSize / 2;
+    let colaGain = 2.0f / 3.0f;                                  // Hann in and out at 75% overlap sums to 1.5
+    let phaseStep = float (twoPi) * float (hopSize) / float (fftSize);   // how far a bin-centred tone's phase moves per hop
+
+    smear::Channel left, right;
+    float[fftSize] window;
+    float[numBins] tiltGains;
+    float lastTilt = 1000.0f;
+
+    // how much of each bin belongs to each band; the three always add up to 1
+    float[numBands, numBins] bandWeights;
+    float lastLowCross, lastHighCross;
+
+    // this frame's settings for each band, gathered from the inputs
+    smear::BandSettings[numBands] settings;
+
+    // scratch for one channel's frame: what was measured, then where shift moves one band of it
+    float[numBins] measuredLevel, measuredBin, measuredPhase, shiftedLevel, shiftedBin, shiftedPeak, shiftedPhase;
+
+    // Minimum phase: whatever a frame's reshaping did to the levels is treated as a filter,
+    // and that filter's minimum phase is added to the original phases, so the ringing a
+    // sharp change makes comes after a hit instead of before it
+    float[numBins] logGain, minimumPhase;
+    bool[numBins] hasOriginalPhase;
+    float[fftSize] cepstrum, cepstrumSpectrum;
+
+    // The transient splitter: a short FFT that picks out onsets as they arrive, so they can
+    // go around the long frames (which would smear them backwards in time) and be added
+    // back untouched
+    let shortSize = smear::shortSize;
+    let shortHop = shortSize / 4;
+    let shortBins = shortSize / 2 + 1;
+    smear::ShortChannel leftShort, rightShort;
+    float[shortSize] shortWindow;
+    float[shortBins] onsetFast, onsetSlow, onsetMask, fastCoefficient, slowCoefficient, maskDecay;
+    wrap<shortSize> shortPosition;
+    int shortCountdown = shortHop;
+    float keepAmount;
+
+    std::random::RNG rng;
+    wrap<fftSize> position;
+    int hopCountdown = hopSize;
+    int framesUntilSpectrum;
+    float gain = 1.0f;
+
+    // Level matching: smearing, scattering and thinning all lose level (frames whose phases
+    // don't line up partly cancel as they overlap), so the wet signal is slowly brought back
+    // to the dry signal's level, times whatever the band levels ask for. While every band is
+    // frozen it holds, so the drone doesn't swell up when the input stops.
+    float dryPower, wetPower, levelMatch = 1.0f, wetLimit = 1.0f, intendedPower = 1.0f;
+
+    //==============================================================================
+    void main()
+    {
+        rng.seed (777L);
+
+        for (wrap<fftSize> i)
+            window[i] = 0.5f - 0.5f * cos (float (twoPi) * float (i) / float (fftSize));
+
+        for (wrap<shortSize> i)
+            shortWindow[i] = 0.5f - 0.5f * cos (float (twoPi) * float (i) / float (shortSize));
+
+        setUpOnsetDetector();
+
+        let powerCoefficient = 1.0f - exp (-1.0f / (0.4f * float (processor.frequency)));
+        let limitRelease = 1.0f - exp (-1.0f / (0.1f * float (processor.frequency)));
+
+        loop
+        {
+            // The splitter: what went in shortSize samples ago, and the onsets picked out of it
+            let delayedIn = float<2> (leftShort.incoming[shortPosition], rightShort.incoming[shortPosition]);
+            let onset = float<2> (leftShort.outgoing[shortPosition], rightShort.outgoing[shortPosition]);
+
+            leftShort.incoming[shortPosition] = in[0];
+            rightShort.incoming[shortPosition] = in[1];
+            leftShort.outgoing[shortPosition] = 0.0f;
+            rightShort.outgoing[shortPosition] = 0.0f;
+
+            // the kept onsets go around the long frames, and the rest goes through them
+            keepAmount += (transients - keepAmount) * 0.001f;
+            let kept = onset * keepAmount;
+            let steady = delayedIn - kept;
+
+            // what went in fftSize samples before that is about to be overwritten: it's the
+            // dry signal, lined up with the wet one
+            let steadyDry = float<2> (left.incoming[position], right.incoming[position]);
+            let keptDry = float<2> (left.kept[position], right.kept[position]);
+            let dry = steadyDry + keptDry;
+            let wet = float<2> (left.outgoing[position], right.outgoing[position]);
+
+            left.incoming[position] = steady[0];
+            right.incoming[position] = steady[1];
+            left.kept[position] = kept[0];
+            right.kept[position] = kept[1];
+            left.outgoing[position] = 0.0f;
+            right.outgoing[position] = 0.0f;
+
+            if (lowFreeze == 0 || midFreeze == 0 || highFreeze == 0)
+            {
+                dryPower += (steadyDry[0] * steadyDry[0] + steadyDry[1] * steadyDry[1] - dryPower) * powerCoefficient;
+                wetPower += (wet[0] * wet[0] + wet[1] * wet[1] - wetPower) * powerCoefficient;
+
+                // only while there's something to match, never boosting by more than 6dB, and
+                // rising slowly so a sound that's still fading in doesn't get pushed too far
+                if (dryPower > 1.0e-8f && wetPower > 1.0e-10f)
+                {
+                    let target = clamp (sqrt (dryPower * intendedPower / wetPower), 0.25f, 2.0f);
+                    levelMatch += (target - levelMatch) * (target > levelMatch ? 0.00005f : 0.001f);
+                }
+            }
+
+            // smeared and scattered sound peaks higher for the same level, so the wet signal
+            // has a limiter: instant when it would go over, letting go over about 100ms
+            let matchedWet = wet * levelMatch;
+            let wetPeak = max (abs (matchedWet[0]), abs (matchedWet[1]));
+            wetLimit = wetPeak * wetLimit > 1.0f ? 1.0f / wetPeak : wetLimit + (1.0f - wetLimit) * limitRelease;
+
+            gain += (pow (10.0f, volume / 20.0f) - gain) * 0.001f;
+            out <- (dry * (1.0f - mix) + (matchedWet * wetLimit + keptDry) * mix) * gain;
+
+            ++shortPosition;
+
+            if (--shortCountdown <= 0)
+            {
+                shortCountdown = shortHop;
+                splitOnsets();
+            }
+
+            ++position;
+
+            if (--hopCountdown <= 0)
+            {
+                hopCountdown = hopSize;
+                renderFrame();
+            }
+
+            advance();
+        }
+    }
+
+    //==============================================================================
+    void renderFrame()
+    {
+        if (tilt != lastTilt)
+            updateTiltGains();
+
+        if (lowCross != lastLowCross || highCross != lastHighCross)
+            updateBandWeights();
+
+        gatherSettings();
+
+        processChannel (left);
+        processChannel (right);
+
+        if (--framesUntilSpectrum <= 0)
+        {
+            framesUntilSpectrum = 2;
+            sendSpectrum();
+        }
+    }
+
+    void gatherSettings()
+    {
+        settings[0] = smear::makeSettings (lowFreeze,  lowSmear,  lowShift,  lowPeaks,  lowScatter,  lowLevel,  processor.frequency);
+        settings[1] = smear::makeSettings (midFreeze,  midSmear,  midShift,  midPeaks,  midScatter,  midLevel,  processor.frequency);
+        settings[2] = smear::makeSettings (highFreeze, highSmear, highShift, highPeaks, highScatter, highLevel, processor.frequency);
+
+        // Unless a band is frozen, shifted or pulled, its original phases are kept, so the
+        // sound stays tight; otherwise each bin's phase runs on at its measured frequency
+        for (wrap<numBands> b)
+            settings[b].isPlain = ! settings[b].isFrozen && abs (settings[b].shiftRatio - 1.0f) < 0.0005f && magnet <= 0.0f;
+    }
+
+    //==============================================================================
+    // The detector is ResoChecker's onset recovery: each bin's energy (with its neighbours,
+    // about 150Hz either side) is followed by a fast and a slow average, and when the fast
+    // one jumps well above the slow one that bin is an onset. The mask opens at once and
+    // closes over a little under a cycle of the bin's frequency, never quicker than 8ms.
+    void setUpOnsetDetector()
+    {
+        let binWidth = float (processor.frequency) / float (shortSize);
+        let hopSeconds = float (shortHop) / float (processor.frequency);
+
+        for (wrap<shortBins> k)
+        {
+            let frequency = max (40.0f, float (int (k)) * binWidth);
+            fastCoefficient[k] = 1.0f - exp (-hopSeconds / max (0.25f / frequency, 0.001f));
+            slowCoefficient[k] = 1.0f - exp (-hopSeconds / max (3.0f / frequency, 0.02f));
+            maskDecay[k] = exp (-hopSeconds / max (0.8f / frequency, 0.008f));
+        }
+    }
+
+    void splitOnsets()
+    {
+        analyseShort (leftShort);
+        analyseShort (rightShort);
+
+        let shortNyquist = shortSize / 2;
+        let radius = max (1, int (150.0f * float (shortSize) / float (processor.frequency) + 0.5f));
+        let normalise = 4.0f / float (shortSize * shortSize);
+
+        float[shortBins] energy;
+
+        for (wrap<shortBins> k)
+        {
+            let bin = int (k);
+            energy[k] = (smear::powerAt (leftShort.spectrum, bin, shortNyquist) + smear::powerAt (rightShort.spectrum, bin, shortNyquist)) * normalise;
+        }
+
+        for (wrap<shortBins> k)
+        {
+            let bin = int (k);
+            let low = max (0, bin - radius);
+            let high = min (shortNyquist, bin + radius);
+            float sum;
+
+            for (int i = low; i <= high; ++i)
+                sum += energy.at (i);
+
+            let level = sum / float (high - low + 1);
+            onsetFast[k] += (level - onsetFast[k]) * fastCoefficient[k];
+
+            // compared with the slow average from before this hop, or a coarse hop could
+            // swallow the whole attack
+            let ratio = sqrt (onsetFast[k] / max (onsetSlow[k], 1.0e-12f));
+            let rise = clamp ((ratio - 1.4f) / 2.6f, 0.0f, 1.0f);
+            let target = onsetFast[k] > 1.0e-8f ? rise * rise * (3.0f - 2.0f * rise) : 0.0f;
+
+            onsetMask[k] = max (target, onsetMask[k] * maskDecay[k]);
+            onsetSlow[k] += (level - onsetSlow[k]) * slowCoefficient[k];
+        }
+
+        resynthesiseShort (leftShort);
+        resynthesiseShort (rightShort);
+    }
+
+    void analyseShort (smear::ShortChannel& c)
+    {
+        wrap<shortSize> source = shortPosition;
+
+        for (wrap<shortSize> i)
+        {
+            c.frame[i] = c.incoming[source] * shortWindow[i];
+            ++source;
+        }
+
+        std::frequency::realOnlyForwardFFT (c.frame, c.spectrum);
+    }
+
+    // Keeps only the onsets (each bin times its mask) and adds them into the splitter's output
+    void resynthesiseShort (smear::ShortChannel& c)
+    {
+        let shortNyquist = shortSize / 2;
+
+        for (wrap<shortBins> k)
+        {
+            let bin = int (k);
+            c.spectrum.at (bin) *= onsetMask[k];
+
+            if (bin > 0 && bin < shortNyquist)
+                c.spectrum.at (shortNyquist + bin) *= onsetMask[k];
+        }
+
+        std::frequency::realOnlyInverseFFT (c.spectrum, c.frame);
+
+        wrap<shortSize> target = shortPosition;
+
+        for (wrap<shortSize> i)
+        {
+            c.outgoing[target] += c.frame[i] * shortWindow[i] * colaGain;
+            ++target;
+        }
+    }
+
+    void processChannel (smear::Channel& c)
+    {
+        // the frame ends at the newest sample, which is just behind `position`
+        wrap<fftSize> source = position;
+
+        for (wrap<fftSize> i)
+        {
+            c.frame[i] = c.incoming[source] * window[i];
+            ++source;
+        }
+
+        std::frequency::realOnlyForwardFFT (c.frame, c.spectrum);
+        measure (c);
+
+        for (wrap<numBands> b)
+            processBand (c.bands[b], b);
+
+        resynthesise (c);
+    }
+
+    // Measures every bin's level and its true frequency (in bins), from how far its phase
+    // moved since the last frame compared with where a bin-centred tone would be
+    void measure (smear::Channel& c)
+    {
+        for (wrap<numBins> k)
+        {
+            let bin = int (k);
+            let real = c.spectrum.at (bin);
+            let imag = bin > 0 && bin < nyquist ? c.spectrum.at (nyquist + bin) : 0.0f;
+            let phase = atan2 (imag, real);
+            let deviation = smear::wrapPhase (phase - c.lastPhase[k] - phaseStep * float (bin));
+
+            c.lastPhase[k] = phase;
+            measuredLevel[k] = sqrt (real * real + imag * imag);
+            measuredBin[k] = float (bin) + deviation / phaseStep;
+            measuredPhase[k] = phase;
+        }
+    }
+
+    // One band's share of the spectrum: shifted, thinned, then smeared into (or held in)
+    // its running levels, with its phases either kept or run on at their measured frequencies
+    void processBand (smear::BandState& band, wrap<numBands> b)
+    {
+        let s = settings[b];
+        shiftBand (b, s.shiftRatio);
+        keepPeaks (s.peaks);
+
+        for (wrap<numBins> k)
+        {
+            if (! s.isFrozen)
+            {
+                band.level[k] = shiftedLevel[k] + (band.level[k] - shiftedLevel[k]) * s.smearCoefficient;
+                band.binFrequency[k] = shiftedBin[k];
+            }
+
+            band.phase[k] = s.isPlain ? shiftedPhase[k] : smear::wrapPhase (band.phase[k] + phaseStep * band.binFrequency[k]);
+        }
+    }
+
+    // Moves a band's bins to their shifted places, then pulls each towards the nearest note of
+    // the scale. A bin is pulled by how far its measured frequency is from that note, so every
+    // bin of one partial moves together and the partial keeps its shape. Where several land on
+    // one bin their levels add, and the loudest one decides its frequency and phase.
+    void shiftBand (wrap<numBands> b, float ratio)
+    {
+        let mask = smear::scaleMask (scale);
+        let binWidth = float (processor.frequency) / float (fftSize);
+
+        for (wrap<numBins> k)
+        {
+            shiftedLevel[k] = 0.0f;
+            shiftedPeak[k] = 0.0f;
+            shiftedBin[k] = float (int (k));
+            shiftedPhase[k] = 0.0f;
+        }
+
+        for (wrap<numBins> k)
+        {
+            let level = measuredLevel[k] * bandWeights[b, k];
+
+            if (level <= 0.0f)
+                continue;
+
+            let movedBin = measuredBin[k] * ratio;
+            let pull = smear::pullTowardsScale (movedBin * binWidth, key, mask, magnet);
+            let target = int (float (int (k)) * ratio * pull + 0.5f);
+
+            if (target < 0 || target > nyquist)
+                continue;
+
+            let t = wrap<numBins> (target);
+            shiftedLevel[t] += level;
+
+            if (level > shiftedPeak[t])
+            {
+                shiftedPeak[t] = level;
+                shiftedBin[t] = movedBin * pull;
+                shiftedPhase[t] = measuredPhase[k];
+            }
+        }
+    }
+
+    // Peaks: everything quieter than a threshold below the band's loudest bin goes. At 0
+    // nothing goes; at 1 only what's within 6dB of the loudest is left.
+    void keepPeaks (float peaks)
+    {
+        if (peaks <= 0.0f)
+            return;
+
+        float loudest = 0.0f;
+
+        for (wrap<numBins> k)
+            loudest = max (loudest, shiftedLevel[k]);
+
+        let threshold = loudest * pow (10.0f, (-80.0f + 74.0f * peaks) / 20.0f);
+
+        for (wrap<numBins> k)
+            if (shiftedLevel[k] < threshold)
+                shiftedLevel[k] = 0.0f;
+    }
+
+    // Adds the bands back together (each at its level, taking the loudest band's phase, with
+    // scatter if asked), tilts the result, turns it back into sound and adds it into the output
+    void resynthesise (smear::Channel& c)
+    {
+        float before, after, unlevelled, levelled;
+
+        for (wrap<numBins> k)
+        {
+            float level, plainLevel, loudest;
+            float phase;
+            bool isOriginal;
+
+            for (wrap<numBands> b)
+            {
+                let bandLevel = c.bands[b].level[k];
+                let scaled = bandLevel * settings[b].gain;
+                level += scaled;
+                plainLevel += bandLevel;
+
+                if (scaled > loudest)
+                {
+                    loudest = scaled;
+                    phase = c.bands[b].phase[k] + settings[b].scatter * float (pi) * rng.getBipolar();
+                    isOriginal = settings[b].isPlain;
+                }
+            }
+
+            // how much this bin's level changed, as a filter would have changed it. Bins that
+            // Peaks emptied are left out: they make no sound, and their deep notches would only
+            // throw their neighbours' phases about.
+            let incoming = measuredLevel[k];
+            logGain[k] = incoming > 1.0e-9f && level > 0.0f ? clamp (log (level / incoming * tiltGains[k]), -12.0f, 4.0f) : 0.0f;
+            hasOriginalPhase[k] = isOriginal;
+
+            measuredLevel[k] = level;   // reused as the combined level from here on
+            measuredPhase[k] = phase;
+
+            let weight = int (k) > 0 && int (k) < nyquist ? 2.0f : 1.0f;
+            before += level * level * weight;
+            after += level * level * weight * tiltGains[k] * tiltGains[k];
+            unlevelled += plainLevel * plainLevel * weight;
+            levelled += level * level * weight;
+        }
+
+        // the level matcher aims for the dry level times what the band levels ask for
+        if (unlevelled > 1.0e-20f)
+            intendedPower += (levelled / unlevelled - intendedPower) * 0.2f;
+
+        // tilt changes the colour, not the loudness
+        let normalise = before > 1.0e-20f && after > 1.0e-20f ? sqrt (before / after) : 1.0f;
+        let useMinimumPhase = phaseMode != 0;
+
+        if (useMinimumPhase)
+            findMinimumPhase();
+
+        for (wrap<numBins> k)
+        {
+            let bin = int (k);
+            let level = measuredLevel[k] * tiltGains[k] * normalise;
+            let phase = useMinimumPhase && hasOriginalPhase[k] ? measuredPhase[k] + minimumPhase[k] : measuredPhase[k];
+
+            c.displayLevel[k] = level;
+            c.spectrum.at (bin) = level * cos (phase);
+
+            if (bin > 0 && bin < nyquist)
+                c.spectrum.at (nyquist + bin) = level * sin (phase);
+        }
+
+        std::frequency::realOnlyInverseFFT (c.spectrum, c.frame);
+
+        wrap<fftSize> target = position;
+
+        for (wrap<fftSize> i)
+        {
+            c.outgoing[target] += c.frame[i] * window[i] * colaGain;
+            ++target;
+        }
+    }
+
+    // The minimum phase of the gain curve in logGain, from its cepstrum: the cepstrum's
+    // negative-time half is folded onto its positive half, and what that turns into
+    // (back in the frequency domain) is the log of a filter with the same levels whose
+    // response all comes after time zero. Its imaginary part is that filter's phase.
+    void findMinimumPhase()
+    {
+        for (wrap<numBins> k)
+        {
+            let bin = int (k);
+            cepstrumSpectrum.at (bin) = logGain[k];
+
+            if (bin > 0 && bin < nyquist)
+                cepstrumSpectrum.at (nyquist + bin) = 0.0f;
+        }
+
+        std::frequency::realOnlyInverseFFT (cepstrumSpectrum, cepstrum);
+
+        for (wrap<fftSize> i)
+        {
+            let n = int (i);
+
+            if (n > 0 && n < nyquist)
+                cepstrum[i] *= 2.0f;
+            else if (n > nyquist)
+                cepstrum[i] = 0.0f;
+        }
+
+        std::frequency::realOnlyForwardFFT (cepstrum, cepstrumSpectrum);
+
+        for (wrap<numBins> k)
+        {
+            let bin = int (k);
+            minimumPhase[k] = bin > 0 && bin < nyquist ? cepstrumSpectrum.at (nyquist + bin) : 0.0f;
+        }
+    }
+
+    //==============================================================================
+    // A gain per bin for the tilt, pivoting around 1kHz
+    void updateTiltGains()
+    {
+        lastTilt = tilt;
+        let binWidth = float (processor.frequency) / float (fftSize);
+
+        for (wrap<numBins> k)
+        {
+            let frequency = max (20.0f, float (max (1, int (k))) * binWidth);
+            tiltGains[k] = pow (10.0f, tilt * log (frequency / 1000.0f) / log (2.0f) / 20.0f);
+        }
+    }
+
+    // Splits the bins between the bands. Each crossover fades over a third of an octave either
+    // side, and the high one is kept at least half an octave above the low one.
+    void updateBandWeights()
+    {
+        lastLowCross = lowCross;
+        lastHighCross = highCross;
+
+        let binWidth = float (processor.frequency) / float (fftSize);
+        let lowOctave = log (max (lowCross, 20.0f)) / log (2.0f);
+        let highOctave = max (log (max (highCross, 20.0f)) / log (2.0f), lowOctave + 0.5f);
+
+        for (wrap<numBins> k)
+        {
+            let octave = log (max (float (int (k)) * binWidth, 10.0f)) / log (2.0f);
+            let aboveLow = smear::fade ((octave - lowOctave) * 1.5f);
+            let aboveHigh = smear::fade ((octave - highOctave) * 1.5f);
+
+            bandWeights[0, k] = 1.0f - aboveLow;
+            bandWeights[1, k] = aboveLow - aboveHigh;
+            bandWeights[2, k] = aboveHigh;
+        }
+    }
+
+    // The output's spectrum in log-spaced bands from 30Hz to 16kHz, each 0 (-84dB or
+    // quieter) to 1 (0dB), averaging the two channels
+    void sendSpectrum()
+    {
+        smear::Spectrum s;
+        let binWidth = float (processor.frequency) / float (fftSize);
+
+        for (wrap<smear::numDisplayBands> band)
+        {
+            let low = 30.0f * pow (16000.0f / 30.0f, float (int (band)) / float (smear::numDisplayBands));
+            let high = 30.0f * pow (16000.0f / 30.0f, float (int (band) + 1) / float (smear::numDisplayBands));
+            let firstBin = clamp (int (low / binWidth), 1, nyquist);
+            let lastBin = clamp (int (high / binWidth), firstBin, nyquist);
+            float level;
+
+            for (int bin = firstBin; bin <= lastBin; ++bin)
+            {
+                let k = wrap<numBins> (bin);
+                level = max (level, (left.displayLevel[k] + right.displayLevel[k]) * 0.5f);
+            }
+
+            let decibels = 20.0f * log10 (max (level * 2.0f / float (fftSize), 1.0e-6f));
+            s.bands[band] = clamp ((decibels + 84.0f) / 84.0f, 0.0f, 1.0f);
+        }
+
+        spectrumOut <- s;
+    }
+}
+
+//==============================================================================
+namespace smear
+{
+    let fftSize = 2048;
+    let numBands = 3;
+    let numDisplayBands = 64;
+    let shortSize = 256;
+
+    /// One band's running state for one channel
+    struct BandState
+    {
+        float[fftSize / 2 + 1] level, binFrequency, phase;
+    }
+
+    /// One channel's buffers and running state
+    struct Channel
+    {
+        float[fftSize] incoming, outgoing, kept, frame, spectrum;
+        float[fftSize / 2 + 1] lastPhase, displayLevel;
+        BandState[numBands] bands;
+    }
+
+    /// One channel of the transient splitter's short frames
+    struct ShortChannel
+    {
+        float[shortSize] incoming, outgoing, frame, spectrum;
+    }
+
+    /// The power of one bin of a spectrum laid out as realOnlyForwardFFT leaves it
+    float powerAt (const float[shortSize]& spectrum, int bin, int nyquist)
+    {
+        let real = spectrum.at (bin);
+        let imag = bin > 0 && bin < nyquist ? spectrum.at (nyquist + bin) : 0.0f;
+        return real * real + imag * imag;
+    }
+
+    /// One band's settings for a frame, worked out from its controls
+    struct BandSettings
+    {
+        bool isFrozen;
+        float smearCoefficient, shiftRatio, peaks, scatter, gain;
+        bool isPlain;
+    }
+
+    BandSettings makeSettings (int freeze, float smear, float shift, float peaks, float scatter, float levelDecibels, float64 sampleRate)
+    {
+        BandSettings s;
+        let smearSeconds = 4.0f * smear * smear;   // up to 4 seconds, with finer control at the short end
+
+        s.isFrozen = freeze != 0;
+        s.smearCoefficient = smearSeconds > 0.001f ? exp (-float (fftSize / 4) / (smearSeconds * float (sampleRate))) : 0.0f;
+        s.shiftRatio = pow (2.0f, shift / 12.0f);
+        s.peaks = peaks;
+        s.scatter = scatter;
+        s.gain = levelDecibels <= -35.9f ? 0.0f : pow (10.0f, levelDecibels / 20.0f);
+        return s;
+    }
+
+    /// Which of the 12 notes above the key are in each scale, one bit per semitone
+    int scaleMask (int scale)
+    {
+        let masks = int[12] (0xab5,    // major
+                             0x5ad,    // natural minor
+                             0x6ad,    // dorian
+                             0x5ab,    // phrygian
+                             0xad5,    // lydian
+                             0x6b5,    // mixolydian
+                             0x9ad,    // harmonic minor
+                             0x295,    // major pentatonic
+                             0x4a9,    // minor pentatonic
+                             0x555,    // whole tone
+                             0x081,    // root and fifth
+                             0x001);   // root only
+
+        return masks.at (clamp (scale, 0, 11));
+    }
+
+    /// How much to multiply a frequency by to pull it towards the nearest note of the scale:
+    /// at a pull of 1 it lands on the note, at 0 it stays where it is
+    float pullTowardsScale (float frequency, int key, int mask, float amount)
+    {
+        if (amount <= 0.0f || frequency < 20.0f)
+            return 1.0f;
+
+        let semitones = 12.0f * log (frequency / 440.0f) / log (2.0f) + 69.0f - float (key);
+        let below = int (floor (semitones));
+        float nearest = semitones, distance = 100.0f;
+
+        for (int note = below - 6; note <= below + 7; ++note)
+        {
+            if (((mask >> ((note % 12 + 12) % 12)) & 1) == 0)
+                continue;
+
+            let d = abs (float (note) - semitones);
+
+            if (d < distance)
+            {
+                distance = d;
+                nearest = float (note);
+            }
+        }
+
+        return pow (2.0f, (nearest - semitones) * amount / 12.0f);
+    }
+
+    /// A smooth step from 0 (at -1 and below) to 1 (at 1 and above)
+    float fade (float x)
+    {
+        let t = clamp (x * 0.5f + 0.5f, 0.0f, 1.0f);
+        return t * t * (3.0f - 2.0f * t);
+    }
+
+    /// The output's spectrum, for the GUI
+    struct Spectrum
+    {
+        float[numDisplayBands] bands;
+    }
+
+    /// Wraps a phase into -pi..pi
+    float wrapPhase (float p)
+    {
+        return p - float (twoPi) * floor (p / float (twoPi) + 0.5f);
+    }
+}
