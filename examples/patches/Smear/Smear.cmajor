@@ -1,25 +1,34 @@
 /**
     Smear - a multiband spectral effect for drums, rumbles and anything else.
 
-    The input is cut into overlapping 2048-sample frames, turned into a spectrum, reshaped,
-    and turned back into sound. Each bin's true frequency is measured from how far its
-    phase moved since the last frame (a phase vocoder), which is what lets the spectrum be
-    shifted in pitch and frozen into a steady drone without going rough.
+    The input is cut into overlapping frames, turned into a spectrum, reshaped, and turned
+    back into sound. Each bin's true frequency is measured from how far its phase moved
+    since the last frame (a phase vocoder), which is what lets the spectrum be shifted in
+    pitch and frozen into a steady drone without going rough.
 
     The spectrum is split into three bands (low, mid and high) by two crossovers with soft
     edges, and each band is reshaped on its own: Freeze holds it and keeps playing it, Smear
     blurs every bin's level over time, Shift moves it up or down, Peaks throws away all but
     its loudest bins, Scatter randomises its phases so it turns breathy and diffuse, and
-    Level sets how loud it comes back. Pull drags every partial towards the nearest note of
-    the chosen key and scale, so even a drum loop ends up tuned. Tilt then leans the whole
-    balance towards the lows or highs without changing the loudness.
+    Level sets how loud it comes back. Pull tunes each note to the nearest note of the
+    chosen key and scale: its pitch centre moves, so vibrato and drift come through as they
+    were, its overtones move with it, and noise is left where it was. Tilt then leans the
+    whole balance towards the lows or highs without changing the loudness.
 
-    Alongside the long frames runs a short 256-sample FFT that picks out onsets as they arrive.
+    Everything below 1kHz runs on 2048-sample frames at a quarter of the sample rate, which
+    last as long as 8192 samples would at the full rate, and everything above on 2048-sample
+    frames at the full rate. A bass note's harmonics, and a chord's partials, are closer
+    together than a short frame can tell apart, so the long frames are what let them be
+    shifted and pulled one by one (the long frames also work out where every partial up to
+    about 4kHz belongs, for the short frames to follow); the short frames keep everything
+    above them quick.
+
+    Alongside them runs a short 256-sample FFT that picks out onsets as they arrive.
     Transients sets how much of them goes around the long frames and is added back untouched,
     so hits stay sharp however smeared or frozen the rest is. Phase on Minimum makes any
     ringing from the reshaping come after a hit instead of before it.
 
-    With everything at neutral it passes the sound straight through, 2304 samples late (the
+    With everything at neutral it passes the sound straight through, 8528 samples late (the
     dry signal is delayed to match, so Mix doesn't comb-filter).
 */
 
@@ -63,38 +72,45 @@ processor Smear  [[ main ]]
     input value float mix          [[ name: "Mix",            min: 0,   max: 1,     init: 1 ]];
     input value float volume       [[ name: "Output",         min: -24, max: 12,    init: 0,    unit: "dB" ]];
 
-    processor.latency = smear::fftSize + smear::shortSize;
+    processor.latency = smear::lowLatency + smear::shortSize;
 
     //==============================================================================
-    let fftSize = smear::fftSize;
-    let numBands = smear::numBands;
-    let hopSize = fftSize / 4;
-    let numBins = fftSize / 2 + 1;
-    let nyquist = fftSize / 2;
-    let colaGain = 2.0f / 3.0f;                                  // Hann in and out at 75% overlap sums to 1.5
-    let phaseStep = float (twoPi) * float (hopSize) / float (fftSize);   // how far a bin-centred tone's phase moves per hop
+    namespace frames = smear::stft (smear::fftSize);
 
-    smear::Channel left, right;
-    float[fftSize] window;
-    float[numBins] tiltGains;
-    float lastTilt = 1000.0f;
+    frames::Engine lowEngine;     // everything below smear::engineSplit, at a quarter of the sample rate
+    frames::Engine upperEngine;   // everything above it
+    smear::Controls controls;
 
-    // how much of each bin belongs to each band; the three always add up to 1
-    float[numBands, numBins] bandWeights;
-    float lastLowCross, lastHighCross;
+    // The low engine's trip down to a quarter of the sample rate and back up: the same
+    // lowpass filter takes out what would alias on the way down and the images on the way
+    // up. Going up, only every fourth sample of the stuffed signal isn't zero, so each
+    // output sample only needs one tap in four.
+    let decimation = smear::decimation;
+    let filterLength = smear::filterLength;
+    let interpolatorLength = (filterLength + decimation - 1) / decimation;
+    float[filterLength] resamplingFilter;
+    float<2>[filterLength] decimatorHistory;
+    float<2>[interpolatorLength] interpolatorHistory;
+    wrap<filterLength> decimatorPosition;
+    wrap<interpolatorLength> interpolatorPosition;
+    int samplesSinceDecimation;
 
-    // this frame's settings for each band, gathered from the inputs
-    smear::BandSettings[numBands] settings;
+    // The upper engine's input is held back so that what comes out of it lines up with the
+    // low engine's output, and so that its frames are never ahead of the low engine's, whose
+    // moves it follows
+    let upperDelay = smear::lowLatency - smear::fftSize;
+    smear::Delayed[upperDelay] upperDelayLine;
+    wrap<upperDelay> upperDelayPosition;
 
-    // scratch for one channel's frame: what was measured, then where shift moves one band of it
-    float[numBins] measuredLevel, measuredBin, measuredPhase, shiftedLevel, shiftedBin, shiftedPeak, shiftedPhase;
-
-    // Minimum phase: whatever a frame's reshaping did to the levels is treated as a filter,
-    // and that filter's minimum phase is added to the original phases, so the ringing a
-    // sharp change makes comes after a hit instead of before it
-    float[numBins] logGain, minimumPhase;
-    bool[numBins] hasOriginalPhase;
-    float[fftSize] cepstrum, cepstrumSpectrum;
+    // The sample each of the low engine's last three frames was made on (the upper engine
+    // keeps their moves), so the upper engine can blend between the two either side of its
+    // own frame. The middle of the upper engine's frame is this much further back in the
+    // input than the middle of a low frame made on the same sample (both frames' middles
+    // are half their length, less a sample, behind their newest sample).
+    let lowMovesLag = (upperDelay + smear::fftSize / 2 - 1) - ((filterLength - 1) / 2 + decimation * (smear::fftSize / 2 - 1));
+    int64[3] lowMovesMadeAt;
+    wrap<3> newestLowMoves;
+    int64 sampleCount;
 
     // The transient splitter: a short FFT that picks out onsets as they arrive, so they can
     // go around the long frames (which would smear them backwards in time) and be added
@@ -102,16 +118,15 @@ processor Smear  [[ main ]]
     let shortSize = smear::shortSize;
     let shortHop = shortSize / 4;
     let shortBins = shortSize / 2 + 1;
+    let colaGain = 2.0f / 3.0f;   // Hann in and out at 75% overlap sums to 1.5
     smear::ShortChannel leftShort, rightShort;
     float[shortSize] shortWindow;
-    float[shortBins] onsetFast, onsetSlow, onsetMask, fastCoefficient, slowCoefficient, maskDecay;
+    float[shortBins] onsetFast, onsetSlow, onsetPeak, onsetMask, fastCoefficient, slowCoefficient, peakDecay, maskDecay;
+    bool[shortBins] isRising;
     wrap<shortSize> shortPosition;
     int shortCountdown = shortHop;
     float keepAmount;
 
-    std::random::RNG rng;
-    wrap<fftSize> position;
-    int hopCountdown = hopSize;
     int framesUntilSpectrum;
     float gain = 1.0f;
 
@@ -119,15 +134,19 @@ processor Smear  [[ main ]]
     // don't line up partly cancel as they overlap), so the wet signal is slowly brought back
     // to the dry signal's level, times whatever the band levels ask for. While every band is
     // frozen it holds, so the drone doesn't swell up when the input stops.
-    float dryPower, wetPower, levelMatch = 1.0f, wetLimit = 1.0f, intendedPower = 1.0f;
+    float dryPower, wetPower, levelMatch = 1.0f, wetLimit = 1.0f;
 
     //==============================================================================
     void main()
     {
-        rng.seed (777L);
+        frames::initialise (lowEngine, true, 777L, float (processor.frequency) / float (decimation));
+        frames::initialise (upperEngine, false, 778L, float (processor.frequency));
 
-        for (wrap<fftSize> i)
-            window[i] = 0.5f - 0.5f * cos (float (twoPi) * float (i) / float (fftSize));
+        // the low engine's frames fall halfway between the upper one's, so the two never
+        // land on the same sample
+        lowEngine.hopCountdown = frames::hopSize / (2 * decimation);
+
+        designResamplingFilter();
 
         for (wrap<shortSize> i)
             shortWindow[i] = 0.5f - 0.5f * cos (float (twoPi) * float (i) / float (shortSize));
@@ -153,24 +172,27 @@ processor Smear  [[ main ]]
             let kept = onset * keepAmount;
             let steady = delayedIn - kept;
 
-            // what went in fftSize samples before that is about to be overwritten: it's the
-            // dry signal, lined up with the wet one
-            let steadyDry = float<2> (left.incoming[position], right.incoming[position]);
-            let keptDry = float<2> (left.kept[position], right.kept[position]);
-            let dry = steadyDry + keptDry;
-            let wet = float<2> (left.outgoing[position], right.outgoing[position]);
+            // The upper engine works on the input held back by upperDelay, and gives back the
+            // dry signal too (what went into it fftSize samples ago), so both line up with the
+            // low engine's output
+            let held = upperDelayLine[upperDelayPosition];
+            upperDelayLine[upperDelayPosition].steady = steady;
+            upperDelayLine[upperDelayPosition].kept = kept;
+            ++upperDelayPosition;
 
-            left.incoming[position] = steady[0];
-            right.incoming[position] = steady[1];
-            left.kept[position] = kept[0];
-            right.kept[position] = kept[1];
-            left.outgoing[position] = 0.0f;
-            right.outgoing[position] = 0.0f;
+            let steadyDry = frames::getDueInput (upperEngine);
+            let keptDry = frames::getDueKept (upperEngine);
+            let dry = steadyDry + keptDry;
+            let wet = runLowEngine (steady) + frames::exchange (upperEngine, held.steady, held.kept);
 
             if (lowFreeze == 0 || midFreeze == 0 || highFreeze == 0)
             {
                 dryPower += (steadyDry[0] * steadyDry[0] + steadyDry[1] * steadyDry[1] - dryPower) * powerCoefficient;
                 wetPower += (wet[0] * wet[0] + wet[1] * wet[1] - wetPower) * powerCoefficient;
+
+                // the level matcher aims for the dry level times what the band levels ask for
+                let unlevelled = lowEngine.unlevelled + upperEngine.unlevelled;
+                let intendedPower = unlevelled > 1.0e-20f ? (lowEngine.levelled + upperEngine.levelled) / unlevelled : 1.0f;
 
                 // only while there's something to match, never boosting by more than 6dB, and
                 // rising slowly so a sound that's still fading in doesn't get pushed too far
@@ -198,56 +220,145 @@ processor Smear  [[ main ]]
                 splitOnsets();
             }
 
-            ++position;
-
-            if (--hopCountdown <= 0)
+            if (frames::isFrameDue (upperEngine))
             {
-                hopCountdown = hopSize;
-                renderFrame();
+                gatherControls();
+                chooseLowMoves();
+                frames::renderFrame (upperEngine, controls);
+
+                if (--framesUntilSpectrum <= 0)
+                {
+                    framesUntilSpectrum = 2;
+                    sendSpectrum();
+                }
             }
 
+            ++sampleCount;
             advance();
         }
     }
 
-    //==============================================================================
-    void renderFrame()
+    // Picks the two low frames centred either side of the upper engine's frame, and how far
+    // between them it is
+    void chooseLowMoves()
     {
-        if (tilt != lastTilt)
-            updateTiltGains();
+        let wanted = sampleCount - int64 (lowMovesLag);
+        wrap<3> previous = newestLowMoves;
+        --previous;
 
-        if (lowCross != lastLowCross || highCross != lastHighCross)
-            updateBandWeights();
+        wrap<3> later = lowMovesMadeAt[previous] > wanted ? previous : newestLowMoves;
+        wrap<3> earlier = later;
+        --earlier;
 
-        gatherSettings();
-
-        processChannel (left);
-        processChannel (right);
-
-        if (--framesUntilSpectrum <= 0)
-        {
-            framesUntilSpectrum = 2;
-            sendSpectrum();
-        }
+        let spacing = float (lowMovesMadeAt[later] - lowMovesMadeAt[earlier]);
+        controls.earlierLowMoves = earlier;
+        controls.laterLowMoves = later;
+        controls.lowMovesBlend = spacing > 0.0f ? clamp (float (wanted - lowMovesMadeAt[earlier]) / spacing, 0.0f, 1.0f) : 1.0f;
+        controls.secondsAfterEarlier = float (wanted - lowMovesMadeAt[earlier]) / float (processor.frequency);
+        controls.secondsBeforeLater = float (lowMovesMadeAt[later] - wanted) / float (processor.frequency);
     }
 
-    void gatherSettings()
+    //==============================================================================
+    // Takes one sample of what goes through the long frames down to the low engine (every
+    // fourth sample), and gives back the low engine's output brought back up to the full
+    // rate. Both filters are linear-phase, so it comes out filterLength - 1 samples later
+    // than the engine alone would make it.
+    float<2> runLowEngine (float<2> steady)
     {
-        settings[0] = smear::makeSettings (lowFreeze,  lowSmear,  lowShift,  lowPeaks,  lowScatter,  lowLevel,  processor.frequency);
-        settings[1] = smear::makeSettings (midFreeze,  midSmear,  midShift,  midPeaks,  midScatter,  midLevel,  processor.frequency);
-        settings[2] = smear::makeSettings (highFreeze, highSmear, highShift, highPeaks, highScatter, highLevel, processor.frequency);
+        decimatorHistory[decimatorPosition] = steady;
 
-        // Unless a band is frozen, shifted or pulled, its original phases are kept, so the
-        // sound stays tight; otherwise each bin's phase runs on at its measured frequency
-        for (wrap<numBands> b)
-            settings[b].isPlain = ! settings[b].isFrozen && abs (settings[b].shiftRatio - 1.0f) < 0.0005f && magnet <= 0.0f;
+        if (samplesSinceDecimation == 0)
+        {
+            float<2> down;
+            wrap<filterLength> source = decimatorPosition;
+
+            for (wrap<filterLength> i)
+            {
+                down += resamplingFilter[i] * decimatorHistory[source];
+                --source;
+            }
+
+            ++interpolatorPosition;
+            interpolatorHistory[interpolatorPosition] = frames::exchange (lowEngine, down, float<2>());
+
+            if (frames::isFrameDue (lowEngine))
+            {
+                gatherControls();
+                frames::renderFrame (lowEngine, controls);
+
+                ++newestLowMoves;
+                upperEngine.recentLowMoves[newestLowMoves] = lowEngine.moves;
+                lowMovesMadeAt[newestLowMoves] = sampleCount;
+            }
+        }
+
+        float<2> up;
+        wrap<interpolatorLength> source = interpolatorPosition;
+
+        for (int i = 0; i < interpolatorLength; ++i)
+        {
+            let tap = samplesSinceDecimation + decimation * i;
+
+            if (tap < filterLength)
+                up += resamplingFilter.at (tap) * interpolatorHistory[source];
+
+            --source;
+        }
+
+        ++decimatorPosition;
+        samplesSinceDecimation = (samplesSinceDecimation + 1) % decimation;
+
+        return up * float (decimation);
+    }
+
+    // A Kaiser-windowed lowpass at an eighth of the sample rate (the quarter rate's highest
+    // frequency): flat to within 0.001dB up to 9% of the sample rate, and at least 80dB down
+    // from 16%, scaled to a gain of exactly 1 at DC
+    void designResamplingFilter()
+    {
+        let beta = 7.857f;
+        let middle = float (filterLength - 1) / 2.0f;
+        float sum;
+
+        for (wrap<filterLength> i)
+        {
+            let t = float (int (i)) - middle;
+            let x = float (pi) * t / float (decimation);
+            let sinc = abs (t) < 0.5f ? 1.0f : sin (x) / x;
+            let r = t / middle;
+
+            resamplingFilter[i] = sinc * smear::besselI0 (beta * sqrt (max (0.0f, 1.0f - r * r))) / smear::besselI0 (beta);
+            sum += resamplingFilter[i];
+        }
+
+        for (wrap<filterLength> i)
+            resamplingFilter[i] /= sum;
+    }
+
+    //==============================================================================
+    void gatherControls()
+    {
+        controls.bands[0] = smear::makeSettings (lowFreeze,  lowSmear,  lowShift,  lowPeaks,  lowScatter,  lowLevel);
+        controls.bands[1] = smear::makeSettings (midFreeze,  midSmear,  midShift,  midPeaks,  midScatter,  midLevel);
+        controls.bands[2] = smear::makeSettings (highFreeze, highSmear, highShift, highPeaks, highScatter, highLevel);
+
+        controls.lowCross = lowCross;
+        controls.highCross = highCross;
+        controls.tilt = tilt;
+        controls.magnet = magnet;
+        controls.key = key;
+        controls.scaleMask = smear::scaleMask (scale);
+        controls.useMinimumPhase = phaseMode != 0;
     }
 
     //==============================================================================
     // The detector is ResoChecker's onset recovery: each bin's energy (with its neighbours,
     // about 150Hz either side) is followed by a fast and a slow average, and when the fast
-    // one jumps well above the slow one that bin is an onset. The mask opens at once and
-    // closes over a little under a cycle of the bin's frequency, never quicker than 8ms.
+    // one jumps well above the slow one that bin is an onset. It only starts one when the
+    // energy also goes well above the most it's been lately (which lets go over at least
+    // 60ms), so a low note's own waveform, which comes round loud and quiet every cycle,
+    // isn't taken for a string of onsets. The mask opens at once and closes over a little
+    // under a cycle of the bin's frequency, never quicker than 8ms.
     void setUpOnsetDetector()
     {
         let binWidth = float (processor.frequency) / float (shortSize);
@@ -258,6 +369,7 @@ processor Smear  [[ main ]]
             let frequency = max (40.0f, float (int (k)) * binWidth);
             fastCoefficient[k] = 1.0f - exp (-hopSeconds / max (0.25f / frequency, 0.001f));
             slowCoefficient[k] = 1.0f - exp (-hopSeconds / max (3.0f / frequency, 0.02f));
+            peakDecay[k] = exp (-hopSeconds / max (3.0f / frequency, 0.06f));
             maskDecay[k] = exp (-hopSeconds / max (0.8f / frequency, 0.008f));
         }
     }
@@ -296,10 +408,17 @@ processor Smear  [[ main ]]
             // swallow the whole attack
             let ratio = sqrt (onsetFast[k] / max (onsetSlow[k], 1.0e-12f));
             let rise = clamp ((ratio - 1.4f) / 2.6f, 0.0f, 1.0f);
-            let target = onsetFast[k] > 1.0e-8f ? rise * rise * (3.0f - 2.0f * rise) : 0.0f;
+
+            if (onsetFast[k] > 1.96f * onsetPeak[k])
+                isRising[k] = true;
+            else if (rise <= 0.0f)
+                isRising[k] = false;
+
+            let target = isRising[k] && onsetFast[k] > 1.0e-8f ? rise * rise * (3.0f - 2.0f * rise) : 0.0f;
 
             onsetMask[k] = max (target, onsetMask[k] * maskDecay[k]);
             onsetSlow[k] += (level - onsetSlow[k]) * slowCoefficient[k];
+            onsetPeak[k] = max (level, onsetPeak[k] * peakDecay[k]);
         }
 
         resynthesiseShort (leftShort);
@@ -344,301 +463,21 @@ processor Smear  [[ main ]]
         }
     }
 
-    void processChannel (smear::Channel& c)
-    {
-        // the frame ends at the newest sample, which is just behind `position`
-        wrap<fftSize> source = position;
-
-        for (wrap<fftSize> i)
-        {
-            c.frame[i] = c.incoming[source] * window[i];
-            ++source;
-        }
-
-        std::frequency::realOnlyForwardFFT (c.frame, c.spectrum);
-        measure (c);
-
-        for (wrap<numBands> b)
-            processBand (c.bands[b], b);
-
-        resynthesise (c);
-    }
-
-    // Measures every bin's level and its true frequency (in bins), from how far its phase
-    // moved since the last frame compared with where a bin-centred tone would be
-    void measure (smear::Channel& c)
-    {
-        for (wrap<numBins> k)
-        {
-            let bin = int (k);
-            let real = c.spectrum.at (bin);
-            let imag = bin > 0 && bin < nyquist ? c.spectrum.at (nyquist + bin) : 0.0f;
-            let phase = atan2 (imag, real);
-            let deviation = smear::wrapPhase (phase - c.lastPhase[k] - phaseStep * float (bin));
-
-            c.lastPhase[k] = phase;
-            measuredLevel[k] = sqrt (real * real + imag * imag);
-            measuredBin[k] = float (bin) + deviation / phaseStep;
-            measuredPhase[k] = phase;
-        }
-    }
-
-    // One band's share of the spectrum: shifted, thinned, then smeared into (or held in)
-    // its running levels, with its phases either kept or run on at their measured frequencies
-    void processBand (smear::BandState& band, wrap<numBands> b)
-    {
-        let s = settings[b];
-        shiftBand (b, s.shiftRatio);
-        keepPeaks (s.peaks);
-
-        for (wrap<numBins> k)
-        {
-            if (! s.isFrozen)
-            {
-                band.level[k] = shiftedLevel[k] + (band.level[k] - shiftedLevel[k]) * s.smearCoefficient;
-                band.binFrequency[k] = shiftedBin[k];
-            }
-
-            band.phase[k] = s.isPlain ? shiftedPhase[k] : smear::wrapPhase (band.phase[k] + phaseStep * band.binFrequency[k]);
-        }
-    }
-
-    // Moves a band's bins to their shifted places, then pulls each towards the nearest note of
-    // the scale. A bin is pulled by how far its measured frequency is from that note, so every
-    // bin of one partial moves together and the partial keeps its shape. Where several land on
-    // one bin their levels add, and the loudest one decides its frequency and phase.
-    void shiftBand (wrap<numBands> b, float ratio)
-    {
-        let mask = smear::scaleMask (scale);
-        let binWidth = float (processor.frequency) / float (fftSize);
-
-        for (wrap<numBins> k)
-        {
-            shiftedLevel[k] = 0.0f;
-            shiftedPeak[k] = 0.0f;
-            shiftedBin[k] = float (int (k));
-            shiftedPhase[k] = 0.0f;
-        }
-
-        for (wrap<numBins> k)
-        {
-            let level = measuredLevel[k] * bandWeights[b, k];
-
-            if (level <= 0.0f)
-                continue;
-
-            let movedBin = measuredBin[k] * ratio;
-            let pull = smear::pullTowardsScale (movedBin * binWidth, key, mask, magnet);
-            let target = int (float (int (k)) * ratio * pull + 0.5f);
-
-            if (target < 0 || target > nyquist)
-                continue;
-
-            let t = wrap<numBins> (target);
-            shiftedLevel[t] += level;
-
-            if (level > shiftedPeak[t])
-            {
-                shiftedPeak[t] = level;
-                shiftedBin[t] = movedBin * pull;
-                shiftedPhase[t] = measuredPhase[k];
-            }
-        }
-    }
-
-    // Peaks: everything quieter than a threshold below the band's loudest bin goes. At 0
-    // nothing goes; at 1 only what's within 6dB of the loudest is left.
-    void keepPeaks (float peaks)
-    {
-        if (peaks <= 0.0f)
-            return;
-
-        float loudest = 0.0f;
-
-        for (wrap<numBins> k)
-            loudest = max (loudest, shiftedLevel[k]);
-
-        let threshold = loudest * pow (10.0f, (-80.0f + 74.0f * peaks) / 20.0f);
-
-        for (wrap<numBins> k)
-            if (shiftedLevel[k] < threshold)
-                shiftedLevel[k] = 0.0f;
-    }
-
-    // Adds the bands back together (each at its level, taking the loudest band's phase, with
-    // scatter if asked), tilts the result, turns it back into sound and adds it into the output
-    void resynthesise (smear::Channel& c)
-    {
-        float before, after, unlevelled, levelled;
-
-        for (wrap<numBins> k)
-        {
-            float level, plainLevel, loudest;
-            float phase;
-            bool isOriginal;
-
-            for (wrap<numBands> b)
-            {
-                let bandLevel = c.bands[b].level[k];
-                let scaled = bandLevel * settings[b].gain;
-                level += scaled;
-                plainLevel += bandLevel;
-
-                if (scaled > loudest)
-                {
-                    loudest = scaled;
-                    phase = c.bands[b].phase[k] + settings[b].scatter * float (pi) * rng.getBipolar();
-                    isOriginal = settings[b].isPlain;
-                }
-            }
-
-            // how much this bin's level changed, as a filter would have changed it. Bins that
-            // Peaks emptied are left out: they make no sound, and their deep notches would only
-            // throw their neighbours' phases about.
-            let incoming = measuredLevel[k];
-            logGain[k] = incoming > 1.0e-9f && level > 0.0f ? clamp (log (level / incoming * tiltGains[k]), -12.0f, 4.0f) : 0.0f;
-            hasOriginalPhase[k] = isOriginal;
-
-            measuredLevel[k] = level;   // reused as the combined level from here on
-            measuredPhase[k] = phase;
-
-            let weight = int (k) > 0 && int (k) < nyquist ? 2.0f : 1.0f;
-            before += level * level * weight;
-            after += level * level * weight * tiltGains[k] * tiltGains[k];
-            unlevelled += plainLevel * plainLevel * weight;
-            levelled += level * level * weight;
-        }
-
-        // the level matcher aims for the dry level times what the band levels ask for
-        if (unlevelled > 1.0e-20f)
-            intendedPower += (levelled / unlevelled - intendedPower) * 0.2f;
-
-        // tilt changes the colour, not the loudness
-        let normalise = before > 1.0e-20f && after > 1.0e-20f ? sqrt (before / after) : 1.0f;
-        let useMinimumPhase = phaseMode != 0;
-
-        if (useMinimumPhase)
-            findMinimumPhase();
-
-        for (wrap<numBins> k)
-        {
-            let bin = int (k);
-            let level = measuredLevel[k] * tiltGains[k] * normalise;
-            let phase = useMinimumPhase && hasOriginalPhase[k] ? measuredPhase[k] + minimumPhase[k] : measuredPhase[k];
-
-            c.displayLevel[k] = level;
-            c.spectrum.at (bin) = level * cos (phase);
-
-            if (bin > 0 && bin < nyquist)
-                c.spectrum.at (nyquist + bin) = level * sin (phase);
-        }
-
-        std::frequency::realOnlyInverseFFT (c.spectrum, c.frame);
-
-        wrap<fftSize> target = position;
-
-        for (wrap<fftSize> i)
-        {
-            c.outgoing[target] += c.frame[i] * window[i] * colaGain;
-            ++target;
-        }
-    }
-
-    // The minimum phase of the gain curve in logGain, from its cepstrum: the cepstrum's
-    // negative-time half is folded onto its positive half, and what that turns into
-    // (back in the frequency domain) is the log of a filter with the same levels whose
-    // response all comes after time zero. Its imaginary part is that filter's phase.
-    void findMinimumPhase()
-    {
-        for (wrap<numBins> k)
-        {
-            let bin = int (k);
-            cepstrumSpectrum.at (bin) = logGain[k];
-
-            if (bin > 0 && bin < nyquist)
-                cepstrumSpectrum.at (nyquist + bin) = 0.0f;
-        }
-
-        std::frequency::realOnlyInverseFFT (cepstrumSpectrum, cepstrum);
-
-        for (wrap<fftSize> i)
-        {
-            let n = int (i);
-
-            if (n > 0 && n < nyquist)
-                cepstrum[i] *= 2.0f;
-            else if (n > nyquist)
-                cepstrum[i] = 0.0f;
-        }
-
-        std::frequency::realOnlyForwardFFT (cepstrum, cepstrumSpectrum);
-
-        for (wrap<numBins> k)
-        {
-            let bin = int (k);
-            minimumPhase[k] = bin > 0 && bin < nyquist ? cepstrumSpectrum.at (nyquist + bin) : 0.0f;
-        }
-    }
-
     //==============================================================================
-    // A gain per bin for the tilt, pivoting around 1kHz
-    void updateTiltGains()
-    {
-        lastTilt = tilt;
-        let binWidth = float (processor.frequency) / float (fftSize);
-
-        for (wrap<numBins> k)
-        {
-            let frequency = max (20.0f, float (max (1, int (k))) * binWidth);
-            tiltGains[k] = pow (10.0f, tilt * log (frequency / 1000.0f) / log (2.0f) / 20.0f);
-        }
-    }
-
-    // Splits the bins between the bands. Each crossover fades over a third of an octave either
-    // side, and the high one is kept at least half an octave above the low one.
-    void updateBandWeights()
-    {
-        lastLowCross = lowCross;
-        lastHighCross = highCross;
-
-        let binWidth = float (processor.frequency) / float (fftSize);
-        let lowOctave = log (max (lowCross, 20.0f)) / log (2.0f);
-        let highOctave = max (log (max (highCross, 20.0f)) / log (2.0f), lowOctave + 0.5f);
-
-        for (wrap<numBins> k)
-        {
-            let octave = log (max (float (int (k)) * binWidth, 10.0f)) / log (2.0f);
-            let aboveLow = smear::fade ((octave - lowOctave) * 1.5f);
-            let aboveHigh = smear::fade ((octave - highOctave) * 1.5f);
-
-            bandWeights[0, k] = 1.0f - aboveLow;
-            bandWeights[1, k] = aboveLow - aboveHigh;
-            bandWeights[2, k] = aboveHigh;
-        }
-    }
-
     // The output's spectrum in log-spaced bands from 30Hz to 16kHz, each 0 (-84dB or
-    // quieter) to 1 (0dB), averaging the two channels
+    // quieter) to 1 (0dB), averaging the two channels and taking whichever engine is louder
     void sendSpectrum()
     {
         smear::Spectrum s;
-        let binWidth = float (processor.frequency) / float (fftSize);
 
         for (wrap<smear::numDisplayBands> band)
         {
             let low = 30.0f * pow (16000.0f / 30.0f, float (int (band)) / float (smear::numDisplayBands));
             let high = 30.0f * pow (16000.0f / 30.0f, float (int (band) + 1) / float (smear::numDisplayBands));
-            let firstBin = clamp (int (low / binWidth), 1, nyquist);
-            let lastBin = clamp (int (high / binWidth), firstBin, nyquist);
-            float level;
+            let level = max (frames::getDisplayLevel (lowEngine, low, high),
+                             frames::getDisplayLevel (upperEngine, low, high));
 
-            for (int bin = firstBin; bin <= lastBin; ++bin)
-            {
-                let k = wrap<numBins> (bin);
-                level = max (level, (left.displayLevel[k] + right.displayLevel[k]) * 0.5f);
-            }
-
-            let decibels = 20.0f * log10 (max (level * 2.0f / float (fftSize), 1.0e-6f));
+            let decibels = 20.0f * log10 (max (level, 1.0e-6f));
             s.bands[band] = clamp ((decibels + 84.0f) / 84.0f, 0.0f, 1.0f);
         }
 
@@ -649,24 +488,14 @@ processor Smear  [[ main ]]
 //==============================================================================
 namespace smear
 {
-    let fftSize = 2048;
+    let fftSize = 2048;           // both engines' frames
+    let engineSplit = 1000.0f;    // the low engine renders everything below this many Hz, and the upper engine everything above
+    let decimation = 4;           // the low engine runs at a quarter of the sample rate
+    let filterLength = 81;        // the taps in the low engine's resampling filter
+    let lowLatency = decimation * fftSize + filterLength - 1;
+    let shortSize = 256;          // the transient splitter's frames
     let numBands = 3;
     let numDisplayBands = 64;
-    let shortSize = 256;
-
-    /// One band's running state for one channel
-    struct BandState
-    {
-        float[fftSize / 2 + 1] level, binFrequency, phase;
-    }
-
-    /// One channel's buffers and running state
-    struct Channel
-    {
-        float[fftSize] incoming, outgoing, kept, frame, spectrum;
-        float[fftSize / 2 + 1] lastPhase, displayLevel;
-        BandState[numBands] bands;
-    }
 
     /// One channel of the transient splitter's short frames
     struct ShortChannel
@@ -682,26 +511,70 @@ namespace smear
         return real * real + imag * imag;
     }
 
+    /// One sample of what goes to the upper engine, held back to line up with the low engine
+    struct Delayed
+    {
+        float<2> steady, kept;
+    }
+
+    /// The zeroth-order modified Bessel function of the first kind, for the Kaiser window
+    float besselI0 (float x)
+    {
+        float sum = 1.0f, term = 1.0f;
+
+        for (int k = 1; k < 30; ++k)
+        {
+            let factor = x / (2.0f * float (k));
+            term *= factor * factor;
+            sum += term;
+        }
+
+        return sum;
+    }
+
     /// One band's settings for a frame, worked out from its controls
     struct BandSettings
     {
         bool isFrozen;
-        float smearCoefficient, shiftRatio, peaks, scatter, gain;
-        bool isPlain;
+        float smearSeconds, shiftRatio, peaks, scatter, gain;
     }
 
-    BandSettings makeSettings (int freeze, float smear, float shift, float peaks, float scatter, float levelDecibels, float64 sampleRate)
+    BandSettings makeSettings (int freeze, float smear, float shift, float peaks, float scatter, float levelDecibels)
     {
         BandSettings s;
-        let smearSeconds = 4.0f * smear * smear;   // up to 4 seconds, with finer control at the short end
-
         s.isFrozen = freeze != 0;
-        s.smearCoefficient = smearSeconds > 0.001f ? exp (-float (fftSize / 4) / (smearSeconds * float (sampleRate))) : 0.0f;
+        s.smearSeconds = 4.0f * smear * smear;   // up to 4 seconds, with finer control at the short end
         s.shiftRatio = pow (2.0f, shift / 12.0f);
         s.peaks = peaks;
         s.scatter = scatter;
         s.gain = levelDecibels <= -35.9f ? 0.0f : pow (10.0f, levelDecibels / 20.0f);
         return s;
+    }
+
+    /// How the low engine moved each of its bins in one frame, in each band (as a ratio of
+    /// frequencies). Its frames are four times as long as the upper engine's, so it can tell
+    /// apart a chord's partials (and see which note each belongs to) where the upper engine
+    /// can't; the upper engine moves anything below highestFrequency the same way.
+    struct LowMoves
+    {
+        float[numBands, fftSize / 2 + 1] shift, phase;   // how far each bin moved (in Hz), and how far its phases had been turned by the middle of the frame
+        float binWidth, highestFrequency;
+        bool isValid;
+    }
+
+    /// Everything the engines need to know about the controls for a frame
+    struct Controls
+    {
+        BandSettings[numBands] bands;
+        float lowCross, highCross, tilt, magnet;
+        int key, scaleMask;
+        bool useMinimumPhase;
+
+        // which two of the low engine's last three frames are centred either side of the
+        // upper engine's frame, how far between them it is, and how many seconds after the
+        // first and before the second
+        wrap<3> earlierLowMoves, laterLowMoves;
+        float lowMovesBlend, secondsAfterEarlier, secondsBeforeLater;
     }
 
     /// Which of the 12 notes above the key are in each scale, one bit per semitone
@@ -723,16 +596,21 @@ namespace smear
         return masks.at (clamp (scale, 0, 11));
     }
 
-    /// How much to multiply a frequency by to pull it towards the nearest note of the scale:
-    /// at a pull of 1 it lands on the note, at 0 it stays where it is
-    float pullTowardsScale (float frequency, int key, int mask, float amount)
+    /// A frequency in semitones above the key's lowest note (MIDI numbering, less the key)
+    float toSemitones (float frequency, int key)
     {
-        if (amount <= 0.0f || frequency < 20.0f)
-            return 1.0f;
+        return 12.0f * log (frequency / 440.0f) / log (2.0f) + 69.0f - float (key);
+    }
 
-        let semitones = 12.0f * log (frequency / 440.0f) / log (2.0f) + 69.0f - float (key);
+    /// The nearest note of the scale to a pitch in semitones (as toSemitones gives it). If
+    /// the note it was on last time is still in the scale and no more than 30 cents further
+    /// away than the nearest, it stays on that, so a pitch sitting between two notes doesn't
+    /// flip from one to the other.
+    int nearestNote (float semitones, int mask, int heldNote)
+    {
         let below = int (floor (semitones));
-        float nearest = semitones, distance = 100.0f;
+        var nearest = below;
+        float distance = 100.0f;
 
         for (int note = below - 6; note <= below + 7; ++note)
         {
@@ -744,11 +622,16 @@ namespace smear
             if (d < distance)
             {
                 distance = d;
-                nearest = float (note);
+                nearest = note;
             }
         }
 
-        return pow (2.0f, (nearest - semitones) * amount / 12.0f);
+        let isHeldInScale = ((mask >> ((heldNote % 12 + 12) % 12)) & 1) != 0;
+
+        if (isHeldInScale && abs (float (heldNote) - semitones) < distance + 0.3f)
+            return heldNote;
+
+        return nearest;
     }
 
     /// A smooth step from 0 (at -1 and below) to 1 (at 1 and above)
@@ -768,5 +651,972 @@ namespace smear
     float wrapPhase (float p)
     {
         return p - float (twoPi) * floor (p / float (twoPi) + 0.5f);
+    }
+
+    //==============================================================================
+    /**
+        One spectral engine: a stereo phase vocoder on frames of fftSize samples, overlapping
+        by three quarters, which reshapes whichever of the three bands it's given.
+
+        Shift and Pull move the spectrum by its peaks: each peak takes the bins around it
+        down to the dips either side, and the whole region moves together, keeping its own
+        levels and phases. The phases are turned just enough to make up the new frequency,
+        so nothing is rebuilt; a peak that doesn't need to move comes out exactly as it went
+        in, and noise between the peaks stays noise. (This is Laroche and Dolson's
+        phase-locked peak shifting.) The peaks are found in both channels together and both
+        move the same way, so the stereo image stays put.
+
+        Pull only tunes what's clearly a steady tone, so noise, breath and room are left
+        where they were rather than being gathered onto the notes of the scale (which is
+        what makes it sound metallic). It tunes each note's pitch centre, smoothed over about
+        150ms, rather than every moment of it, so vibrato and drift come through as they
+        were, and a note that's already in tune isn't touched at all. A peak that's a
+        harmonic of a lower one moves with it, so a note's overtones stay in tune with it
+        rather than each going to its own nearest note.
+
+        The low engine (the analyser) works all this out for every frequency it can hear, in
+        all three bands; the upper engine follows its moves wherever they reach, since its
+        own shorter frames can't tell a chord's partials apart.
+    */
+    namespace stft (int fftSize)
+    {
+        let numBins = fftSize / 2 + 1;
+        let nyquist = fftSize / 2;
+        let hopSize = fftSize / 4;
+        let maxPeaks = numBins / 2;
+        let colaGain = 2.0f / 3.0f;                                          // Hann in and out at 75% overlap sums to 1.5
+        let phaseStep = float (twoPi) * float (hopSize) / float (fftSize);   // how far a bin-centred tone's phase moves per hop
+        let youngFrames = fftSize / hopSize;                                  // how many frames a new note takes to fill one
+
+        /// One band's running state for one channel
+        struct BandState
+        {
+            float[numBins] level, binFrequency, phase;
+        }
+
+        /// One channel's buffers and running state
+        struct Channel
+        {
+            float[fftSize] incoming, outgoing, kept, frame, spectrum;
+            float[numBins] lastPhase, measuredLevel, measuredBin, displayLevel;
+            BandState[numBands] bands;
+        }
+
+        /// How one band moves each bin this frame, and what it carries from frame to frame
+        struct BandPlan
+        {
+            int[numBins] move;                          // the whole bins it moves
+            float[numBins] delta, turnReal, turnImag;   // how far its frequency moves (in bins), and the turn its phases get
+            float[numBins] rotation;                    // how far its peak's phase had turned by the last frame
+            int[numBins] heldNote;                      // the note its peak was pulled to in the last frame
+        }
+
+        struct Engine
+        {
+            Channel left, right;
+            float sampleRate;   // the rate this engine's samples come at
+            float[fftSize] window;
+            bool[numBands] isActive;   // whether any of the band falls in this engine's half
+            bool isAnalyser;           // the low engine: works out its moves itself, rather than following the analyser's
+            wrap<fftSize> position;
+            int hopCountdown;
+
+            // how much of each bin belongs to each band in this engine; they add up to 1 where
+            // this engine has the spectrum to itself, and fade out across engineSplit
+            float[numBands, numBins] bandWeights;
+            float[numBins] tiltGains;
+            float lastTilt, lastLowCross, lastHighCross;
+
+            // this frame's peaks: each one's true frequency (in bins), how sure it is to be a
+            // steady tone rather than noise (0 to 1), its pitch and the pitch it's been
+            // centred on lately (in semitones), how many frames it's been going, and which
+            // root (if any) it's a harmonic of; and which peak's region each bin is in
+            int[maxPeaks] peakBin, peakRoot, peakNote, peakAge, roots;
+            float[maxPeaks] seriesTop, seriesSpacing;   // per root: its highest tonal harmonic so far, and their spacing
+            float[maxPeaks] peakFrequency, peakShaped, peakTonality, peakPitch, peakSmoothed, peakCentre, peakRatio, peakTurned;
+            float<2>[maxPeaks] peakEarlierPitches;   // its pitch one and two frames ago
+            int numPeaks;
+
+            // how one band moves each peak's region, before it's handed out to the bins
+            int[maxPeaks] peakMove;
+            float[maxPeaks] peakDelta, peakTurnReal, peakTurnImag;
+            int[numBins] binRegion;
+            float[numBins] pickingLevel;
+            float[numBins + 1] logLevelSum;   // the sum of the log levels of all the bins below each one
+            BandPlan[numBands] plans;
+
+            // per bin: what its peak was doing in the last frame, for whichever peak it's
+            // nearest in the next one
+            float[numBins] lastPitch, lastSmoothed, lastCentre, lastTonality;
+            float<2>[numBins] earlierPitches;   // its pitch two and three frames ago
+            int[numBins] lastAge;
+            float centreCoefficient;
+
+            // the analyser's moves for the upper engine to follow, as it works them out, and
+            // the upper engine's copies of its last three frames of them
+            LowMoves moves;
+            LowMoves[3] recentLowMoves;
+
+            // scratch for one channel's frame, as each band of it is moved, then as they're added up
+            float[numBins] shiftedReal, shiftedImag, shiftedLevel, shiftedPeak, shiftedBin, shiftedPhase;
+            float[numBins] movedLevel, combinedLevel, combinedPhase;
+
+            // Minimum phase: whatever a frame's reshaping did to the levels is treated as a
+            // filter, and that filter's minimum phase is added to the original phases, so the
+            // ringing a sharp change makes comes after a hit instead of before it
+            float[numBins] logGain, minimumPhase;
+            bool[numBins] hasOriginalPhase;
+            float[fftSize] cepstrum, cepstrumSpectrum;
+
+            // the power going out with and without the band levels, per sample, for the level matcher
+            float levelled, unlevelled;
+
+            std::random::RNG rng;
+        }
+
+        void initialise (Engine& e, bool isAnalyser, int64 seed, float sampleRate)
+        {
+            e.sampleRate = sampleRate;
+
+            for (wrap<fftSize> i)
+                e.window[i] = 0.5f - 0.5f * cos (float (twoPi) * float (i) / float (fftSize));
+
+            e.isAnalyser = isAnalyser;
+            e.hopCountdown = hopSize;
+            e.lastTilt = 1000.0f;
+            e.lastLowCross = -1.0f;
+            e.centreCoefficient = 1.0f - exp (-float (hopSize) / (0.1f * sampleRate));
+            e.rng.seed (seed);
+
+            // the resampling filter is flat up to 36% of this rate
+            e.moves.binWidth = sampleRate / float (fftSize);
+            e.moves.highestFrequency = 0.36f * sampleRate;
+            e.moves.isValid = isAnalyser;
+        }
+
+        /// What went in fftSize samples ago, which is about to be overwritten
+        float<2> getDueInput (const Engine& e)  { return float<2> (e.left.incoming[e.position], e.right.incoming[e.position]); }
+        float<2> getDueKept (const Engine& e)   { return float<2> (e.left.kept[e.position], e.right.kept[e.position]); }
+
+        /// Takes in one sample (and the onsets that went around it) and gives back the wet
+        /// sample that's due, which lines up with what went in fftSize samples ago
+        float<2> exchange (Engine& e, float<2> steady, float<2> kept)
+        {
+            let wet = float<2> (e.left.outgoing[e.position], e.right.outgoing[e.position]);
+
+            e.left.incoming[e.position] = steady[0];
+            e.right.incoming[e.position] = steady[1];
+            e.left.kept[e.position] = kept[0];
+            e.right.kept[e.position] = kept[1];
+            e.left.outgoing[e.position] = 0.0f;
+            e.right.outgoing[e.position] = 0.0f;
+            ++e.position;
+
+            return wet;
+        }
+
+        bool isFrameDue (Engine& e)
+        {
+            if (--e.hopCountdown > 0)
+                return false;
+
+            e.hopCountdown = hopSize;
+            return true;
+        }
+
+        //==============================================================================
+        void renderFrame (Engine& e, const Controls& c)
+        {
+            if (c.tilt != e.lastTilt)
+                updateTiltGains (e, c);
+
+            if (c.lowCross != e.lastLowCross || c.highCross != e.lastHighCross)
+                updateBandWeights (e, c);
+
+            analyse (e, e.left);
+            analyse (e, e.right);
+            findPeaks (e);
+
+            if (e.isAnalyser)
+                trackPeaks (e);
+
+            groupHarmonics (e);
+
+            for (wrap<numBands> b)
+                if (e.isActive[b] || e.isAnalyser)
+                    planShifts (e, b, c);
+
+            processChannel (e, e.left, c);
+            processChannel (e, e.right, c);
+        }
+
+        // Takes the newest frame's spectrum, and measures every bin's level and its true
+        // frequency (in bins), from how far its phase moved since the last frame compared
+        // with where a bin-centred tone would be
+        void analyse (Engine& e, Channel& ch)
+        {
+            // the frame ends at the newest sample, which is just behind `position`
+            wrap<fftSize> source = e.position;
+
+            for (wrap<fftSize> i)
+            {
+                ch.frame[i] = ch.incoming[source] * e.window[i];
+                ++source;
+            }
+
+            std::frequency::realOnlyForwardFFT (ch.frame, ch.spectrum);
+
+            for (wrap<numBins> k)
+            {
+                let bin = int (k);
+                let real = ch.spectrum.at (bin);
+                let imag = bin > 0 && bin < nyquist ? ch.spectrum.at (nyquist + bin) : 0.0f;
+                let phase = atan2 (imag, real);
+                let deviation = wrapPhase (phase - ch.lastPhase[k] - phaseStep * float (bin));
+
+                ch.lastPhase[k] = phase;
+                ch.measuredLevel[k] = sqrt (real * real + imag * imag);
+                ch.measuredBin[k] = float (bin) + deviation / phaseStep;
+            }
+        }
+
+        // Finds the peaks of both channels together (any bin louder than the two either side
+        // of it, and no more than 120dB down), measures each one, and gives each peak the
+        // bins from the dip below it to the dip above it. Two peaks with less than a 3dB dip
+        // between them are one partial (like the two ends of a vibrato's swing, which a long
+        // frame catches both of), so only the louder is kept, and its bins take in both.
+        void findPeaks (Engine& e)
+        {
+            float loudest;
+
+            for (wrap<numBins> k)
+            {
+                e.pickingLevel[k] = e.left.measuredLevel[k] + e.right.measuredLevel[k];
+                loudest = max (loudest, e.pickingLevel[k]);
+            }
+
+            e.logLevelSum[0] = 0.0f;
+
+            for (int k = 0; k < numBins; ++k)
+                e.logLevelSum.at (k + 1) = e.logLevelSum.at (k) + log (e.pickingLevel.at (k) + 1.0e-12f);
+
+            let threshold = loudest * 1.0e-6f;
+            e.numPeaks = 0;
+
+            for (int k = 1; k < nyquist && e.numPeaks < maxPeaks; ++k)
+            {
+                let level = e.pickingLevel.at (k);
+
+                if (level > threshold
+                     && level > e.pickingLevel.at (k - 1) && level >= e.pickingLevel.at (k + 1)
+                     && (k < 2 || level > e.pickingLevel.at (k - 2))
+                     && (k + 2 > nyquist || level >= e.pickingLevel.at (k + 2)))
+                {
+                    if (e.numPeaks > 0)
+                    {
+                        let previous = e.peakBin.at (e.numPeaks - 1);
+                        var valley = level;
+
+                        for (int i = previous + 1; i < k; ++i)
+                            valley = min (valley, e.pickingLevel.at (i));
+
+                        if (valley > 0.7f * min (level, e.pickingLevel.at (previous)))
+                        {
+                            if (level > e.pickingLevel.at (previous))
+                                e.peakBin.at (e.numPeaks - 1) = k;
+
+                            continue;
+                        }
+                    }
+
+                    e.peakBin.at (e.numPeaks) = k;
+                    ++e.numPeaks;
+                }
+            }
+
+            for (int p = 0; p < e.numPeaks; ++p)
+            {
+                let k = e.peakBin.at (p);
+
+                if (e.left.measuredLevel.at (k) >= e.right.measuredLevel.at (k))
+                    measurePeak (e, e.left, p, k);
+                else
+                    measurePeak (e, e.right, p, k);
+            }
+
+            int first = 0;
+
+            for (int p = 0; p < e.numPeaks; ++p)
+            {
+                var last = nyquist;
+
+                if (p + 1 < e.numPeaks)
+                {
+                    last = e.peakBin.at (p);
+
+                    for (int k = e.peakBin.at (p) + 1; k < e.peakBin.at (p + 1); ++k)
+                        if (e.pickingLevel.at (k) < e.pickingLevel.at (last))
+                            last = k;
+                }
+
+                for (int k = first; k <= last; ++k)
+                    e.binRegion.at (k) = p;
+
+                first = last + 1;
+            }
+        }
+
+        // A peak's true frequency, and how sure it is to be a steady tone (1) rather than
+        // noise (0). A tone stands well clear of the bins around it, or every bin it spreads
+        // into measures the same frequency; a noise peak seldom does either. The frequency
+        // comes two ways: from the phase vocoder (the louder channel's), which is the most
+        // precise from moment to moment, and from the shape of the peak (the ratio of its two
+        // biggest bins, which a Hann window makes exact for a steady tone), which averages
+        // over the whole frame, so it's what the pitch centre follows. Where the two disagree
+        // (a tone sliding within the frame), the shape is the safer guess for both.
+        void measurePeak (Engine& e, const Channel& ch, int p, int k)
+        {
+            let level = e.pickingLevel.at (k);
+            let below = e.pickingLevel.at (k - 1);
+            let above = e.pickingLevel.at (k + 1);
+            let side = max (below, above) / max (level, 1.0e-20f);
+            let offset = clamp ((2.0f * side - 1.0f) / (side + 1.0f), 0.0f, 0.5f);
+            let shaped = float (k) + (above >= below ? offset : -offset);
+            let measured = ch.measuredBin.at (k);
+
+            e.peakShaped.at (p) = shaped;
+            e.peakFrequency.at (p) = abs (measured - shaped) < 1.0f ? measured : shaped;
+
+            let top = log (level + 1.0e-12f);
+
+            // how far it stands above the bins around it, leaving out its own main lobe (by
+            // their geometric mean, so a neighbouring peak doesn't count for much): noise
+            // peaks seldom reach 2.5 times, and tones are usually well past 5
+            let first = max (0, k - 12);
+            let last = min (nyquist, k + 12);
+            let lobeFirst = max (0, k - 2);
+            let lobeLast = min (nyquist, k + 2);
+            let count = (lobeFirst - first) + (last - lobeLast);
+            let logAround = e.logLevelSum.at (lobeFirst) - e.logLevelSum.at (first)
+                             + e.logLevelSum.at (last + 1) - e.logLevelSum.at (lobeLast + 1);
+            let standing = count > 0 ? exp (top - logAround / float (count)) : 100.0f;
+
+            // how closely the bins either side agree with it on the frequency (which must be
+            // its own: a sidelobe of a tone further off agrees too, but on that tone's)
+            let spread = max (abs (ch.measuredBin.at (k - 1) - measured), abs (ch.measuredBin.at (k + 1) - measured));
+            let isOwnFrequency = abs (measured - float (k)) < 0.75f;
+
+            let clearOfNoise = clamp (log (standing / 2.5f) / log (2.0f), 0.0f, 1.0f);
+            let steady = standing > 1.8f && isOwnFrequency ? clamp ((0.15f - spread) / 0.1f, 0.0f, 1.0f) : 0.0f;
+            e.peakTonality.at (p) = max (clearOfNoise, steady);
+        }
+
+        // The analyser follows each peak on from the last frame (through whichever peak's
+        // region its bin was in), and works out the pitch it's centred on: its last four
+        // frames' pitches averaged (a long frame catches more of one end of a vibrato's swing
+        // than the other, by turns, and four of them in a row nearly even that out), then
+        // smoothed twice over about 100ms, which together let through hardly any vibrato but
+        // follow a slow drift, and catch up quickly with a pitch that's clearly moved on. Its
+        // tonality it takes up over a couple of frames but only lets go of over about 300ms:
+        // a note with vibrato looks less like a tone at some points of its swing than at
+        // others, and it mustn't be pulled harder or softer in time with it. A pitch that's
+        // jumped by more than 60 cents since the last frame, and is more than 85 cents from
+        // where it was centred, is a new note and starts afresh (vibrato does the first but
+        // not both). Until a new note fills the frame (youngFrames), its pitch is taken as it
+        // comes, not smoothed.
+        void trackPeaks (Engine& e)
+        {
+            let binWidth = e.sampleRate / float (fftSize);
+
+            for (int p = 0; p < e.numPeaks; ++p)
+            {
+                let bin = e.peakBin.at (p);
+                let pitch = toSemitones (max (e.peakShaped.at (p), 0.5f) * binWidth, 0);
+                let lastPitch = e.lastPitch.at (bin);
+                let earlier = e.earlierPitches.at (bin);
+                let isNew = abs (pitch - lastPitch) > 0.6f && abs (pitch - e.lastCentre.at (bin)) > 0.85f;
+                let age = isNew ? 0 : min (e.lastAge.at (bin) + 1, 1000);
+
+                e.peakPitch.at (p) = pitch;
+                e.peakEarlierPitches.at (p) = float<2> (lastPitch, earlier[0]);
+                e.peakAge.at (p) = age;
+
+                if (age < youngFrames)
+                {
+                    e.peakSmoothed.at (p) = pitch;
+                    e.peakCentre.at (p) = pitch;
+                }
+                else
+                {
+                    let averaged = 0.25f * (pitch + lastPitch + earlier[0] + earlier[1]);
+                    let smoothed = followPitch (e.lastSmoothed.at (bin), averaged, e.centreCoefficient);
+                    e.peakSmoothed.at (p) = smoothed;
+                    e.peakCentre.at (p) = followPitch (e.lastCentre.at (bin), smoothed, e.centreCoefficient);
+                    let tonality = e.peakTonality.at (p);
+                    let last = e.lastTonality.at (bin);
+                    e.peakTonality.at (p) = last + (tonality - last) * (tonality > last ? 0.5f : 0.15f);
+                }
+            }
+
+            for (wrap<numBins> k)
+            {
+                if (e.numPeaks > 0)
+                {
+                    let p = e.binRegion[k];
+                    e.lastPitch[k] = e.peakPitch.at (p);
+                    e.earlierPitches[k] = e.peakEarlierPitches.at (p);
+                    e.lastSmoothed[k] = e.peakSmoothed.at (p);
+                    e.lastCentre[k] = e.peakCentre.at (p);
+                    e.lastTonality[k] = e.peakTonality.at (p);
+                    e.lastAge[k] = e.peakAge.at (p);
+                }
+                else
+                {
+                    e.lastPitch[k] = -1000.0f;
+                    e.lastCentre[k] = -1000.0f;
+                }
+            }
+        }
+
+        // One step of smoothing a pitch, going much faster once it's more than about half a
+        // semitone away (a note sliding into the next rather than wavering about one)
+        float followPitch (float from, float to, float coefficient)
+        {
+            let quickness = clamp ((abs (to - from) - 0.3f) / 0.3f, 0.0f, 1.0f);
+            return from + (to - from) * (coefficient + (0.8f - coefficient) * quickness);
+        }
+
+        // Groups the peaks into notes. Going up from the lowest, a peak is a harmonic of a
+        // lower root if it's within about 3% of a whole-number multiple of it (up to the
+        // 16th, and above that a tonal peak within a tenth of a harmonic of one, up to the
+        // 64th), or if it lands where the root's series of tonal harmonics is heading (within
+        // a tenth of their spacing of the next one or the one after), so a series that's a
+        // little stretched, like a piano's, is followed all the way up. Only the harmonics
+        // that fit closely carry the series on, so a stray tone in between can't knock it off
+        // course. Where several roots fit, the one it fits best has it, and a root that's
+        // quieter than the peak has to fit it that much better. A peak that's nobody's
+        // harmonic is a root of its own if it's tonal, and otherwise it's noise.
+        void groupHarmonics (Engine& e)
+        {
+            int numRoots = 0;
+
+            for (int j = 0; j < e.numPeaks; ++j)
+            {
+                let frequency = e.peakFrequency.at (j);
+                let level = e.pickingLevel.at (e.peakBin.at (j));
+                let isTonal = e.peakTonality.at (j) >= 0.5f;
+                var best = -1;
+                float bestMiss = 1.0f, bestFit = 1.0f;
+
+                for (int r = 0; r < numRoots; ++r)
+                {
+                    let root = e.roots.at (r);
+
+                    // a root that's quieter than the peak has to fit it all the better, so a
+                    // faint tone can't take a loud note's harmonics from it; 30dB quieter, and
+                    // it can't have it at all
+                    let rootLevel = e.pickingLevel.at (e.peakBin.at (root));
+                    let quieter = rootLevel < level ? 0.29f * log (level / max (rootLevel, 1.0e-20f)) : 0.0f;
+
+                    if (quieter >= bestMiss)
+                        continue;
+
+                    var fit = 1.0f;
+                    let ratio = frequency / e.peakFrequency.at (root);
+                    let harmonic = floor (ratio + 0.5f);
+
+                    if (ratio > 1.94f && harmonic <= 16.0f)
+                        fit = abs (ratio / harmonic - 1.0f) / min (0.03f, 0.45f / harmonic);
+                    else if (harmonic > 16.0f && harmonic <= 64.0f && isTonal)
+                        fit = abs (ratio - harmonic) / 0.1f;
+
+                    let spacing = e.seriesSpacing.at (r);
+                    let steps = floor ((frequency - e.seriesTop.at (r)) / spacing + 0.5f);
+
+                    if (steps >= 1.0f && steps <= 2.0f)
+                        fit = min (fit, abs (frequency - e.seriesTop.at (r) - steps * spacing) / (0.1f * spacing));
+
+                    if (fit + quieter < bestMiss)
+                    {
+                        best = r;
+                        bestMiss = fit + quieter;
+                        bestFit = fit;
+                    }
+                }
+
+                if (best >= 0)
+                {
+                    e.peakRoot.at (j) = e.roots.at (best);
+
+                    // a tonal harmonic that's close to where it should be carries its root's
+                    // series on up
+                    let top = e.seriesTop.at (best);
+                    let steps = floor ((frequency - top) / e.seriesSpacing.at (best) + 0.5f);
+
+                    if (steps >= 1.0f && isTonal && bestFit < 0.35f)
+                    {
+                        e.seriesSpacing.at (best) = 0.5f * (e.seriesSpacing.at (best) + (frequency - top) / steps);
+                        e.seriesTop.at (best) = frequency;
+                    }
+                }
+                else
+                {
+                    e.peakRoot.at (j) = j;
+
+                    if (frequency > 0.5f && isTonal)
+                    {
+                        e.roots.at (numRoots) = j;
+                        e.seriesTop.at (numRoots) = frequency;
+                        e.seriesSpacing.at (numRoots) = frequency;
+                        ++numRoots;
+                    }
+                }
+            }
+        }
+
+        // Works out how far each bin moves for one band. In the analyser, a peak's whole
+        // region moves together: a root by Shift, and then with Pull towards the note of the
+        // scale nearest the pitch it's centred on (holding on to the note it went to last time
+        // unless another is clearly nearer), all the way once it's clearly a tone and less
+        // for one that's only just tonal; a harmonic
+        // by the same ratio as its root, and noise only by Shift. A note that hasn't been
+        // moved yet is left alone while it's within 2 cents of its note (15 cents while it's
+        // still filling the frame and its pitch is only roughly known), but once it's been
+        // moved it's taken all the way, so it never jumps back. Each region moves by whole
+        // bins, and its phases are turned to make up the exact frequency: by how far they've
+        // turned so far, which carries on from frame to frame (from nothing for a new note),
+        // plus the part of a bin the move couldn't make. A region that isn't moving is left
+        // just as it was, rather than keeping whatever turn an earlier peak there had. (The
+        // frames start at their first sample rather than their middle, so moving by a bin
+        // also flips the sign; the same term takes care of that.)
+        //
+        // Within the analyser's reach, the upper engine moves each bin the way the analyser
+        // moved that frequency, blending between its frames either side, with the phases turned
+        // as far as the analyser's had been by the middle of this frame, so a partial the two
+        // engines share comes out of both in step. It goes bin by bin rather than by its own
+        // peaks, which can lump several of a low note's harmonics together. Above the
+        // analyser's reach, its harmonics follow their roots again.
+        void planShifts (Engine& e, wrap<numBands> b, const Controls& c)
+        {
+            let binWidth = e.sampleRate / float (fftSize);
+            let shiftRatio = c.bands[b].shiftRatio;
+            let shiftSemitones = 12.0f * log (shiftRatio) / log (2.0f);
+
+            let earlier = c.earlierLowMoves;
+            let later = c.laterLowMoves;
+            let followsAnalyser = ! e.isAnalyser && e.recentLowMoves[earlier].isValid && e.recentLowMoves[later].isValid;
+            let reachBin = followsAnalyser ? min (int (e.recentLowMoves[later].highestFrequency / binWidth), numBins) : 0;
+            let lowBinWidth = e.recentLowMoves[later].binWidth;
+
+            for (int k = 0; k < reachBin; ++k)
+            {
+                let lowBin = wrap<numBins> (clamp (int (float (k) * binWidth / lowBinWidth + 0.5f), 0, numBins - 1));
+                let earlierShift = e.recentLowMoves[earlier].shift[b, lowBin];
+                let laterShift = e.recentLowMoves[later].shift[b, lowBin];
+                let fromEarlier = e.recentLowMoves[earlier].phase[b, lowBin] + float (twoPi) * earlierShift * c.secondsAfterEarlier;
+                let fromLater = e.recentLowMoves[later].phase[b, lowBin] - float (twoPi) * laterShift * c.secondsBeforeLater;
+                let middleTurn = fromEarlier + wrapPhase (fromLater - fromEarlier) * c.lowMovesBlend;
+                let delta = (earlierShift + (laterShift - earlierShift) * c.lowMovesBlend) / binWidth;
+                let move = int (floor (delta + 0.5f));
+                let angle = middleTurn - float (pi) * float (move);
+
+                e.plans[b].move.at (k) = move;
+                e.plans[b].delta.at (k) = delta;
+                e.plans[b].turnReal.at (k) = cos (angle);
+                e.plans[b].turnImag.at (k) = sin (angle);
+                e.plans[b].rotation.at (k) = wrapPhase (middleTurn - float (pi) * delta);
+            }
+
+            for (int p = 0; p < e.numPeaks; ++p)
+            {
+                let bin = e.peakBin.at (p);
+                let root = e.peakRoot.at (p);
+                let original = e.peakFrequency.at (p);
+                let frequency = original * binWidth;
+                let isFollowed = bin < reachBin;
+                let isNew = e.isAnalyser && e.peakAge.at (p) == 0;
+                var ratio = shiftRatio;
+                var note = isNew ? -1000 : e.plans[b].heldNote.at (bin);
+
+                if (isFollowed)
+                {
+                    ratio = original > 0.0f ? 1.0f + e.plans[b].delta.at (bin) / original : shiftRatio;
+                }
+                else if (root != p)
+                {
+                    ratio = e.peakRatio.at (root);
+                    note = e.peakNote.at (root);
+                }
+                else if (e.isAnalyser && c.magnet > 0.0f && ! isNew && e.peakTonality.at (p) > 0.5f && frequency * shiftRatio >= 20.0f)
+                {
+                    let centre = e.peakCentre.at (p) + shiftSemitones - float (c.key);
+                    note = nearestNote (centre, c.scaleMask, note);
+                    let distance = float (note) - centre;
+
+                    if (e.plans[b].rotation.at (bin) != 0.0f || abs (distance) >= (e.peakAge.at (p) < youngFrames ? 0.15f : 0.02f))
+                        ratio *= pow (2.0f, distance * c.magnet * min (1.0f, 4.0f * (e.peakTonality.at (p) - 0.5f)) / 12.0f);
+                }
+
+                e.peakRatio.at (p) = ratio;
+
+                // the analyser sizes each move by the pitch the peak is centred on rather than
+                // where it happens to be in this frame, so a partial with vibrato, whose peak
+                // jumps between the ends of its swing from one frame to the next, moves as a
+                // whole and by the same amount every time
+                let steadyFrequency = e.isAnalyser ? 440.0f * pow (2.0f, (e.peakCentre.at (p) - 69.0f) / 12.0f) / binWidth
+                                                   : original;
+                let delta = steadyFrequency * (ratio - 1.0f);
+                let move = int (floor (delta + 0.5f));
+                let turned = isFollowed ? e.plans[b].rotation.at (bin)
+                                        : delta == 0.0f ? 0.0f
+                                                        : wrapPhase ((isNew ? 0.0f : e.plans[b].rotation.at (bin)) + delta * phaseStep);
+                let angle = turned + float (pi) * (delta - float (move));
+
+                e.peakMove.at (p) = move;
+                e.peakDelta.at (p) = delta;
+                e.peakTurnReal.at (p) = cos (angle);
+                e.peakTurnImag.at (p) = sin (angle);
+                e.peakTurned.at (p) = turned;
+                e.peakNote.at (p) = note;
+            }
+
+            // hands each region's move out to its bins, keeping what its peak did for
+            // whichever peak is nearest in the next frame; the analyser also writes down how
+            // far it moved each bin (in Hz) and how far it had turned it by the middle of the
+            // frame, for the upper engine
+            for (int k = reachBin; k < numBins; ++k)
+            {
+                if (e.numPeaks > 0)
+                {
+                    let p = e.binRegion.at (k);
+                    e.plans[b].move.at (k) = e.peakMove.at (p);
+                    e.plans[b].delta.at (k) = e.peakDelta.at (p);
+                    e.plans[b].turnReal.at (k) = e.peakTurnReal.at (p);
+                    e.plans[b].turnImag.at (k) = e.peakTurnImag.at (p);
+                    e.plans[b].rotation.at (k) = e.peakTurned.at (p);
+                    e.plans[b].heldNote.at (k) = e.peakNote.at (p);
+                }
+                else
+                {
+                    e.plans[b].move.at (k) = 0;
+                    e.plans[b].delta.at (k) = 0.0f;
+                    e.plans[b].turnReal.at (k) = 1.0f;
+                    e.plans[b].turnImag.at (k) = 0.0f;
+                    e.plans[b].rotation.at (k) = 0.0f;
+                }
+
+                if (e.isAnalyser)
+                {
+                    let lowBin = wrap<numBins> (k);
+                    e.moves.shift[b, lowBin] = e.plans[b].delta.at (k) * binWidth;
+                    e.moves.phase[b, lowBin] = e.plans[b].rotation.at (k) + float (pi) * e.plans[b].delta.at (k);
+                }
+            }
+        }
+
+        void processChannel (Engine& e, Channel& ch, const Controls& c)
+        {
+            for (wrap<numBins> k)
+                e.movedLevel[k] = 0.0f;
+
+            for (wrap<numBands> b)
+                if (e.isActive[b])
+                    processBand (e, ch, b, c);
+
+            resynthesise (e, ch, c);
+        }
+
+        // One band's share of the spectrum: moved, thinned, then smeared into (or held in)
+        // its running levels, with its phases either kept or, while frozen, run on at their
+        // frequencies
+        void processBand (Engine& e, Channel& ch, wrap<numBands> b, const Controls& c)
+        {
+            let s = c.bands[b];
+            let smearCoefficient = s.smearSeconds > 0.001f ? exp (-float (hopSize) / (s.smearSeconds * e.sampleRate)) : 0.0f;
+
+            shiftBand (e, ch, b);
+            keepPeaks (e, s.peaks);
+
+            for (wrap<numBins> k)
+            {
+                if (! s.isFrozen)
+                {
+                    ch.bands[b].level[k] = e.shiftedLevel[k] + (ch.bands[b].level[k] - e.shiftedLevel[k]) * smearCoefficient;
+                    ch.bands[b].binFrequency[k] = e.shiftedBin[k];
+                }
+
+                ch.bands[b].phase[k] = s.isFrozen ? wrapPhase (ch.bands[b].phase[k] + phaseStep * ch.bands[b].binFrequency[k])
+                                                  : e.shiftedPhase[k];
+            }
+        }
+
+        // Moves a band's share of each bin as planned, turning its phases. Where bins land in
+        // the same place they add up, and the louder decides the frequency a frozen band
+        // carries on at.
+        void shiftBand (Engine& e, Channel& ch, wrap<numBands> b)
+        {
+            for (wrap<numBins> k)
+            {
+                e.shiftedReal[k] = 0.0f;
+                e.shiftedImag[k] = 0.0f;
+                e.shiftedPeak[k] = 0.0f;
+                e.shiftedBin[k] = float (int (k));
+            }
+
+            for (wrap<numBins> k)
+            {
+                let weight = e.bandWeights[b, k];
+
+                if (weight <= 0.0f)
+                    continue;
+
+                let bin = int (k);
+                let target = bin + e.plans[b].move[k];
+
+                if (target < 0 || target > nyquist)
+                    continue;
+
+                let real = ch.spectrum.at (bin) * weight;
+                let imag = bin > 0 && bin < nyquist ? ch.spectrum.at (nyquist + bin) * weight : 0.0f;
+                let turnReal = e.plans[b].turnReal[k];
+                let turnImag = e.plans[b].turnImag[k];
+                let t = wrap<numBins> (target);
+                e.shiftedReal[t] += real * turnReal - imag * turnImag;
+                e.shiftedImag[t] += real * turnImag + imag * turnReal;
+
+                let level = ch.measuredLevel[k] * weight;
+
+                if (level > e.shiftedPeak[t])
+                {
+                    e.shiftedPeak[t] = level;
+                    e.shiftedBin[t] = ch.measuredBin[k] + e.plans[b].delta[k];
+                }
+            }
+
+            for (wrap<numBins> k)
+            {
+                e.shiftedLevel[k] = sqrt (e.shiftedReal[k] * e.shiftedReal[k] + e.shiftedImag[k] * e.shiftedImag[k]);
+                e.shiftedPhase[k] = atan2 (e.shiftedImag[k], e.shiftedReal[k]);
+                e.movedLevel[k] += e.shiftedLevel[k];
+            }
+        }
+
+        // Peaks: everything quieter than a threshold below the band's loudest bin goes. At 0
+        // nothing goes; at 1 only what's within 6dB of the loudest is left.
+        void keepPeaks (Engine& e, float peaks)
+        {
+            if (peaks <= 0.0f)
+                return;
+
+            float loudest = 0.0f;
+
+            for (wrap<numBins> k)
+                loudest = max (loudest, e.shiftedLevel[k]);
+
+            let threshold = loudest * pow (10.0f, (-80.0f + 74.0f * peaks) / 20.0f);
+
+            for (wrap<numBins> k)
+                if (e.shiftedLevel[k] < threshold)
+                    e.shiftedLevel[k] = 0.0f;
+        }
+
+        // Adds the bands back together (each at its level, taking the loudest band's phase,
+        // with scatter if asked), tilts the result, turns it back into sound and adds it into
+        // the output
+        void resynthesise (Engine& e, Channel& ch, const Controls& c)
+        {
+            float before, after, unlevelled, levelled;
+
+            for (wrap<numBins> k)
+            {
+                float level, plainLevel, loudest;
+                float phase;
+                bool isOriginal;
+
+                for (wrap<numBands> b)
+                {
+                    if (! e.isActive[b])
+                        continue;
+
+                    let bandLevel = ch.bands[b].level[k];
+                    let scaled = bandLevel * c.bands[b].gain;
+                    level += scaled;
+                    plainLevel += bandLevel;
+
+                    if (scaled > loudest)
+                    {
+                        loudest = scaled;
+                        phase = ch.bands[b].phase[k] + c.bands[b].scatter * float (pi) * e.rng.getBipolar();
+                        isOriginal = ! c.bands[b].isFrozen;
+                    }
+                }
+
+                // how much this bin's level changed, as a filter would have changed it, against
+                // where the moving left it (neither the crossovers nor the moves count). Bins
+                // that Peaks emptied are left out: they make no sound, and their deep notches
+                // would only throw their neighbours' phases about.
+                let incoming = e.movedLevel[k];
+                e.logGain[k] = incoming > 1.0e-9f && level > 0.0f ? clamp (log (level / incoming * e.tiltGains[k]), -12.0f, 4.0f) : 0.0f;
+                e.hasOriginalPhase[k] = isOriginal;
+
+                e.combinedLevel[k] = level;
+                e.combinedPhase[k] = phase;
+
+                let weight = int (k) > 0 && int (k) < nyquist ? 2.0f : 1.0f;
+                before += level * level * weight;
+                after += level * level * weight * e.tiltGains[k] * e.tiltGains[k];
+                unlevelled += plainLevel * plainLevel * weight;
+                levelled += level * level * weight;
+            }
+
+            // per-sample power (a Hann frame of n samples carries 3n/8 of them, and the
+            // transform multiplies the power by n), so the two engines can be added together
+            let perSample = 8.0f / (3.0f * float (fftSize) * float (fftSize));
+            e.levelled += (levelled * perSample - e.levelled) * 0.2f;
+            e.unlevelled += (unlevelled * perSample - e.unlevelled) * 0.2f;
+
+            // tilt changes the colour, not the loudness
+            let normalise = before > 1.0e-20f && after > 1.0e-20f ? sqrt (before / after) : 1.0f;
+
+            if (c.useMinimumPhase)
+                findMinimumPhase (e);
+
+            for (wrap<numBins> k)
+            {
+                let bin = int (k);
+                let level = e.combinedLevel[k] * e.tiltGains[k] * normalise;
+                let phase = c.useMinimumPhase && e.hasOriginalPhase[k] ? e.combinedPhase[k] + e.minimumPhase[k] : e.combinedPhase[k];
+
+                ch.displayLevel[k] = level;
+                ch.spectrum.at (bin) = level * cos (phase);
+
+                if (bin > 0 && bin < nyquist)
+                    ch.spectrum.at (nyquist + bin) = level * sin (phase);
+            }
+
+            std::frequency::realOnlyInverseFFT (ch.spectrum, ch.frame);
+
+            wrap<fftSize> target = e.position;
+
+            for (wrap<fftSize> i)
+            {
+                ch.outgoing[target] += ch.frame[i] * e.window[i] * colaGain;
+                ++target;
+            }
+        }
+
+        // The minimum phase of the gain curve in logGain, from its cepstrum: the cepstrum's
+        // negative-time half is folded onto its positive half, and what that turns into
+        // (back in the frequency domain) is the log of a filter with the same levels whose
+        // response all comes after time zero. Its imaginary part is that filter's phase.
+        void findMinimumPhase (Engine& e)
+        {
+            for (wrap<numBins> k)
+            {
+                let bin = int (k);
+                e.cepstrumSpectrum.at (bin) = e.logGain[k];
+
+                if (bin > 0 && bin < nyquist)
+                    e.cepstrumSpectrum.at (nyquist + bin) = 0.0f;
+            }
+
+            std::frequency::realOnlyInverseFFT (e.cepstrumSpectrum, e.cepstrum);
+
+            for (wrap<fftSize> i)
+            {
+                let n = int (i);
+
+                if (n > 0 && n < nyquist)
+                    e.cepstrum[i] *= 2.0f;
+                else if (n > nyquist)
+                    e.cepstrum[i] = 0.0f;
+            }
+
+            std::frequency::realOnlyForwardFFT (e.cepstrum, e.cepstrumSpectrum);
+
+            for (wrap<numBins> k)
+            {
+                let bin = int (k);
+                e.minimumPhase[k] = bin > 0 && bin < nyquist ? e.cepstrumSpectrum.at (nyquist + bin) : 0.0f;
+            }
+        }
+
+        //==============================================================================
+        // A gain per bin for the tilt, pivoting around 1kHz
+        void updateTiltGains (Engine& e, const Controls& c)
+        {
+            e.lastTilt = c.tilt;
+            let binWidth = e.sampleRate / float (fftSize);
+
+            for (wrap<numBins> k)
+            {
+                let frequency = max (20.0f, float (max (1, int (k))) * binWidth);
+                e.tiltGains[k] = pow (10.0f, c.tilt * log (frequency / 1000.0f) / log (2.0f) / 20.0f);
+            }
+        }
+
+        // Splits the bins between the bands, and between the engines. Each band crossover
+        // fades over a third of an octave either side, and the high one is kept at least half
+        // an octave above the low one; the engines hand over at engineSplit, fading over a
+        // sixth of an octave either side. A band is only rendered by an engine that has some
+        // of it, and one that's just come back starts from silence rather than whatever it
+        // held before.
+        void updateBandWeights (Engine& e, const Controls& c)
+        {
+            e.lastLowCross = c.lowCross;
+            e.lastHighCross = c.highCross;
+
+            let binWidth = e.sampleRate / float (fftSize);
+            let lowOctave = log (max (c.lowCross, 20.0f)) / log (2.0f);
+            let highOctave = max (log (max (c.highCross, 20.0f)) / log (2.0f), lowOctave + 0.5f);
+            let splitOctave = log (engineSplit) / log (2.0f);
+            bool[numBands] isNowActive;
+
+            for (wrap<numBins> k)
+            {
+                let octave = log (max (float (int (k)) * binWidth, 10.0f)) / log (2.0f);
+                let aboveLow = fade ((octave - lowOctave) * 1.5f);
+                let aboveHigh = fade ((octave - highOctave) * 1.5f);
+                let aboveSplit = fade ((octave - splitOctave) * 6.0f);
+                let share = e.isAnalyser ? 1.0f - aboveSplit : aboveSplit;
+
+                e.bandWeights[0, k] = (1.0f - aboveLow) * share;
+                e.bandWeights[1, k] = (aboveLow - aboveHigh) * share;
+                e.bandWeights[2, k] = aboveHigh * share;
+
+                for (wrap<numBands> b)
+                    if (e.bandWeights[b, k] > 0.0f)
+                        isNowActive[b] = true;
+            }
+
+            for (wrap<numBands> b)
+            {
+                if (isNowActive[b] && ! e.isActive[b])
+                {
+                    for (wrap<numBins> k)
+                    {
+                        e.left.bands[b].level[k] = 0.0f;
+                        e.right.bands[b].level[k] = 0.0f;
+                    }
+                }
+
+                e.isActive[b] = isNowActive[b];
+            }
+        }
+
+        /// The loudest output level (relative to full scale, both channels averaged) between
+        /// two frequencies
+        float getDisplayLevel (const Engine& e, float lowFrequency, float highFrequency)
+        {
+            let binWidth = e.sampleRate / float (fftSize);
+            let firstBin = clamp (int (lowFrequency / binWidth), 1, nyquist);
+            let lastBin = clamp (int (highFrequency / binWidth), firstBin, nyquist);
+            float level;
+
+            for (int bin = firstBin; bin <= lastBin; ++bin)
+                level = max (level, (e.left.displayLevel.at (bin) + e.right.displayLevel.at (bin)) * 0.5f);
+
+            return level * 2.0f / float (fftSize);
+        }
     }
 }

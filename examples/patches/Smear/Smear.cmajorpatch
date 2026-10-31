@@ -7,7 +7,7 @@
     "category":         "effect",
     "manufacturer":     "Cmajor Software Ltd",
     "isInstrument":     false,
-    "latencySamples":   2304,
+    "latencySamples":   8528,
 
     "source":           "Smear.cmajor",
 
