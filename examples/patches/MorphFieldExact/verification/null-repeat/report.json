@@ -1,0 +1,71 @@
+{
+  "passed": true,
+  "source": "Phase kick",
+  "reference": "Native Visco 2.0.3",
+  "candidate": "Native Cmajor 1.0.3096, Morph Field Exact 1.0.2",
+  "limiter": {
+    "enabled": true,
+    "gainDb": 0,
+    "speed": 50
+  },
+  "seed": 2345,
+  "abletonCaptured": false,
+  "rows": [
+    {
+      "rate": 44100,
+      "frames": 44100,
+      "relativeRmsDb": -129.66737191326223,
+      "residualRmsDbFS": -149.22655895572493,
+      "residualPeak": 0.0000019073486328125,
+      "residualPeakDbFS": -114.39139835231286,
+      "attackRelativeRmsDb": -130.45664366158454,
+      "cliStartupSilenceRemoved": 20480,
+      "signalShiftSamples": 0,
+      "gainAdjustmentDb": 0,
+      "settings": {
+        "velocity": 1,
+        "limiterGain": 0,
+        "b": "E:\\Programming\\cmajor\\examples\\patches\\MorphFieldExact\\fixtures\\phase-kick.wav",
+        "a": "E:\\Programming\\cmajor\\examples\\patches\\MorphFieldExact\\fixtures\\phase-kick.wav",
+        "mix": 0,
+        "importMode": "stored",
+        "retrigger": -1,
+        "nextMix": 0,
+        "seconds": 1,
+        "rate": 44100,
+        "limiterSpeed": 50,
+        "morphAt": -1,
+        "preRoll": 4096,
+        "limiter": true
+      }
+    },
+    {
+      "rate": 48000,
+      "frames": 48000,
+      "relativeRmsDb": -129.3793151831242,
+      "residualRmsDbFS": -149.16565622834494,
+      "residualPeak": 0.0000019073486328125,
+      "residualPeakDbFS": -114.39139835231286,
+      "attackRelativeRmsDb": -129.32491031174524,
+      "cliStartupSilenceRemoved": 20480,
+      "signalShiftSamples": 0,
+      "gainAdjustmentDb": 0,
+      "settings": {
+        "rate": 48000,
+        "morphAt": -1,
+        "retrigger": -1,
+        "limiter": true,
+        "velocity": 1,
+        "seconds": 1,
+        "nextMix": 0,
+        "importMode": "stored",
+        "mix": 0,
+        "b": "E:\\Programming\\cmajor\\examples\\patches\\MorphFieldExact\\fixtures\\phase-kick.wav",
+        "preRoll": 4096,
+        "limiterSpeed": 50,
+        "limiterGain": 0,
+        "a": "E:\\Programming\\cmajor\\examples\\patches\\MorphFieldExact\\fixtures\\phase-kick.wav"
+      }
+    }
+  ]
+}

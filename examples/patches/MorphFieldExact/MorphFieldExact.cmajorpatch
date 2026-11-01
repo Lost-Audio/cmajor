@@ -1,0 +1,22 @@
+{
+  "CmajorVersion": 1,
+  "ID": "local.examples.morphfieldexact",
+  "version": "1.0.2",
+  "name": "Morph Field Exact",
+  "description": "Morph two sound models with the traced renderer and optional Visco limiter.",
+  "manufacturer": "Local experiments",
+  "isInstrument": true,
+  "source": [
+    "Defaults.cmajor",
+    "WaveData.cmajor",
+    "ViscoLimiter.cmajor",
+    "MorphFieldExact.cmajor"
+  ],
+  "worker": "worker.js",
+  "view": {
+    "src": "view/index.js",
+    "width": 900,
+    "height": 680,
+    "resizable": true
+  }
+}

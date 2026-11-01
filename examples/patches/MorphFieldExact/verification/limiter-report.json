@@ -1,0 +1,49 @@
+{
+  "rate": 44100,
+  "gain": 0,
+  "speed": 50,
+  "peak": 0.9767634868621826,
+  "peakDbFS": -0.20421166903287152,
+  "differenceDb": -129.66737191326223,
+  "attackDifferenceDb": -130.45664366158454,
+  "isolatedLimiterCases": 5,
+  "exactLimiterCases": 5,
+  "reduction": [
+    {
+      "startMs": 0,
+      "endMs": 2,
+      "changeDb": 0
+    },
+    {
+      "startMs": 2,
+      "endMs": 5,
+      "changeDb": -0.002302934002342928
+    },
+    {
+      "startMs": 5,
+      "endMs": 10,
+      "changeDb": -4.496447815033254
+    },
+    {
+      "startMs": 10,
+      "endMs": 20,
+      "changeDb": -5.790494965221589
+    },
+    {
+      "startMs": 20,
+      "endMs": 50,
+      "changeDb": -6.060855287251464
+    },
+    {
+      "startMs": 50,
+      "endMs": 100,
+      "changeDb": -5.330236831383161
+    },
+    {
+      "startMs": 100,
+      "endMs": 200,
+      "changeDb": -3.4136641475986886
+    }
+  ],
+  "listeningExamples": "Dry and limited examples have equal peaks. Native and patch limited examples share one gain factor."
+}

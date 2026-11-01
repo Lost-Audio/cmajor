@@ -1,0 +1,38 @@
+{
+  "file": "SHADOW_UKDdrums_oneshot_kick_Phase.wav",
+  "sampleRate": 44100,
+  "import": "Visco UI saved-model path",
+  "seed": 2345,
+  "morph": 0,
+  "velocity": 1,
+  "width": 0,
+  "effects": false,
+  "sampleShift": 0,
+  "gainFit": false,
+  "before": {
+    "relativeDb": -32.43534477288161,
+    "rmsDbFS": -46.544036836830884,
+    "peak": 0.05447673797607422,
+    "peakDbFS": -25.27577811052685
+  },
+  "after": {
+    "relativeDb": -129.29482642844974,
+    "rmsDbFS": -143.40351849239903,
+    "peak": 0.000003814697265625,
+    "peakDbFS": -108.37079843903324
+  },
+  "attackBefore": {
+    "relativeDb": -31.928749548702836,
+    "rmsDbFS": -33.9460273532789,
+    "peak": 0.05447673797607422,
+    "peakDbFS": -25.27577811052685
+  },
+  "attackAfter": {
+    "relativeDb": -129.9268803566074,
+    "rmsDbFS": -131.94415816118348,
+    "peak": 0.000003814697265625,
+    "peakDbFS": -108.37079843903324
+  },
+  "comparisonAudioGainDb": -12,
+  "nullAudioGainDb": 24
+}

@@ -1,0 +1,48 @@
+{
+  "version": "2.0.3",
+  "routine": "0xdb1e0",
+  "cases": [
+    {
+      "id": "limiter-phase-44100",
+      "rate": 44100,
+      "gain": 0,
+      "speed": 50,
+      "input": "attack-phase-stored-44100.f32",
+      "audio": "limiter-phase-44100.f32"
+    },
+    {
+      "id": "limiter-phase-slow",
+      "rate": 44100,
+      "gain": 12,
+      "speed": 0,
+      "input": "attack-phase-stored-44100.f32",
+      "audio": "limiter-phase-slow.f32"
+    },
+    {
+      "id": "limiter-phase-fast",
+      "rate": 44100,
+      "gain": 48,
+      "speed": 100,
+      "input": "attack-phase-stored-44100.f32",
+      "audio": "limiter-phase-fast.f32"
+    },
+    {
+      "id": "limiter-phase-48000",
+      "rate": 48000,
+      "gain": 6.7,
+      "speed": 77,
+      "input": "attack-phase-stored-48000.f32",
+      "audio": "limiter-phase-48000.f32"
+    },
+    {
+      "id": "limiter-stereo",
+      "rate": 44100,
+      "gain": 12,
+      "speed": 65,
+      "input": "limiter-stereo-input-left.f32",
+      "rightInput": "limiter-stereo-input-right.f32",
+      "audio": "limiter-stereo-left.f32",
+      "rightAudio": "limiter-stereo-right.f32"
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+/test-artifacts/
+/test-results.json
+/worker-test-results.json
+/limiter-test-results.json
+/WorkerProbe.cmajorpatch

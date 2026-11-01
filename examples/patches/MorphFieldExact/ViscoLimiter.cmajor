@@ -1,0 +1,48 @@
+// Visco 2.0.3 CompLimiter: 0xdb1e0, parameter setup 0xddb30.
+// The two gain states persist between notes. This effect adds no lookahead delay.
+namespace ViscoDynamics
+{
+    struct Limiter
+    {
+        float first, second, drive, release1, release2, attackDelta1, attackDelta2;
+        float ceiling, knee, kneeWidth;
+
+        void reset() { this.first=1.0f;this.second=1.0f; }
+
+        float inverseExp(float db)
+        {
+            let x=(-0.115129254758358f)*db,xx=x*x;
+            return 1.0f/((xx*0.5f+(x+1.0f))+(xx*0.17000000178813934f)*xx);
+        }
+
+        void configure(float rate,float gainDb,float speed)
+        {
+            let z=0.16609638929367065f*clamp(gainDb,0.0f,48.0f)+127.0f;
+            let index=int(z),t=z-float(index);
+            var p=t*0.013686471618711948f+0.051752276718616486f;
+            p=p*t+0.24156560003757477f;p=p*t+0.6929956674575806f;p=p*t+1.0f;
+            this.drive=p*pow(2.0f,float(index-127));
+            speed=clamp(speed,0.0f,100.0f)/100.0f;
+            let attack=(rate*0.003000000026077032f)*(1.2000000476837158f-speed);
+            let release=(rate*0.11999999731779099f)*(1.100000023841858f-speed);
+            this.release1=1.0f/(release+1.0f);this.release2=1.0f/(release*0.5f+1.0f);
+            this.attackDelta1=1.0f/(attack+1.0f)-this.release1;
+            this.attackDelta2=1.0f/(attack*0.5f+1.0f)-this.release2;
+            this.ceiling=this.inverseExp(-0.2f);this.knee=this.inverseExp(-5.0f);
+            this.kneeWidth=1.0f-this.knee;
+        }
+
+        float<2> process(float<2> sample)
+        {
+            sample*=this.drive;
+            let instant=this.ceiling/(max(abs(sample[0]),abs(sample[1]))+0.001f);
+            let target=min(1.0f,instant*this.knee);
+            this.first=((target<this.first?this.attackDelta1:0.0f)+this.release1)*(target-this.first)+this.first;
+            this.second=((this.first<this.second?this.attackDelta2:0.0f)+this.release2)*(this.first-this.second)+this.second;
+            let width=this.second*this.kneeWidth;
+            let overlap=max(0.0f,width-abs(this.second-instant));
+            let gain=min(this.second,instant)-((overlap*overlap)*0.25f)/width;
+            return sample*gain;
+        }
+    }
+}
