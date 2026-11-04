@@ -1,0 +1,605 @@
+/**
+    Strike - techno percussion.
+
+    Each hit is a short FM blip (with a pitch drop and some noise), run through a
+    resonant filter whose cutoff is snapped open by its own envelope (the "rubber"),
+    then driven and wave-folded, and finally thrown into a tempo-synced ping-pong
+    delay with saturation in its feedback path.
+
+    Play it from MIDI (the note sets the pitch), or switch on the built-in 16-step
+    sequencer. In a host, the sequencer follows its tempo, and while Run is on it plays
+    only when the host is playing, locked to the host's beat position.
+
+    Three modulation lanes each play a drawn curve, looped over a length in beats that
+    is locked to the same clock, and push one of the sound's controls up or down by it.
+*/
+
+graph Strike  [[main]]
+{
+    input event std::midi::Message midiIn;
+    input event std::timeline::Tempo tempoIn;
+    input event std::timeline::TransportState transportIn;
+    input event std::timeline::Position positionIn;
+    output stream float<2> out;
+    output event int currentStep;
+    output event float modClock;    // the lanes' clock in 16th notes, for the GUI's playheads
+
+    input value float decay       [[ name: "Decay",        min: 0.03,  max: 1.5,   init: 0.18,  unit: "s" ]];
+    input value float pitchDrop   [[ name: "Pitch Drop",   min: 0,     max: 48,    init: 24,    unit: "st" ]];
+    input value float fm          [[ name: "FM",           min: 0,     max: 1,     init: 0.3 ]];
+    input value float noise       [[ name: "Noise",        min: 0,     max: 1,     init: 0.15 ]];
+
+    input value float cutoff      [[ name: "Cutoff",       min: 80,    max: 12000, init: 600,   unit: "Hz" ]];
+    input value float resonance   [[ name: "Resonance",    min: 0.5,   max: 16,    init: 8 ]];
+    input value float envAmount   [[ name: "Env Amount",   min: 0,     max: 1,     init: 0.7 ]];
+    input value float rubber      [[ name: "Rubber",       min: 0.01,  max: 0.8,   init: 0.12,  unit: "s" ]];
+    input value int   filterMode  [[ name: "Filter Mode",  min: 0,     max: 1,     init: 0,     text: "LP|BP" ]];
+
+    input value float drive       [[ name: "Drive",        min: 0,     max: 1,     init: 0.5 ]];
+    input value float fold        [[ name: "Fold",         min: 0,     max: 1,     init: 0.2 ]];
+
+    input value int   division    [[ name: "Delay Time",   min: 0,     max: 4,     init: 3,     text: "1/16|1/8T|1/8|1/8D|1/4" ]];
+    input value float feedback    [[ name: "Feedback",     min: 0,     max: 0.95,  init: 0.6 ]];
+    input value float delayMix    [[ name: "Delay Mix",    min: 0,     max: 1,     init: 0.45 ]];
+    input value float delayTone   [[ name: "Delay Tone",   min: 500,   max: 12000, init: 3500,  unit: "Hz" ]];
+
+    input value int   run         [[ name: "Run",          min: 0,     max: 1,     init: 0,     text: "Stop|Run" ]];
+    input value float bpm         [[ name: "BPM",          min: 90,    max: 160,   init: 132,   step: 1 ]];
+    input value int   pattern     [[ name: "Pattern",      min: 0,     max: 65535, init: 28013 ]];
+    input value float root        [[ name: "Root",         min: 24,    max: 72,    init: 48,    step: 1, unit: "note" ]];
+    // each step's note, in semitones from the root
+    input value int   note1       [[ name: "Step 1 Note", min: -24, max: 24, init: 0, step: 1, hidden: true ]];
+    input value int   note2       [[ name: "Step 2 Note", min: -24, max: 24, init: 0, step: 1, hidden: true ]];
+    input value int   note3       [[ name: "Step 3 Note", min: -24, max: 24, init: 0, step: 1, hidden: true ]];
+    input value int   note4       [[ name: "Step 4 Note", min: -24, max: 24, init: 12, step: 1, hidden: true ]];
+    input value int   note5       [[ name: "Step 5 Note", min: -24, max: 24, init: 0, step: 1, hidden: true ]];
+    input value int   note6       [[ name: "Step 6 Note", min: -24, max: 24, init: 7, step: 1, hidden: true ]];
+    input value int   note7       [[ name: "Step 7 Note", min: -24, max: 24, init: 0, step: 1, hidden: true ]];
+    input value int   note8       [[ name: "Step 8 Note", min: -24, max: 24, init: 0, step: 1, hidden: true ]];
+    input value int   note9       [[ name: "Step 9 Note", min: -24, max: 24, init: 0, step: 1, hidden: true ]];
+    input value int   note10      [[ name: "Step 10 Note", min: -24, max: 24, init: 0, step: 1, hidden: true ]];
+    input value int   note11      [[ name: "Step 11 Note", min: -24, max: 24, init: 0, step: 1, hidden: true ]];
+    input value int   note12      [[ name: "Step 12 Note", min: -24, max: 24, init: 3, step: 1, hidden: true ]];
+    input value int   note13      [[ name: "Step 13 Note", min: -24, max: 24, init: 0, step: 1, hidden: true ]];
+    input value int   note14      [[ name: "Step 14 Note", min: -24, max: 24, init: 12, step: 1, hidden: true ]];
+    input value int   note15      [[ name: "Step 15 Note", min: -24, max: 24, init: 10, step: 1, hidden: true ]];
+    input value int   note16      [[ name: "Step 16 Note", min: -24, max: 24, init: 0, step: 1, hidden: true ]];
+
+    input value float volume      [[ name: "Volume",       min: -36,   max: 6,     init: -2,    unit: "dB" ]];
+
+    // the modulation lanes; their curves come from the GUI (and the worker, on load)
+    input value int   mod1Target  [[ name: "Mod 1 Target", min: 0,     max: 12,    init: 0,     text: "Cutoff|Reso|Env|Snap|Decay|Drive|Fold|FM|Noise|Pitch|Feedback|Echo Mix|Echo Tone" ]];
+    input value int   mod1Length  [[ name: "Mod 1 Length", min: 0,     max: 5,     init: 2,     text: "1/4|1/2|1 bar|2 bars|4 bars|8 bars" ]];
+    input value float mod1Depth   [[ name: "Mod 1 Depth",  min: -1,    max: 1,     init: 0.35 ]];
+    input value int   mod2Target  [[ name: "Mod 2 Target", min: 0,     max: 12,    init: 10,    text: "Cutoff|Reso|Env|Snap|Decay|Drive|Fold|FM|Noise|Pitch|Feedback|Echo Mix|Echo Tone" ]];
+    input value int   mod2Length  [[ name: "Mod 2 Length", min: 0,     max: 5,     init: 3,     text: "1/4|1/2|1 bar|2 bars|4 bars|8 bars" ]];
+    input value float mod2Depth   [[ name: "Mod 2 Depth",  min: -1,    max: 1,     init: 0 ]];
+    input value int   mod3Target  [[ name: "Mod 3 Target", min: 0,     max: 12,    init: 6,     text: "Cutoff|Reso|Env|Snap|Decay|Drive|Fold|FM|Noise|Pitch|Feedback|Echo Mix|Echo Tone" ]];
+    input value int   mod3Length  [[ name: "Mod 3 Length", min: 0,     max: 5,     init: 0,     text: "1/4|1/2|1 bar|2 bars|4 bars|8 bars" ]];
+    input value float mod3Depth   [[ name: "Mod 3 Depth",  min: -1,    max: 1,     init: 0 ]];
+    input value strike::Curve mod1Curve, mod2Curve, mod3Curve;
+
+    let voiceCount = 6;
+
+    node
+    {
+        sequencer = Sequencer;
+        allocator = std::voices::VoiceAllocator (voiceCount);
+        voices    = PercVoice[voiceCount];
+        mods      = ModMatrix;
+        echo      = Echo;
+    }
+
+    connection
+    {
+        midiIn -> std::midi::MPEConverter -> allocator;
+        sequencer.noteOut -> allocator;
+        allocator.voiceEventOut -> voices.eventIn;
+
+        tempoIn     -> sequencer.tempoIn;
+        transportIn -> sequencer.transportIn;
+        positionIn  -> sequencer.positionIn;
+        run         -> sequencer.run;
+        bpm         -> sequencer.bpm;
+        pattern     -> sequencer.pattern;
+        root        -> sequencer.root;
+        note1       -> sequencer.notes[0];
+        note2       -> sequencer.notes[1];
+        note3       -> sequencer.notes[2];
+        note4       -> sequencer.notes[3];
+        note5       -> sequencer.notes[4];
+        note6       -> sequencer.notes[5];
+        note7       -> sequencer.notes[6];
+        note8       -> sequencer.notes[7];
+        note9       -> sequencer.notes[8];
+        note10      -> sequencer.notes[9];
+        note11      -> sequencer.notes[10];
+        note12      -> sequencer.notes[11];
+        note13      -> sequencer.notes[12];
+        note14      -> sequencer.notes[13];
+        note15      -> sequencer.notes[14];
+        note16      -> sequencer.notes[15];
+        sequencer.stepOut -> currentStep;
+
+        // everything a lane can reach goes through the mod matrix on its way to the sound
+        sequencer.clockOut -> mods.clock;
+        mods.clockEventOut -> modClock;
+        mod1Curve  -> mods.curve1;
+        mod2Curve  -> mods.curve2;
+        mod3Curve  -> mods.curve3;
+        mod1Target -> mods.target1;
+        mod2Target -> mods.target2;
+        mod3Target -> mods.target3;
+        mod1Length -> mods.length1;
+        mod2Length -> mods.length2;
+        mod3Length -> mods.length3;
+        mod1Depth  -> mods.depth1;
+        mod2Depth  -> mods.depth2;
+        mod3Depth  -> mods.depth3;
+
+        cutoff     -> mods.cutoff;
+        resonance  -> mods.resonance;
+        envAmount  -> mods.envAmount;
+        rubber     -> mods.rubber;
+        decay      -> mods.decay;
+        drive      -> mods.drive;
+        fold       -> mods.fold;
+        fm         -> mods.fm;
+        noise      -> mods.noise;
+        feedback   -> mods.feedback;
+        delayMix   -> mods.delayMix;
+        delayTone  -> mods.delayTone;
+
+        mods.decayOut     -> voices.decay;
+        pitchDrop         -> voices.pitchDrop;
+        mods.fmOut        -> voices.fm;
+        mods.noiseOut     -> voices.noise;
+        mods.cutoffOut    -> voices.cutoff;
+        mods.resonanceOut -> voices.resonance;
+        mods.envAmountOut -> voices.envAmount;
+        mods.rubberOut    -> voices.rubber;
+        filterMode        -> voices.filterMode;
+        mods.driveOut     -> voices.drive;
+        mods.foldOut      -> voices.fold;
+        mods.pitchOut     -> voices.pitchMod;
+
+        sequencer.tempoOut -> echo.bpm;
+        division           -> echo.division;
+        mods.feedbackOut   -> echo.feedback;
+        mods.delayMixOut   -> echo.mix;
+        mods.delayToneOut  -> echo.tone;
+        volume             -> echo.volume;
+
+        voices.out -> echo.in;
+        echo.out -> out;
+    }
+}
+
+//==============================================================================
+namespace strike
+{
+    /// Returns a per-sample multiplier that makes an envelope fall by 60dB over the given time
+    float decayCoefficient (float seconds, float64 sampleRate)
+    {
+        return float (exp (-6.9 / (float64 (max (seconds, 0.001f)) * sampleRate)));
+    }
+
+    /// A TPT state-variable filter, which stays stable with fast cutoff sweeps and high resonance
+    struct SVF
+    {
+        void setup (float cutoff, float q, float64 sampleRate)
+        {
+            let g = float (tan (pi * min (float64 (cutoff), sampleRate * 0.45) / sampleRate));
+            this.k  = 1.0f / q;
+            this.a1 = 1.0f / (1.0f + g * (g + this.k));
+            this.a2 = g * this.a1;
+            this.a3 = g * this.a2;
+        }
+
+        void process (float x)
+        {
+            let v3 = x - this.ic2;
+            let v1 = this.a1 * this.ic1 + this.a2 * v3;
+            let v2 = this.ic2 + this.a2 * this.ic1 + this.a3 * v3;
+            this.ic1 = 2.0f * v1 - this.ic1;
+            this.ic2 = 2.0f * v2 - this.ic2;
+            this.lp = v2;
+            this.bp = v1 * this.k;
+        }
+
+        float lp, bp;
+        float ic1, ic2, a1, a2, a3, k;
+    }
+
+    /// A shape drawn in the GUI: up to 16 points with x and y in 0..1, joined by segments
+    /// that bend by their tension (0 is straight)
+    struct Curve
+    {
+        float[16] x;
+        float[16] y;
+        float[16] tension;
+        int count;
+    }
+
+    /// Returns the curve's value at position t (0..1). A curve that hasn't been drawn
+    /// yet is a straight ramp up, which is what the GUI shows for it too.
+    float evaluateCurve (Curve c, float t)
+    {
+        if (c.count < 2)
+            return t;
+
+        let last = c.count - 1;
+
+        if (t <= c.x.at (0))     return c.y.at (0);
+        if (t >= c.x.at (last))  return c.y.at (last);
+
+        for (int i = 0; i < last; ++i)
+        {
+            let x1 = c.x.at (i + 1);
+
+            if (t < x1)
+            {
+                let x0 = c.x.at (i);
+                let p = (t - x0) / max (x1 - x0, 1.0e-6f);
+                let k = c.tension.at (i);
+                let shaped = abs (k) < 0.001f ? p : (exp (k * p) - 1.0f) / (exp (k) - 1.0f);
+                return c.y.at (i) + (c.y.at (i + 1) - c.y.at (i)) * shaped;
+            }
+        }
+
+        return c.y.at (last);
+    }
+}
+
+//==============================================================================
+// A 16-step sequencer. Each set bit in `pattern` is a hit, and `notes` holds the note for
+// each step as semitones from `root`.
+// Downbeats are accented. Uses the host's tempo if one arrives, otherwise `bpm`.
+processor Sequencer
+{
+    input event std::timeline::Tempo tempoIn;
+    input event std::timeline::TransportState transportIn;
+    input event std::timeline::Position positionIn;
+    input value int run;
+    input value float bpm;
+    input value int pattern;
+    input value float root;
+    input value int notes[16];
+
+    output event (std::notes::NoteOn, std::notes::NoteOff) noteOut;
+    output event int stepOut;
+    output value float tempoOut;
+    output stream float clockOut;   // the position in 16th notes, wrapped to 8 bars, for the mod lanes
+
+    event tempoIn (std::timeline::Tempo t)
+    {
+        if (t.bpm > 0.0f)
+        {
+            hostTempo = t.bpm;
+            hasHostTempo = true;
+        }
+    }
+
+    // Once a host has told us about its transport, Run only plays while the host does.
+    // A standalone player never sends one, so there Run alone starts and stops it.
+    event transportIn (std::timeline::TransportState t)
+    {
+        hasHostTransport = true;
+        isHostPlaying = t.isPlaying();
+    }
+
+    event positionIn (std::timeline::Position p)
+    {
+        hostSixteenths = p.quarterNote * 4.0;
+        hasNewPosition = true;
+    }
+
+    let sequencerChannel = 200;
+
+    float hostTempo;
+    bool hasHostTempo, hasHostTransport, isHostPlaying, hasNewPosition;
+    float64 hostSixteenths;
+
+
+    void main()
+    {
+        float64 sixteenths;   // position in 16th notes; each whole number is a step
+        int64 lastIndex;
+        bool isNoteOn, wasRunning;
+        float lastPitch;
+
+        loop
+        {
+            let tempo = hasHostTempo ? hostTempo : bpm;
+            tempoOut <- tempo;
+
+            let shouldPlay = run != 0 && (! hasHostTransport || isHostPlaying);
+            let isSynced = hasHostTransport && hasNewPosition;
+
+            if (isSynced)
+            {
+                sixteenths = hostSixteenths;
+                hasNewPosition = false;
+            }
+
+            if (shouldPlay)
+            {
+                if (! wasRunning)
+                {
+                    wasRunning = true;
+
+                    if (! hasHostTransport)
+                        sixteenths = 0;
+
+                    // start on the step we're at if it's exactly on it, otherwise wait for the next one
+                    lastIndex = int64 (ceil (sixteenths)) - 1;
+                }
+
+                let index = int64 (floor (sixteenths));
+
+                // the host's position can nudge us back a hair, which mustn't retrigger a step,
+                // but a bigger jump backwards (a loop, or relocating) starts from there
+                if (index > lastIndex || index < lastIndex - 1)
+                {
+                    lastIndex = index;
+                    let step = int (((index % 16) + 16) % 16);
+                    stepOut <- step;
+
+                    if (isNoteOn)
+                    {
+                        noteOut <- std::notes::NoteOff (sequencerChannel, lastPitch, 0.0f);
+                        isNoteOn = false;
+                    }
+
+                    if (((pattern >> step) & 1) != 0)
+                    {
+                        let interval = notes[wrap<16> (step)];
+                        lastPitch = root + float (interval);
+
+                        noteOut <- std::notes::NoteOn (sequencerChannel, lastPitch, step % 4 == 0 ? 1.0f : 0.72f);
+                        isNoteOn = true;
+                    }
+                }
+            }
+            else if (wasRunning)
+            {
+                wasRunning = false;
+                stepOut <- -1;
+
+                if (isNoteOn)
+                {
+                    noteOut <- std::notes::NoteOff (sequencerChannel, lastPitch, 0.0f);
+                    isNoteOn = false;
+                }
+            }
+
+            clockOut <- float (sixteenths - 128.0 * floor (sixteenths / 128.0));
+            sixteenths += float64 (max (tempo, 20.0f)) * (4.0 / 60.0) * processor.period;
+            advance();
+        }
+    }
+}
+
+//==============================================================================
+// One hit: an FM sine with a pitch drop, mixed with noise, through a resonant filter
+// whose cutoff is kicked up to six octaves by its own fast envelope, then driven and folded
+processor PercVoice
+{
+    input event (std::notes::NoteOn, std::notes::NoteOff) eventIn;
+    input value float decay;
+    input value float pitchDrop;
+    input value float fm;
+    input value float noise;
+    input value float cutoff;
+    input value float resonance;
+    input value float envAmount;
+    input value float rubber;
+    input value int filterMode;
+    input value float drive;
+    input value float fold;
+    input value float pitchMod;   // semitones, from the mod lanes
+    output stream float out;
+
+    event eventIn (std::notes::NoteOn e)
+    {
+        frequency = std::notes::noteToFrequency (e.pitch);
+        velocity = e.velocity;
+        ampEnv = 1.0f;
+        pitchEnv = 1.0f;
+        filterEnv = 1.0f;
+        phase = 0.0f;
+        modPhase = 0.0f;
+    }
+
+    event eventIn (std::notes::NoteOff e) {}
+
+    void init()
+    {
+        rng.seed (1000L + processor.id);
+    }
+
+    std::random::RNG rng;
+    strike::SVF filter;
+    float frequency, velocity, ampEnv, pitchEnv, filterEnv, phase, modPhase;
+
+    void main()
+    {
+        loop
+        {
+            let freq = frequency * pow (2.0f, (pitchDrop * pitchEnv + pitchMod) / 12.0f);
+            let modulator = fm * 3.0f * sin (modPhase * float (twoPi));
+            let tone = sin (phase * float (twoPi) + modulator);
+            let source = (tone * (1.0f - noise) + rng.getBipolar() * noise) * ampEnv;
+
+            filter.setup (cutoff * pow (2.0f, envAmount * 6.0f * filterEnv), resonance, processor.frequency);
+            filter.process (source);
+
+            let driven = (filterMode == 0 ? filter.lp : filter.bp) * (1.0f + drive * 24.0f);
+            let clipped = tanh (driven);
+            let shaped = clipped + (sin (driven * (1.0f + fold * 3.0f)) - clipped) * fold;
+
+            out <- velocity * 0.8f * shaped;
+
+            phase += freq * float (processor.period);
+            modPhase += freq * 1.41f * float (processor.period);
+
+            if (phase >= 1.0f)     phase -= 1.0f;
+            if (modPhase >= 1.0f)  modPhase -= 1.0f;
+
+            ampEnv    *= strike::decayCoefficient (decay, processor.frequency);
+            pitchEnv  *= strike::decayCoefficient (0.04f, processor.frequency);
+            filterEnv *= strike::decayCoefficient (rubber, processor.frequency);
+            advance();
+        }
+    }
+}
+
+//==============================================================================
+// Plays the three modulation lanes and applies them. Each lane loops its curve over its
+// length, locked to the sequencer's clock, and adds curve * depth to its target. Lanes
+// on the same target add up. Every amount is smoothed a little, so a curve with a sheer
+// jump in it doesn't click.
+processor ModMatrix
+{
+    input stream float clock;
+    input value strike::Curve curve1, curve2, curve3;
+    input value int target1, target2, target3;
+    input value int length1, length2, length3;
+    input value float depth1, depth2, depth3;
+
+    input value float cutoff, resonance, envAmount, rubber, decay, drive, fold, fm, noise;
+    input value float feedback, delayMix, delayTone;
+
+    output value float cutoffOut, resonanceOut, envAmountOut, rubberOut, decayOut;
+    output value float driveOut, foldOut, fmOut, noiseOut, pitchOut;
+    output value float feedbackOut, delayMixOut, delayToneOut;
+    output event float clockEventOut;
+
+    let numTargets = 13;
+
+    // how far each lane reaches through its curve, given its length choice
+    float getPhase (float position, int lengthChoice)
+    {
+        let sixteenths = float (4 << clamp (lengthChoice, 0, 5));
+        let wrapped = position - sixteenths * floor (position / sixteenths);
+        return wrapped / sixteenths;
+    }
+
+    void main()
+    {
+        float[numTargets] amounts, smoothed;
+        int samplesUntilClockEvent;
+
+        loop
+        {
+            let position = clock;
+
+            for (wrap<numTargets> i)
+                amounts[i] = 0.0f;
+
+            amounts.at (target1) += depth1 * strike::evaluateCurve (curve1, getPhase (position, length1));
+            amounts.at (target2) += depth2 * strike::evaluateCurve (curve2, getPhase (position, length2));
+            amounts.at (target3) += depth3 * strike::evaluateCurve (curve3, getPhase (position, length3));
+
+            let smoothing = 1.0f - exp (-1.0f / (0.003f * float (processor.frequency)));
+
+            for (wrap<numTargets> i)
+                smoothed[i] += (amounts[i] - smoothed[i]) * smoothing;
+
+            // multiplying controls move in octaves (or doublings), the rest just add
+            cutoffOut    <- clamp (cutoff * pow (2.0f, smoothed[0] * 6.0f), 20.0f, 18000.0f);
+            resonanceOut <- clamp (resonance + smoothed[1] * 15.5f, 0.5f, 16.0f);
+            envAmountOut <- clamp (envAmount + smoothed[2], 0.0f, 1.0f);
+            rubberOut    <- clamp (rubber * pow (2.0f, smoothed[3] * 3.0f), 0.005f, 1.5f);
+            decayOut     <- clamp (decay * pow (2.0f, smoothed[4] * 3.0f), 0.01f, 3.0f);
+            driveOut     <- clamp (drive + smoothed[5], 0.0f, 1.0f);
+            foldOut      <- clamp (fold + smoothed[6], 0.0f, 1.0f);
+            fmOut        <- clamp (fm + smoothed[7], 0.0f, 1.0f);
+            noiseOut     <- clamp (noise + smoothed[8], 0.0f, 1.0f);
+            pitchOut     <- smoothed[9] * 24.0f;
+            feedbackOut  <- clamp (feedback + smoothed[10] * 0.95f, 0.0f, 0.95f);
+            delayMixOut  <- clamp (delayMix + smoothed[11], 0.0f, 1.0f);
+            delayToneOut <- clamp (delayTone * pow (2.0f, smoothed[12] * 4.0f), 200.0f, 16000.0f);
+
+            // about 40 times a second, tell the GUI where the lanes are
+            if (--samplesUntilClockEvent <= 0)
+            {
+                samplesUntilClockEvent = int (processor.frequency / 40.0);
+                clockEventOut <- position;
+            }
+
+            advance();
+        }
+    }
+}
+
+//==============================================================================
+// A tempo-synced ping-pong delay. The time glides when it changes (like tape), and the
+// feedback path is darkened, thinned out and saturated so the repeats get dirtier as they go.
+processor Echo
+{
+    input stream float in;
+    input value float bpm;
+    input value int division;
+    input value float feedback;
+    input value float mix;
+    input value float tone;
+    input value float volume;
+    output stream float<2> out;
+
+    let bufferSize = 192000;   // two seconds at 96kHz
+
+    float[bufferSize] left, right;
+    wrap<bufferSize> writePos;
+    float delaySamples = 1000.0f;
+    float lowL, lowR, bassL, bassR, gain;
+
+    float getBeats()
+    {
+        if (division == 0)  return 0.25f;
+        if (division == 1)  return 1.0f / 3.0f;
+        if (division == 2)  return 0.5f;
+        if (division == 3)  return 0.75f;
+        return 1.0f;
+    }
+
+    void main()
+    {
+        loop
+        {
+            let target = clamp (60.0f / max (bpm, 20.0f) * getBeats() * float (processor.frequency), 1.0f, float (bufferSize - 2));
+            delaySamples += (target - delaySamples) * 0.0004f;
+
+            var readPosition = float (writePos) - delaySamples;
+
+            if (readPosition < 0.0f)
+                readPosition += float (bufferSize);
+
+            // linear interpolation between the two samples either side of the read position
+            let index = int (floor (readPosition));
+            let fraction = readPosition - float (index);
+            let echoL = left.at (index) + (left.at (index + 1) - left.at (index)) * fraction;
+            let echoR = right.at (index) + (right.at (index + 1) - right.at (index)) * fraction;
+
+            // darken, remove low end, and saturate what goes back round
+            let lowCoeff = 1.0f - exp (-float (twoPi) * tone * float (processor.period));
+            let bassCoeff = 1.0f - exp (-float (twoPi) * 150.0f * float (processor.period));
+            lowL += (echoL - lowL) * lowCoeff;
+            lowR += (echoR - lowR) * lowCoeff;
+            bassL += (lowL - bassL) * bassCoeff;
+            bassR += (lowR - bassR) * bassCoeff;
+
+            // ping-pong: the input goes into the left line, and each side feeds the other
+            left[writePos]  = in + tanh (1.3f * feedback * (lowR - bassR));
+            right[writePos] = tanh (1.3f * feedback * (lowL - bassL));
+            ++writePos;
+
+            gain += (pow (10.0f, volume / 20.0f) - gain) * 0.001f;
+            let wet = float<2> (echoL, echoR) * mix;
+            let mixed = (float<2> (in, in) + wet) * gain;
+            out <- float<2> (tanh (mixed[0]), tanh (mixed[1]));
+
+            advance();
+        }
+    }
+}

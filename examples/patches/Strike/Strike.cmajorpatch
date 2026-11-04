@@ -1,0 +1,19 @@
+{
+    "CmajorVersion":    1,
+    "ID":               "dev.cmajor.examples.strike",
+    "version":          "1.0",
+    "name":             "Strike",
+    "description":      "Techno percussion: pitched blips through a rubbery resonant filter, distortion and a ping-pong delay, with a built-in step sequencer",
+    "manufacturer":     "Cmajor Software Ltd",
+    "isInstrument":     true,
+
+    "source":           "Strike.cmajor",
+    "worker":           "worker.js",
+
+    "view":             {
+                            "src": "view/index.js",
+                            "width": 1040,
+                            "height": 618,
+                            "resizable": true
+                        }
+}
