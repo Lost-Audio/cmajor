@@ -1,0 +1,86 @@
+namespace ViscoEffects
+{
+    // Frequency-dependent delay, RVAs 0xdf510, 0xda290, and 0xd9c00.
+    struct SpringDispersion
+    {
+        float[256] inputRing,outputRing,re,im,cosine,sine;
+        int[256] reversed;
+        float<2>[65536] history;
+        float<2>[128] first,second;int[128] delays;
+        float averageDelay;int cursor,frame;
+        void configure(float rate)
+        {
+            this.inputRing=0.0f;this.outputRing=0.0f;this.history=0.0f;this.cursor=0;this.frame=0;
+            for(int i=0;i<256;++i){int r=0,v=i;loop(8){r=(r<<1)|(v&1);v>>=1;}this.reversed[i]=r;this.cosine[i]=float(cos(float64(i)*6.283185307179586/256.0));this.sine[i]=float(sin(float64(i)*6.283185307179586/256.0));}
+            let table=rate==44100.0f?0:rate==48000.0f?1:rate==88200.0f?2:rate==96000.0f?3:rate==176400.0f?4:rate==192000.0f?5:-1;
+            if(table>=0){for(int i=0;i<128;++i){this.delays[i]=ViscoSpringData::delays.at(table*128+i);this.first[i]=float<2>(ViscoSpringData::first.at(table*256+i*2),ViscoSpringData::first.at(table*256+i*2+1));this.second[i]=float<2>(ViscoSpringData::second.at(table*256+i*2),ViscoSpringData::second.at(table*256+i*2+1));}this.averageDelay=ViscoSpringData::average.at(table);}
+            else this.makeProfile(rate);
+            this.renderFrame();
+        }
+        void makeProfile(float rate)
+        {
+            float[128] times,weights;float maximum=0.0f,sum=0.0f,total=0.0f;
+            for(int i=0;i<128;++i){let hz=float(i)*(rate*0.00390625f);let curve=hz>=6000.0f?50.0f/((hz-4000.0f)/2000.0f+1.0f)+4.0f:exp(-abs(6000.0f-hz)/1200.0f)*60.0f+20.0f;times[i]=(rate*0.015625f*0.001f)*curve;weights[i]=((hz+6.0f)/((pow(hz/8000.0f,3.0f)+1.0f)*(hz+8.0f)))*min(abs(hz-6000.0f)/400.0f,1.0f);sum+=weights[i]*times[i];total+=weights[i];maximum=max(maximum,weights[i]);}
+            this.averageDelay=(sum*64.0f)/total;let scale=1.0f/maximum;float phase=0.0f;
+            for(int i=0;i<128;++i){this.delays[i]=int(times[i]);let fraction=times[i]-float(this.delays[i]);for(int j=0;j<2;++j){let d=float(j)-fraction,w=max(0.0f,1.0f-abs(d)),level=(3.0f-(w+w))*w*w*(weights[i]*scale);var p=float(i)*d*0.25f+phase;p-=floor(p);let q=(1.0f-p)*p*4.0f;let r=(1.0f-((q*q*WaveData::k1fefc0+WaveData::k1fefec)*q)*q)*level;let v=((q*WaveData::k1fefe0+WaveData::k1feff0)*q+WaveData::k1ff004)*(0.5f-p)*q*level;if(j==0)this.first[i]=float<2>(r,v);else this.second[i]=float<2>(r,v);}if(i<127){let d=(times[i+1]-times[i])*(float(i)+0.5f)*0.25f;phase=phase+(d-floor(phase+d));}}
+        }
+        void transform(bool inverse)
+        {
+            for(int i=0;i<256;++i)if(i<this.reversed[i]){let j=this.reversed[i],r=this.re[i],v=this.im[i];this.re[i]=this.re[j];this.im[i]=this.im[j];this.re[j]=r;this.im[j]=v;}
+            for(int size=2;size<=256;size*=2)for(int j=0;j<size/2;++j){let c=this.cosine[j*256/size],s=inverse?this.sine[j*256/size]:-this.sine[j*256/size];for(int k=j;k<256;k+=size){let b=k+size/2,x=this.re[b]*c-this.im[b]*s,y=this.re[b]*s+this.im[b]*c,r=this.re[k],v=this.im[k];this.re[k]=r+x;this.im[k]=v+y;this.re[b]=r-x;this.im[b]=v-y;}}
+        }
+        void renderFrame()
+        {
+            for(int i=0;i<256;++i){this.re[i]=this.inputRing[(this.cursor+i)%256]*ViscoSpringData::analysis.at(i);this.im[i]=0.0f;}
+            this.transform(false);
+            for(int i=0;i<128;++i)this.history.at(this.frame*128+i)=float<2>(this.re[i],this.im[i]);
+            this.re=0.0f;this.im=0.0f;
+            for(int i=0;i<128;++i){let old=(this.frame-this.delays[i]+512)%512,prior=(old+511)%512,a=this.history.at(old*128+i),b=this.history.at(prior*128+i),c=this.first[i],d=this.second[i];this.re[i]=(d[0]*b[0]-d[1]*b[1])+(c[0]*a[0]-c[1]*a[1]);this.im[i]=c[0]*a[1]+c[1]*a[0]+d[0]*b[1]+d[1]*b[0];}
+            this.im[0]=0.0f;
+            for(int i=1;i<128;++i){this.re[256-i]=this.re[i];this.im[256-i]=-this.im[i];}
+            this.transform(true);
+            for(int i=0;i<256;++i){let v=this.re[i]*ViscoSpringData::synthesis.at(i),p=(this.cursor+i)%256;if(i<192)this.outputRing[p]=v+this.outputRing[p];else this.outputRing[p]=v;}
+            this.frame=(this.frame+1)%512;
+        }
+        float process(float x)
+        {
+            this.inputRing[this.cursor]=x;let y=this.outputRing[this.cursor];this.cursor=(this.cursor+1)%256;if(this.cursor%64==0)this.renderFrame();return y;
+        }
+    }
+    // Spring Reverb, RVA 0xe2c80.
+    struct Spring
+    {
+        SpringDispersion dispersion;
+        Small::Line feedback;ReadHead head;
+        Small::Line[2] allpasses;int[2] delays;
+        StateFilter filter;
+        float rate,length,color,phase,decay,inputGain,filterFrequency,filterDamping;
+        int cursor;bool ready;
+        void reset() { this.ready=false;this.cursor=0;this.phase=0.0f;this.head.reset();this.filter.reset(); }
+        void configure(float rate,float length,float color)
+        {
+            if(!this.ready||rate!=this.rate){this.dispersion.configure(rate);this.feedback.reset(max(256,int(rate*0.1f)&~7));for(int c=0;c<2;++c){this.allpasses[c].reset(int(rate*0.1f));this.delays[c]=int(rate*0.001f*17.0f*pow(2.0f,float(c*5)/7.0f));}this.ready=true;}
+            this.rate=rate;this.length=length;this.color=color;let l=max(0.0f,length/100.0f),c=color/100.0f;
+            this.decay=(pow(2.0f,(l-0.5f)*(-6.0f))*1.5f)/rate;this.inputGain=1.0f-l*0.75f;
+            this.filterFrequency=clamp((c*8000.0f*c*c+100.0f)/rate,0.001f,0.44999998807907104f);
+            let d=(c-0.6600000262260437f)/0.6600000262260437f;this.filterDamping=clamp(d*d*0.75f+0.20000000298023224f,0.0f,0.9900000095367432f);
+        }
+        void beginBlock()
+        {
+            this.phase=((64.0f/this.rate)*2.5f-floor(this.phase))+this.phase;
+            let delay=max((sineCycle(this.phase)*0.25f+5.0f)*(this.rate*0.001f),2.0f);
+            this.feedback.beginRead(this.head,delay,((delay+this.dispersion.averageDelay)*this.decay)/delay,64);
+            for(int c=0;c<2;++c)this.allpasses[c].beginGain(this.delays[c],this.decay,64);
+            this.filter.beginBlock(this.filterFrequency,this.filterDamping,64);
+        }
+        float<2> process(float<2> x)
+        {
+            if(this.cursor==0)this.beginBlock();
+            let v=this.feedback.read(this.head);var mono=v/(abs(v)*0.20000000298023224f+1.0f);
+            mono=x[0]*this.inputGain+mono;mono=x[1]*this.inputGain+mono;mono=this.dispersion.process(mono);
+            let left=mono;mono=this.allpasses[0].allpass(mono,this.delays[0],-0.6100000143051147f);let right=mono;
+            mono=this.allpasses[1].allpass(mono,this.delays[1],-0.6100000143051147f);this.feedback.push(mono);
+            this.cursor=(this.cursor+1)%64;return this.filter.process(float<2>(left,right));
+        }
+    }
+}

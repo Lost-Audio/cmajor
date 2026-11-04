@@ -18,7 +18,8 @@ export default function(connection){
 }
 `);
 const manifest=new URL('WorkerProbe.cmajorpatch',import.meta.url);
-fs.writeFileSync(manifest,JSON.stringify({CmajorVersion:1,ID:'local.morphfieldexact.worker-test',version:'1.0',name:'Worker test',source:['Defaults.cmajor','WaveData.cmajor','ViscoLimiter.cmajor','MorphFieldExact.cmajor'],worker:'test-artifacts/WorkerProbe.js'}));
+const patchManifest=JSON.parse(fs.readFileSync(new URL('MorphFieldExact.cmajorpatch',import.meta.url)));
+fs.writeFileSync(manifest,JSON.stringify({CmajorVersion:1,ID:'local.morphfieldexact.worker-test',version:'1.0',name:'Worker test',source:patchManifest.source,worker:'test-artifacts/WorkerProbe.js'}));
 const result=await new Promise((resolve,reject)=>{
  const child=spawn('cmaj',['play','--no-gui','--worker=webview','--stop-on-error','WorkerProbe.cmajorpatch'],{cwd:dir,windowsHide:true});
  let stdout='',stderr='',finished=false;

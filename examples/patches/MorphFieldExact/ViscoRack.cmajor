@@ -1,0 +1,122 @@
+// Two parallel send effects feed two serial main effects.
+namespace ViscoEffects
+{
+    struct SendSlot
+    {
+        int requested,active,cursor;float rate,p1,p2,wet,step,target,tempo;bool enabled;
+        Chorus core0;
+        Diffuser core1;
+        Plate core2;
+        Room core3;
+        Spring core4;
+        Delay core5;
+        Compressor core6;
+        Fuzz core7;
+        void setup(float rate,int type,float a,float b) { this.rate=rate;this.requested=type;this.active=-1;this.p1=a;this.p2=b;this.tempo=120.0f; }
+        void select(int type) { this.requested=clamp(type,0,7); }
+        void configure()
+        {
+            if(this.active==0)this.core0.configure(this.rate,clamp(this.p1,1.0f,100.0f),clamp(this.p2,0.5f,10.0f));
+            if(this.active==1)this.core1.configure(this.rate,clamp(this.p1,0.0f,100.0f),clamp(this.p2,0.0f,300.0f));
+            if(this.active==2)this.core2.configure(this.rate,clamp(this.p1,0.0f,100.0f),clamp(this.p2,0.0f,100.0f));
+            if(this.active==3)this.core3.configure(this.rate,clamp(this.p1,0.0f,100.0f),clamp(this.p2,0.0f,100.0f));
+            if(this.active==4)this.core4.configure(this.rate,clamp(this.p1,0.0f,100.0f),clamp(this.p2,0.0f,100.0f));
+            if(this.active==5)this.core5.configure(this.rate,clamp(this.p1,1.0f,8.0f),clamp(this.p2,0.0f,100.0f));
+            if(this.active==6)this.core6.configure(this.rate,clamp(this.p1,0.1f,10.0f),clamp(this.p2,0.0f,100.0f));
+            if(this.active==7)this.core7.configure(this.rate,clamp(this.p1,0.0f,100.0f),clamp(this.p2,0.0f,100.0f));
+        }
+        void prepare()
+        {
+            if(this.active!=this.requested&&this.wet==0.0f){this.active=this.requested;
+                if(this.active==0)this.core0.reset();
+                if(this.active==1)this.core1.reset();
+                if(this.active==2)this.core2.reset();
+                if(this.active==3)this.core3.reset();
+                if(this.active==4)this.core4.reset();
+                if(this.active==5)this.core5.reset();
+                if(this.active==6)this.core6.reset();
+                if(this.active==7)this.core7.reset();
+                this.configure();
+            }
+        }
+        void resume(int64& seed)
+        {
+            if(this.active==1)for(int i=0;i<8;++i)this.core1.lines[i].data=0.0f;
+            if(this.active==2){for(int i=0;i<4;++i)this.core2.feedback[i].data=0.0f;for(int i=0;i<8;++i)this.core2.scatter[i].data=0.0f;}
+            if(this.active==3){seed=(seed*214013L+2531011L)&0xffffffffL;this.core3.phase=float((seed>>16)&32767L)/32767.0f;this.core3.pre.reset();for(int i=0;i<2;++i)this.core3.modulated[i].data=0.0f;for(int i=0;i<6;++i){this.core3.scatter[i].data=0.0f;this.core3.allpasses[i].data=0.0f;}}
+            if(this.active==4){this.core4.dispersion.history=0.0f;this.core4.feedback.data=0.0f;for(int i=0;i<2;++i)this.core4.allpasses[i].data=0.0f;}
+            if(this.active==5){for(int i=0;i<2;++i){this.core5.lines[i].data=0.0f;this.core5.scatter[i].data=0.0f;}}
+        }
+        float<2> process(float<2> x,int64& seed)
+        {
+            this.prepare();this.core5.tempo=this.tempo;
+            if(this.cursor==0){this.target=(this.enabled&&this.active==this.requested)?1.0f:0.0f;if(this.wet==0.0f&&this.target>0.0f)this.resume(seed);let limit=300.0f/(this.rate+1.0f);this.step=clamp((this.target-this.wet)/64.0f,-limit,limit);}
+            float<2> y;
+            if(this.wet>0.0f||this.target>0.0f){
+                if(this.active==0)y=this.core0.process(x);
+                if(this.active==1)y=this.core1.process(x);
+                if(this.active==2)y=this.core2.process(x);
+                if(this.active==3)y=this.core3.process(x);
+                if(this.active==4)y=this.core4.process(x);
+                if(this.active==5)y=this.core5.process(x);
+                if(this.active==6)y=this.core6.process(x);
+                if(this.active==7)y=this.core7.process(x);
+            }
+            let result=y*this.wet;
+            this.wet+=this.step;if(++this.cursor==64){this.cursor=0;if(abs(this.wet-this.target)<0.0001f)this.wet=this.target;}return result;
+        }
+    }
+    struct MainSlot
+    {
+        int requested,active,cursor;float rate,p1,p2,wet,step,target,tempo;bool enabled;
+        Sticky core0;
+        Optical core1;
+        Upward core2;
+        ViscoDynamics::Limiter core3;
+        Tape core4;
+        Transformer core5;
+        void setup(float rate,int type,float a,float b) { this.rate=rate;this.requested=type;this.active=-1;this.p1=a;this.p2=b;this.tempo=120.0f; }
+        void select(int type) { this.requested=clamp(type,0,5); }
+        void configure()
+        {
+            if(this.active==0)this.core0.configure(this.rate,clamp(this.p1,0.0f,48.0f),clamp(this.p2,0.0f,100.0f));
+            if(this.active==1)this.core1.configure(this.rate,clamp(this.p1,0.0f,48.0f),clamp(this.p2,0.0f,100.0f));
+            if(this.active==2)this.core2.configure(this.rate,clamp(this.p1,0.1f,10.0f),clamp(this.p2,0.0f,100.0f));
+            if(this.active==3)this.core3.configure(this.rate,clamp(this.p1,0.0f,48.0f),clamp(this.p2,0.0f,100.0f));
+            if(this.active==4)this.core4.configure(this.rate,clamp(this.p1,0.0f,100.0f),clamp(this.p2,0.0f,100.0f));
+            if(this.active==5)this.core5.configure(this.rate,clamp(this.p1,0.0f,48.0f),clamp(this.p2,-100.0f,100.0f));
+        }
+        void prepare()
+        {
+            if(this.active!=this.requested&&this.wet==0.0f){this.active=this.requested;
+                if(this.active==0)this.core0.reset();
+                if(this.active==1)this.core1.reset();
+                if(this.active==2)this.core2.reset();
+                if(this.active==3)this.core3.reset();
+                if(this.active==4)this.core4.reset();
+                if(this.active==5)this.core5.reset();
+                this.configure();
+            }
+        }
+        void resume(int64& seed)
+        {
+            if(this.active==2)this.core2.reset();
+        }
+        float<2> process(float<2> x,int64& seed)
+        {
+            this.prepare();
+            if(this.cursor==0){this.target=(this.enabled&&this.active==this.requested)?1.0f:0.0f;if(this.wet==0.0f&&this.target>0.0f)this.resume(seed);let limit=300.0f/(this.rate+1.0f);this.step=clamp((this.target-this.wet)/64.0f,-limit,limit);}
+            float<2> y;
+            if(this.wet>0.0f||this.target>0.0f){
+                if(this.active==0)y=this.core0.process(x);
+                if(this.active==1)y=this.core1.process(x);
+                if(this.active==2)y=this.core2.process(x);
+                if(this.active==3)y=this.core3.process(x);
+                if(this.active==4)y=this.core4.processShared(x,seed);
+                if(this.active==5)y=this.core5.process(x);
+            }
+            let result=x*(1.0f-this.wet)+y*this.wet;
+            this.wet+=this.step;if(++this.cursor==64){this.cursor=0;if(abs(this.wet-this.target)<0.0001f)this.wet=this.target;}return result;
+        }
+    }
+}

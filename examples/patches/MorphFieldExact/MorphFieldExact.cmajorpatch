@@ -1,22 +1,29 @@
 {
   "CmajorVersion": 1,
   "ID": "local.examples.morphfieldexact",
-  "version": "1.0.2",
+  "version": "1.3.0",
   "name": "Morph Field Exact",
-  "description": "Morph two sound models with the traced renderer and optional Visco limiter.",
+  "description": "Morph two sounds with twelve tonal shapes, harmonic stretch, eight voices, and a shared effect rack.",
   "manufacturer": "Local experiments",
   "isInstrument": true,
   "source": [
     "Defaults.cmajor",
     "WaveData.cmajor",
     "ViscoLimiter.cmajor",
+    "ViscoEffects.cmajor",
+    "ViscoSpace.cmajor",
+    "ViscoSpringData.cmajor",
+    "ViscoSpring.cmajor",
+    "ViscoRack.cmajor",
+    "OscillatorData.cmajor",
+    "MorphVoice.cmajor",
     "MorphFieldExact.cmajor"
   ],
   "worker": "worker.js",
   "view": {
     "src": "view/index.js",
     "width": 900,
-    "height": 680,
+    "height": 800,
     "resizable": true
   }
 }

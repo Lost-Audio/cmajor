@@ -3,3 +3,13 @@
 /worker-test-results.json
 /limiter-test-results.json
 /WorkerProbe.cmajorpatch
+/effects-test-results.json
+/effects-view-test-results.json
+/rack-test-results.json
+/native-rack-test-results.json
+/bypass-test-results.json
+/EffectsViewProbe.cmajorpatch
+/polyphony-test-results.json
+/native-polyphony-test-results.json
+/oscillators-test-results.json
+/native-oscillators-test-results.json

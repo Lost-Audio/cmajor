@@ -1,0 +1,499 @@
+// Sound model and per-note renderer. Effects run after the voice sum.
+namespace MorphVoice
+{
+    struct ModelCurve { int slot; int kind; int index; float[49] positions; }
+    struct ModelInfo { int slot; float norm; float duration; float[7] tail; }
+    struct Reader { int index; float width; float nextWidth; float base; float slope; float nextSlope; float quadratic; float shape; float sum; }
+    struct Voice
+    {
+        Reader[8] readers;
+        float[574] times,stageTimes;
+        float[588] frequencies,stageFrequencies;
+        float[2] norms,durations;
+        float[14] tails;
+        float[392] readA,readB;
+        float[7] previousProgress,progress,speed;
+        float[49] frequency;
+        float[80] density,weights,tone,onset,share,freqTurns,timeTurns;
+        float[240] frequencyPolynomial;
+        float[80] lowLeft,lowRight,noiseGain,noiseRe,noiseIm;
+        int[80] lowBin;
+        int[128] highBand;
+        float[128] highLeft,highRight,highGain;
+        float[416] initialNoise,noise,phase,coupling,solved;
+        float[208] a,b,mag,amplitude,noiseShare,turns,scratch;
+        float[328] history;
+        float[137] specRe,specIm;
+        float[256] fftRe,fftIm,ola,fftCos,fftSin;
+        int[256] reversed;
+        float mix,modelPosition,raw,velocityGain,gain;
+        float shelfA,shelfB,shelfC,shelfState,delay1,delay2;
+        int lowCount,highCount,startBin,voiceSize,historyIndex,historyCount,countdown,outIndex;
+        int64 noiseSeed,tailSeed;
+        bool active,firstNoise;
+        float sampleRate;
+        void modelCurve(ModelCurve c)
+        {
+            if(c.slot<0 || c.slot>1)return;
+            if(c.kind==0 && c.index>=0 && c.index<7)
+                for(int q=0;q<41;++q)this.stageTimes.at(c.slot*287+c.index*41+q)=c.positions.at(q);
+            if(c.kind==1 && c.index>=0 && c.index<6)
+                for(int q=0;q<49;++q)this.stageFrequencies.at(c.slot*294+c.index*49+q)=c.positions.at(q);
+        }
+        void modelInfo(ModelInfo m)
+        {
+            if(m.slot<0 || m.slot>1 || !(m.norm>0.0f))return;
+            for(int q=0;q<287;++q)this.times.at(m.slot*287+q)=this.stageTimes.at(m.slot*287+q);
+            for(int q=0;q<294;++q)this.frequencies.at(m.slot*294+q)=this.stageFrequencies.at(m.slot*294+q);
+            for(int q=0;q<7;++q)this.tails.at(m.slot*7+q)=m.tail.at(q);
+            this.norms.at(m.slot)=m.norm;this.durations.at(m.slot)=m.duration;
+            this.active=false;
+        }
+
+        float lerp(float a,float b,float t) { return (1.0f-t)*a+t*b; }
+        float interval(int r,int i)
+        {
+            let k=r*49+i;
+            return (this.readA.at(k+1)-this.readA.at(k))*(1.0f-(r==7?0.0f:this.mix))+
+                   (this.readB.at(k+1)-this.readB.at(k))*(r==7?0.0f:this.mix);
+        }
+        void resetReader(int r)
+        {
+            let w=this.interval(r,0);
+            Reader s;
+            s.index=-1;s.width=w;s.nextWidth=w;s.base=-w;s.nextSlope=1.0f/w;
+            this.readers.at(r)=s;
+        }
+        float readCurve(int r,float x)
+        {
+            if(x<this.readA.at(r*49))return 0.0f;
+            Reader s=this.readers.at(r);
+            let count=r==7?49:41;
+            while(s.index<count-1)
+            {
+                let w=s.width;
+                if(x<s.base+w)break;
+                s.base+=w;++s.index;
+                s.sum=(w*s.quadratic+s.slope)*w+s.sum;
+                s.slope=s.nextSlope;s.width=s.nextWidth;
+                let intervalIndex=r*49+min(s.index+1,count-2);
+                let amount=r==7?0.0f:this.mix;
+                var next=(this.readA.at(intervalIndex+1)-this.readA.at(intervalIndex))*(1.0f-amount)
+                        +(this.readB.at(intervalIndex+1)-this.readB.at(intervalIndex))*amount;
+                if(r==7)next=max(next,1.0e-9f);
+                s.nextWidth=next;
+                let now=s.width;
+                s.nextSlope=(next*next+now*now)/(next*now*(next+now));
+                let shape=(0.5f/w+0.5f/next)*now;
+                s.shape=(shape*shape-1.0f)*0.2f;
+                s.quadratic=(s.nextSlope-(s.shape+1.0f)*s.slope)/((s.shape+2.0f)*now);
+            }
+            x-=s.base;
+            let w=s.width;
+            var numerator=(x*s.quadratic+s.slope)*((w*w)*x);
+            var denominator=x*s.shape*(w-x)+w*w;
+            if(r!=7){numerator=max(numerator,1.0e-30f);denominator=max(denominator,numerator*0.5f);}
+            this.readers.at(r)=s;
+            return numerator/denominator+s.sum;
+        }
+        void reset()
+        {
+            this.modelPosition=0.0f;
+            for(int r=0;r<7;++r)for(int q=0;q<41;++q)
+            {
+                this.readA.at(r*49+q)=this.times.at(r*41+q);
+                this.readB.at(r*49+q)=this.times.at(287+r*41+q);
+            }
+            this.resetReader(0);this.resetReader(1);this.resetReader(2);this.resetReader(3);this.resetReader(4);this.resetReader(5);this.resetReader(6);
+            for(int r=0;r<7;++r)this.previousProgress.at(r)=0.0f;
+        }
+        void advanceTime(int r,float delta)
+        {
+            let p=this.readCurve(r,this.modelPosition);
+            this.speed.at(r)=clamp((p-this.previousProgress.at(r))*(1.0f/delta)-0.17585784196853638f,0.0f,20.0f);
+            this.progress.at(r)=clamp(p*0.125f,0.0f,4.999000072479248f);
+            this.previousProgress.at(r)=p;
+        }
+        void evaluate(float delta)
+        {
+            let oldTime=this.modelPosition;
+            this.modelPosition+=delta;
+            if(this.modelPosition<96.0f && delta>0.0f)
+            {
+                this.advanceTime(0,delta);this.advanceTime(1,delta);this.advanceTime(2,delta);this.advanceTime(3,delta);
+                this.advanceTime(4,delta);this.advanceTime(5,delta);this.advanceTime(6,delta);
+            }
+            else if(delta>0.0f)
+            {
+                let step=(this.linearTime(this.modelPosition)-this.linearTime(oldTime))/689.0625f;
+                for(int r=0;r<7;++r)
+                {
+                    let tau=max(0.001f,(1.0f-this.mix)*this.tails.at(r)+this.mix*this.tails.at(7+r));
+                    this.speed.at(r)=(tau/(tau+step))*this.speed.at(r);
+                    this.tailSeed=(this.tailSeed^(this.tailSeed<<5))&0xffffffffL;this.tailSeed=this.tailSeed^(this.tailSeed>>7);
+                    this.progress.at(r)=clamp(this.progress.at(r)+(float(this.tailSeed)*2.3283000527563047e-10f-0.5f)*0.01f,3.999f,4.999f);
+                }
+            }
+            for(int q=0;q<48;++q)
+            {
+                let r=q/8;
+                let z=float(q%8)*0.125f;
+                let u=(1.0f-z)*this.progress.at(r)+z*this.progress.at(r+1);
+                let t=int(u),v=u-float(t);
+                let lo=this.mix*this.frequencies.at(294+t*49+q)+(1.0f-this.mix)*this.frequencies.at(t*49+q);
+                let hi=this.mix*this.frequencies.at(294+(t+1)*49+q)+(1.0f-this.mix)*this.frequencies.at((t+1)*49+q);
+                this.frequency.at(q)=lo*(1.0f-v)+hi*v;
+            }
+            this.frequency.at(48)=80.0f;
+            for(int q=0;q<49;++q){this.readA.at(343+q)=this.frequency.at(q);this.readB.at(343+q)=this.frequency.at(q);}
+            this.resetReader(7);
+            float previous=this.readCurve(7,0.0f);
+            for(int band=0;band<80;++band)
+            {
+                let current=this.readCurve(7,float(band+1));this.density.at(band)=current-previous;previous=current;
+            }
+            this.frequency.at(48)=80.000999450683594f;
+            int cell=0;
+            let norm=this.velocityGain/max(0.000001f,sqrt(this.norms.at(0))*(1.0f-this.mix)+sqrt(this.norms.at(1))*this.mix);
+            for(int band=0;band<80;++band)
+            {
+                while(cell<47 && this.frequency.at(cell+1)<float(band))++cell;
+                let u=((float(band)-this.frequency.at(cell))/(this.frequency.at(cell+1)-this.frequency.at(cell))+float(cell))*0.125f;
+                let r=clamp(int(u),0,5),z=u-float(r);
+                this.weights.at(band)=((1.0f-z)*this.speed.at(r)+z*this.speed.at(r+1))*max(0.0f,this.density.at(band)-0.25220587849617004f)*norm;
+            }
+        }
+
+
+        float sq(float x) { return x*x; }
+        float<2> rotate(float x)
+        {
+            x-=floor(x);let q=(1.0f-x)*x*4.0f;
+            return float<2>(1.0f-(q*q*WaveData::k1fefc0+WaveData::k1fefec)*(q*q),
+                ((q*WaveData::k1fefe0+WaveData::k1feff0)*q+WaveData::k1ff004)*((0.5f-x)*q));
+        }
+        float fused(float a,float b,float c) { return float(float64(a)*float64(b)+float64(c)); }
+        float clockMapLog(float x)
+        {
+            let bits=std::intrinsics::reinterpretFloatToInt(x),mantissa=bits&0x7fffff,exponent=float((bits>>23)-127);
+            let index=(mantissa>>16)+((mantissa>>15)&1);
+            let a=std::intrinsics::reinterpretIntToFloat((index<<16)|0x3f000000),b=std::intrinsics::reinterpretIntToFloat(mantissa|0x3f000000);
+            let r=(a-b)*WaveData::clockInverse.at(index),p=this.fused(WaveData::k2193b0,r,WaveData::k2193c0);
+            let low=this.fused(WaveData::k219390,exponent,-this.fused(p,r*r,r)),high=this.fused(WaveData::k219380,exponent,WaveData::clockHigh.at(index));
+            return high+(low+WaveData::clockLow.at(index));
+        }
+        float modelTime(float x) { return x<25.0f?x:this.clockMapLog(x/(WaveData::clockOffset*25.0f))/WaveData::clockLog; }
+        float linearTime(float x) { return x<25.0f?x:float(exp(float64(WaveData::clockLog*x)))*(WaveData::clockOffset*25.0f); }
+        float bandWindow(float x) { return this.sq(1.0f-((x-1.0f)*0.1f+1.0f)*(x*x)); }
+        float shelfCurve(float x) { return (1.0f/((1.0f-x*WaveData::k1fbba4)+x*WaveData::k1fd81c*x)-1.0f)*WaveData::k1fd828+1.0f; }
+        void setup(float rateIn)
+        {
+            this.sampleRate=rateIn;this.mix=0.5f;this.velocityGain=1.0f;this.gain=1.0f;this.noiseSeed=2345L;this.tailSeed=123L;this.note=60;this.releaseSeconds=0.2f;this.sustainSeconds=0.1f;this.keyTracking=100.0f;
+            this.times=CoreDefaults::time;this.stageTimes=this.times;
+            this.frequencies=CoreDefaults::frequency;this.stageFrequencies=this.frequencies;
+            this.norms=CoreDefaults::norm;this.durations=CoreDefaults::duration;this.tails=CoreDefaults::tail;
+            let rate=this.sampleRate,binScale=256.0f/rate,hopScale=64.0f/rate;
+            while(this.lowCount<80 && WaveData::bandwidth.at(this.lowCount)<1.3f/binScale && WaveData::hz.at(this.lowCount)<rate*0.5f)++this.lowCount;
+            let end=min(128,int(binScale*WaveData::k1ff050));
+            this.startBin=this.lowCount<80?int(binScale*WaveData::hz.at(this.lowCount)+0.5f):end;
+            this.highCount=end-this.startBin;this.voiceSize=this.lowCount+this.highCount;
+            for(int i=0;i<80;++i)
+            {
+                let k=clamp(i-1,0,77),x=float(k-i),y=x+1.0f,z=x+2.0f;
+                let p=hopScale*WaveData::hz.at(k),q=hopScale*WaveData::hz.at(k+1),r=hopScale*WaveData::hz.at(k+2),dy=q-p;
+                let qa=((r-q)*x+(p-r)*y+dy*z)/((x-z)*(x-y)*(y-z));
+                let qb=dy/(y-x)-(y+x)*qa,qc=(p-qa*x*x)-qb*x;
+                this.frequencyPolynomial.at(i*3)=qc;this.frequencyPolynomial.at(i*3+1)=qb;this.frequencyPolynomial.at(i*3+2)=qa;
+            }
+            for(int i=0;i<this.lowCount;++i)
+            {
+                let hz=WaveData::hz.at(i),bw=WaveData::bandwidth.at(i),bin=binScale*hz;
+                let k=int(bin),z=bin-float(k),g=float(pow(float64(1.0f-(1.0f-bw*binScale)*0.66f),float64(0.22f)));
+                this.lowBin.at(i)=k;this.lowLeft.at(i)=this.bandWindow(z)*g;this.lowRight.at(i)=this.bandWindow(1.0f-z)*g;
+                let rho=float(exp(float64(bw*WaveData::k1ff078*hopScale)))*0.5f;
+                let rot=this.rotate(hopScale*hz),scale=1.0f/sqrt(rot[0]*rot[0]+rot[1]*rot[1]);
+                this.noiseRe.at(i)=rot[0]*scale*rho;this.noiseIm.at(i)=rot[1]*scale*rho;this.noiseGain.at(i)=sqrt(1.0f-rho*rho);
+                this.initialNoise.at(i*2)=z*WaveData::initialSpectrum.at(k+1)+(1.0f-z)*WaveData::initialSpectrum.at(k);
+                let im0=k==0?0.0f:WaveData::initialSpectrum.at(128+k);
+                this.initialNoise.at(i*2+1)=(1.0f-z)*im0+z*WaveData::initialSpectrum.at(129+k);
+            }
+            int k=max(0,this.lowCount-1);
+            for(int j=0;j<this.highCount;++j)
+            {
+                let hz=(float(sin(float64((float(j)*0.01f+0.5f)*float(j))))*0.3f+float(this.startBin+j))/binScale;
+                while(k<78 && hz>WaveData::hz.at(k+1))++k;
+                let z=(hz-WaveData::hz.at(k))/(WaveData::hz.at(k+1)-WaveData::hz.at(k));
+                this.highBand.at(j)=k;this.highLeft.at(j)=max(0.0f,1.0f-abs(z));this.highRight.at(j)=max(0.0f,1.0f-abs(1.0f-z));
+                this.highGain.at(j)=sqrt(1.0f/(((1.0f-z)*WaveData::bandwidth.at(k)+z*WaveData::bandwidth.at(k+1))*binScale));
+                this.initialNoise.at((this.lowCount+j)*2)=WaveData::initialSpectrum.at(this.startBin+j);
+                this.initialNoise.at((this.lowCount+j)*2+1)=WaveData::initialSpectrum.at(128+this.startBin+j);
+            }
+            let x=(140.0f/rate*WaveData::k1fd830)/sqrt(10.0f),pa=this.shelfCurve(x),pb=this.shelfCurve(x*10.0f);
+            this.shelfA=-pa;this.shelfB=((1.0f-pa)*10.0f)/(1.0f-pb);this.shelfC=-pb*this.shelfB;
+            for(int i=0;i<256;++i)
+            {
+                var bits=i;int reversedBits=0;
+                for(int j=0;j<8;++j){reversedBits=(reversedBits<<1)|(bits&1);bits>>=1;}
+                this.reversed.at(i)=reversedBits;
+                this.fftCos.at(i)=float(cos(float64(i)*6.283185307179586/256.0));
+                this.fftSin.at(i)=float(sin(float64(i)*6.283185307179586/256.0));
+            }
+            this.reset();
+        }
+        void start(float v)
+        {
+            this.reset();this.raw=0.0f;this.historyCount=0;this.historyIndex=0;this.active=true;this.firstNoise=true;
+            this.velocityGain=sqrt((v*127.0f)/100.0f);
+            this.phase=float[416]();this.noise=float[416]();
+        }
+        void advanceModel()
+        {
+            let step=this.raw==0.0f?1.0f:44100.0f/this.sampleRate;
+            if(!this.tonal || this.released || this.modelPosition<this.modelTime(this.sustainSeconds*689.0625f))this.raw+=step;
+            this.evaluate(this.modelTime(this.raw)-this.modelPosition);
+            let at=this.historyIndex*82;
+            for(int i=0;i<80;++i){
+                let releaseGain=this.tonal?this.sq(max(0.0f,1.0f-this.releaseProgress)):1.0f;
+                this.history.at(at+i+1)=releaseGain*(this.weights.at(i)*this.weights.at(i));
+            }
+            this.history.at(at)=max(this.history.at(at+1)*0.8f,this.history.at(at+1)*1.5f-this.history.at(at+2)*0.5f);
+            this.history.at(at+81)=max(this.history.at(at+80)*0.8f,this.history.at(at+80)*1.5f-this.history.at(at+79)*0.5f);
+            this.historyIndex=(this.historyIndex+1)%4;this.historyCount=min(4,this.historyCount+1);
+        }
+        void makeFeatures()
+        {
+            let old=((this.historyIndex+1)%4)*82,now=((this.historyIndex+2)%4)*82,next=((this.historyIndex+3)%4)*82;
+            for(int i=0;i<79;++i)
+            {
+                let left=this.history.at(old+i)+this.history.at(now+i),mid=this.history.at(old+i+1)+this.history.at(now+i+1),right=this.history.at(old+i+2)+this.history.at(now+i+2);
+                let oldPair=this.history.at(old+i+1)+this.history.at(old+i+2),nowPair=this.history.at(now+i+1)+this.history.at(now+i+2),nextPair=this.history.at(next+i+1)+this.history.at(next+i+2);
+                let dx=(right-left)/((right+left)*WaveData::k1fefb4+mid*WaveData::k1fefd4+1.0e-30f);
+                let inv=1.0f/(mid+left+right+1.0e-30f),u=mid*inv,z=abs(left-right)*inv;
+                this.tone.at(i)=max(0.0f,(u*u-0.112f)*WaveData::k1ff000+(u-0.333f)*WaveData::k1ff00c+z*WaveData::k1feffc*z+WaveData::toneBias.at(i));
+                let invT=1.0f/(nowPair+oldPair+nextPair+1.0e-30f),v=nowPair*invT,w=abs(oldPair-nextPair)*invT;
+                this.onset.at(i)=max(0.0f,((v*v-0.112f)*WaveData::k1feff4+(v-0.333f)*WaveData::k1ff008+w*WaveData::k1feff8*w)*WaveData::onsetScale.at(i));
+                this.share.at(i)=min(1.0f,this.onset.at(i)+this.tone.at(i));
+                this.freqTurns.at(i)=(dx*this.frequencyPolynomial.at(i*3+2)+this.frequencyPolynomial.at(i*3+1))*dx+this.frequencyPolynomial.at(i*3);
+                this.timeTurns.at(i)=((nextPair-oldPair)/((nextPair+oldPair)*WaveData::k1fefbc+nowPair*WaveData::k1fefdc+1.0e-30f))*WaveData::timeScale.at(i)*(-0.25f);
+            }
+            this.tone.at(79)=this.tone.at(78);this.onset.at(79)=this.onset.at(78);this.share.at(79)=this.share.at(78);this.freqTurns.at(79)=0.0f;this.timeTurns.at(79)=0.0f;
+            this.amplitude=float[208]();
+            for(int i=0;i<this.lowCount;++i)
+            {
+                this.a.at(i)=this.sq(max(this.tone.at(i)+0.3f,0.2f));this.b.at(i)=this.sq(max(this.onset.at(i)+0.4f,0.2f));
+                this.timeTurns.at(i)-=floor(this.timeTurns.at(i));let rot=this.rotate(this.timeTurns.at(i));
+                this.coupling.at(2*i)=rot[0];this.coupling.at(2*i+1)=rot[1];
+                this.amplitude.at(i)=this.history.at(now+i+1);this.noiseShare.at(i)=1.0f-this.share.at(i);this.turns.at(i)=this.freqTurns.at(i);
+            }
+            let base=float(this.startBin)*0.25f;
+            float bin=base;
+            for(int j=0;j<this.highCount;++j)
+            {
+                let i=this.lowCount+j,k=this.highBand.at(j),w0=this.highLeft.at(j),w1=this.highRight.at(j);
+                var value=(w0*this.history.at(now+k+1)+w1*this.history.at(now+k+2))*this.highGain.at(j);
+                let tonal=w1*this.tone.at(k+1)+w0*this.tone.at(k),pitch=w1*this.freqTurns.at(k+1)+w0*this.freqTurns.at(k),timing=w1*this.onset.at(k+1)+w0*this.onset.at(k);
+                this.a.at(i)=this.sq(max(tonal+0.3f,0.2f));this.b.at(i)=this.sq(max(timing+0.4f,0.2f));this.turns.at(i)=pitch;
+                let shift=min(1.0f,max(0.0f,(abs(pitch-bin)-0.4f)*5.0f)*max(tonal,0.0f));
+                if(shift>1.0e-9f)
+                {
+                    let moved=value*shift,at=min((pitch-base)*4.0f,float(this.highCount)-WaveData::k1fc714),dest=max(0,int(at+float(this.lowCount))),frac=(at+float(this.lowCount))-float(dest);
+                    this.amplitude.at(dest)+=(1.0f-frac)*moved;this.amplitude.at(dest+1)+=frac*moved;value-=moved;
+                }
+                this.amplitude.at(i)=value+this.amplitude.at(i);this.noiseShare.at(i)=1.0f-(w1*this.share.at(k+1)+w0*this.share.at(k));
+                let rot=this.rotate(w1*this.timeTurns.at(k+1)+w0*this.timeTurns.at(k));this.coupling.at(2*i)=rot[0];this.coupling.at(2*i+1)=rot[1];bin+=0.25f;
+            }
+            for(int i=0;i<this.voiceSize;++i)
+            {
+                this.mag.at(i)=this.sq(this.coupling.at(2*i))+this.sq(this.coupling.at(2*i+1));
+                this.turns.at(i)-=floor(this.turns.at(i));let rot=this.rotate(this.turns.at(i)),re=this.phase.at(2*i),im=this.phase.at(2*i+1);
+                let r=re*rot[0]-im*rot[1],v=re*rot[1]+im*rot[0];
+                this.a.at(i)=min(1.0f,(r*r+v*v)*1.0e20f+0.001f)*this.a.at(i);
+                this.phase.at(2*i)=r+1.0e-30f;this.phase.at(2*i+1)=v+1.0e-10f;
+            }
+        }
+        void solvePhase()
+        {
+            this.solved.at(0)=this.a.at(0)*this.phase.at(0);this.solved.at(1)=this.a.at(0)*this.phase.at(1);this.scratch.at(0)=this.a.at(0);
+            for(int i=1;i<this.voiceSize;++i)
+            {
+                let j=i-1,g=this.b.at(j)/(this.b.at(j)*this.mag.at(j)+this.scratch.at(j)+1.0e-30f),cr=g*this.coupling.at(2*j),ci=g*this.coupling.at(2*j+1);
+                this.scratch.at(i)=g*this.scratch.at(j)+this.a.at(i);
+                this.solved.at(2*i)=(this.solved.at(2*j)*cr-ci*this.solved.at(2*j+1))+this.a.at(i)*this.phase.at(2*i);
+                this.solved.at(2*i+1)=(ci*this.solved.at(2*j)+cr*this.solved.at(2*j+1))+this.a.at(i)*this.phase.at(2*i+1);
+            }
+            let last=this.voiceSize-1,scale=1.0f/(this.scratch.at(last)+1.0e-30f);this.solved.at(2*last)*=scale;this.solved.at(2*last+1)*=scale;
+            for(int i=this.voiceSize-2;i>=0;--i)
+            {
+                let k=2*i,g=this.b.at(i),cr=g*this.coupling.at(k),ci=-this.coupling.at(k+1)*g,scaleBack=1.0f/(g*this.mag.at(i)+this.scratch.at(i)+1.0e-30f);
+                this.solved.at(k)=((cr*this.solved.at(k+2)-ci*this.solved.at(k+3))+this.solved.at(k))*scaleBack;
+                this.solved.at(k+1)=((ci*this.solved.at(k+2)+cr*this.solved.at(k+3))+this.solved.at(k+1))*scaleBack;
+            }
+        }
+        void addNoise()
+        {
+            this.noiseSeed=(this.noiseSeed*1664525L+1013904223L)&0xffffffffL;
+            let at=int(this.noiseSeed%int64(2048-this.voiceSize))*2;
+            if(this.firstNoise){this.noise=this.initialNoise;this.firstNoise=false;}
+            else
+            {
+                for(int i=0;i<this.lowCount;++i)
+                {
+                    let r=this.noise.at(2*i),v=this.noise.at(2*i+1),cr=this.noiseRe.at(i),ci=this.noiseIm.at(i),g=this.noiseGain.at(i);
+                    this.noise.at(2*i)=(r*cr-v*ci)+g*WaveData::noiseTable.at(at+2*i);
+                    this.noise.at(2*i+1)=(r*ci+v*cr)+g*WaveData::noiseTable.at(at+2*i+1);
+                }
+                for(int i=this.lowCount;i<this.voiceSize;++i){this.noise.at(2*i)=WaveData::noiseTable.at(at+2*i);this.noise.at(2*i+1)=WaveData::noiseTable.at(at+2*i+1);}
+            }
+            for(int i=0;i<this.voiceSize;++i)
+            {
+                let amp=this.amplitude.at(i),na=amp*this.noiseShare.at(i),r=this.solved.at(2*i),v=this.solved.at(2*i+1),scale=(na+amp)/(sqrt(r*r+v*v)+na+1.0e-30f);
+                this.phase.at(2*i)=na*this.noise.at(2*i)+scale*r;this.phase.at(2*i+1)=scale*v+na*this.noise.at(2*i+1);
+            }
+        }
+        void inverseFFT()
+        {
+            for(int i=0;i<256;++i){this.fftRe.at(i)=0.0f;this.fftIm.at(i)=0.0f;}
+            this.specRe.at(4)+=this.specRe.at(4);this.specIm.at(4)=0.0f;
+            for(int i=1;i<=4;++i){this.specRe.at(i+4)+=this.specRe.at(4-i);this.specIm.at(i+4)-=this.specIm.at(4-i);}
+            for(int i=0;i<128;++i){this.fftRe.at(i)=this.specRe.at(i+4);this.fftIm.at(i)=this.specIm.at(i+4);}
+            for(int i=1;i<128;++i){this.fftRe.at(256-i)=this.fftRe.at(i);this.fftIm.at(256-i)=-this.fftIm.at(i);}
+            for(int i=0;i<256;++i)if(i<this.reversed.at(i))
+            {
+                let j=this.reversed.at(i),r=this.fftRe.at(i),v=this.fftIm.at(i);this.fftRe.at(i)=this.fftRe.at(j);this.fftIm.at(i)=this.fftIm.at(j);this.fftRe.at(j)=r;this.fftIm.at(j)=v;
+            }
+            for(int size=2;size<=256;size*=2)for(int j=0;j<size/2;++j)
+            {
+                let c=this.fftCos.at(j*256/size),s=this.fftSin.at(j*256/size);
+                for(int k=j;k<256;k+=size)
+                {
+                    let b=k+size/2,x=this.fftRe.at(b)*c-this.fftIm.at(b)*s,y=this.fftRe.at(b)*s+this.fftIm.at(b)*c,r=this.fftRe.at(k),v=this.fftIm.at(k);
+                    this.fftRe.at(k)=r+x;this.fftIm.at(k)=v+y;this.fftRe.at(b)=r-x;this.fftIm.at(b)=v-y;
+                }
+            }
+        }
+        void makeSpectrum()
+        {
+            this.specRe=float[137]();this.specIm=float[137]();
+            // Native neutral single-voice processing submits the spectrum twice.
+            loop(2)
+            {
+                for(int i=0;i<this.lowCount;++i)
+                {
+                    let k=this.lowBin.at(i)+4,l=this.lowLeft.at(i),r=this.lowRight.at(i),re=this.phase.at(2*i),im=this.phase.at(2*i+1);
+                    this.specRe.at(k)+=re*l;this.specRe.at(k+1)+=re*r;this.specIm.at(k)+=im*l;this.specIm.at(k+1)+=im*r;
+                }
+                for(int j=0;j<this.highCount;++j){let k=this.startBin+j+4;this.specRe.at(k)+=this.phase.at(2*(this.lowCount+j));this.specIm.at(k)+=this.phase.at(2*(this.lowCount+j)+1);}
+            }
+            this.inverseFFT();
+            for(int i=0;i<256;++i)this.ola.at((this.outIndex+i)%256)+=this.fftRe.at((i+128)%256)*WaveData::olaWindow.at(i);
+        }
+        void tick()
+        {
+            if(this.tonal && this.released)
+            {
+                this.releaseProgress+=(64.0f/this.sampleRate)/(this.releaseSeconds+0.00001f);
+                if(this.releaseProgress>1.0f){this.active=false;return;}
+            }
+            let duration=max(this.durations.at(0),this.durations.at(1));
+            if((duration<95.0f && duration+1.0f<this.modelPosition)||duration<1.0f){this.active=false;return;}
+            this.advanceModel();while(this.historyCount<3)this.advanceModel();
+            if(this.tonal)this.makeTonalSpectrum();
+            else { this.makeFeatures();this.solvePhase();this.addNoise();this.makeSpectrum(); }
+            if(this.modelPosition>=96.0f)
+            {
+                float peak=0.0f;for(int i=0;i<7;++i)peak=max(peak,this.speed.at(i));
+                if(peak*peak<0.00001f)this.active=false;
+            }
+        }
+
+        // Tonal mode reads the same model with a pitched harmonic bank.
+        bool tonal,released,keyDown;
+        int note,channel;
+        float age,releaseProgress,pitchBend;
+        float releaseSeconds,sustainSeconds,keyTracking;
+        float[512] harmonicPhase,unisonPhase;
+        int64 tonalRandom;
+        int oscillatorShape;
+        float stretchAmount;
+
+        void silence()
+        {
+            this.active=false;this.keyDown=false;this.released=true;
+            this.ola=float[256]();this.shelfState=0.0f;this.delay1=0.0f;this.delay2=0.0f;
+        }
+        void startTonal(int noteIn,int channelIn,float velocity)
+        {
+            // Existing overlap samples carry the previous note through its last frame.
+            this.tonal=true;this.note=noteIn;this.channel=channelIn;this.keyDown=true;this.released=false;
+            this.age=0.0f;this.releaseProgress=0.0f;this.harmonicPhase=float[512]();
+            this.start(velocity);
+        }
+        void makeTonalSpectrum()
+        {
+            this.specRe=float[137]();this.specIm=float[137]();
+            let stretchNormal=this.stretchAmount/100.0f;
+            let spacingCurve=abs(stretchNormal)*(stretchNormal*0.1f);
+            let pitch=440.0f*pow(2.0f,(float(this.note)+this.pitchBend-69.0f)/12.0f);
+            let fundamental=pitch/max(0.5f,1.0f+spacingCurve);
+            let modelFundamental=261.6199951171875f*pow(fundamental/261.6199951171875f,1.0f-this.keyTracking/100.0f);
+            let halfHop=32.0f/this.sampleRate,binScale=256.0f/this.sampleRate;
+            let topBand=WaveData::hz.at(79)+(WaveData::hz.at(79)-WaveData::hz.at(78));
+            let limit=min(topBand,this.sampleRate*0.46f);
+            let frame=((this.historyIndex+2)%4)*82;
+            let amplitudeScale=sqrt(fundamental)*0.5f;
+            this.tonalRandom=(this.tonalRandom*1664525L+1013904223L)&0xffffffffL;
+            let unisonRate=(1.0f/1200.0f)*halfHop;
+            let randomOffset=(float(this.tonalRandom)*2.3283000527563047e-10f*2.0f+0.5f)*unisonRate;
+            int band=-1;
+            float hz,modelHz;
+            let tableStart=clamp(this.oscillatorShape,0,11)*512;
+            // Negative stretch stops before the frequency steps reverse direction.
+            let harmonicLimit=spacingCurve<(-0.001953125f)?min(512,int(-1.0f/spacingCurve)):512;
+            for(int harmonic=0;harmonic<harmonicLimit;++harmonic)
+            {
+                let spacing=(float(harmonic)*spacingCurve+1.0f)*OscillatorData::spacing.at(tableStart+harmonic);
+                hz+=spacing*fundamental;
+                modelHz+=spacing*modelFundamental;
+                if(hz>limit || modelHz>limit)break;
+                while(band<79 && modelHz>WaveData::hz.at(band+1))++band;
+                let lower=band<0?WaveData::hz.at(0)-(WaveData::hz.at(1)-WaveData::hz.at(0)):WaveData::hz.at(band);
+                let upper=band<79?WaveData::hz.at(band+1):topBand;
+                let fraction=(modelHz-lower)/(upper-lower);
+                let energy=(1.0f-fraction)*this.history.at(frame+band+1)+fraction*this.history.at(frame+band+2);
+                // Signed weights preserve the pulse shapes and the final harmonic fade.
+                let shapeWeight=OscillatorData::levels.at(tableStart+harmonic);
+                let amplitude=energy*amplitudeScale*shapeWeight;
+                let phaseStep=hz*halfHop;
+                let centred=this.harmonicPhase.at(harmonic)+phaseStep;
+                let phaseTurns=centred-floor(centred);
+                this.harmonicPhase.at(harmonic)=phaseStep+phaseTurns;
+                let rotation=this.rotate(phaseTurns);
+                // Visco keeps a small modulation even when Unison is set to zero.
+                let phase2=this.unisonPhase.at(harmonic)+(hz*unisonRate)/(hz*randomOffset+1.0f);
+                let detunePhase=phase2-floor(phase2);
+                this.unisonPhase.at(harmonic)=detunePhase;
+                let modulation=detunePhase*20.780000686645508f*(detunePhase-0.5f)*(detunePhase-1.0f)*0.7f;
+                let sine=rotation[1]*amplitude,negativeCosine=-rotation[0]*amplitude;
+                let unisonGain=1.0f-0.7f*0.7f;
+                let real=sine*unisonGain-negativeCosine*modulation;
+                let imaginary=sine*modulation+negativeCosine*unisonGain;
+                let bin=hz*binScale,index=int(bin)+4,offset=bin-float(int(bin));
+                let left=1.0f-(offset*0.27000001072883606f+0.7300000190734863f)*offset;
+                let inverse=1.0f-offset;
+                let right=1.0f-(inverse*0.27000001072883606f+0.7300000190734863f)*inverse;
+                this.specRe.at(index)+=left*real;this.specRe.at(index+1)+=right*real;
+                this.specIm.at(index)+=left*imaginary;this.specIm.at(index+1)+=right*imaginary;
+            }
+            this.inverseFFT();
+            for(int i=0;i<256;++i)this.ola.at((this.outIndex+i)%256)+=this.fftRe.at((i+128)%256)*WaveData::olaWindow.at(i);
+        }
+        float render()
+        {
+            if(this.countdown==0){if(this.active)this.tick();this.countdown=64;this.age+=64.0f/this.sampleRate;}--this.countdown;
+            let inputSample=this.ola.at(this.outIndex);this.ola.at(this.outIndex)=0.0f;this.outIndex=(this.outIndex+1)%256;
+            let x=inputSample-this.shelfState*this.shelfA,y=this.shelfState*this.shelfC+x*this.shelfB;this.shelfState=x;
+            var sample=this.delay2;this.delay2=this.delay1;this.delay1=y;
+            return sample;
+        }
+    }
+}

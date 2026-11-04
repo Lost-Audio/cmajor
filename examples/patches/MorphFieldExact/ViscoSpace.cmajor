@@ -1,0 +1,288 @@
+namespace ViscoEffects
+{
+    float decayGain(float x) { return 1.0f/(((x*0.16660000383853912f*x+0.5f)*x+1.0f)*x+1.0f); }
+    float sineCycle(float phase)
+    {
+        let x=phase-floor(phase),q=(1.0f-x)*x;
+        return ((q*56.164031982421875f+35.87013244628906f)*q+12.638167381286621f)*((0.5f-x)*q);
+    }
+    struct ReadHead
+    {
+        float position,speed,speedStep;
+        int mirror,remaining,count;
+        void reset() { this.position=-1.0f;this.speed=1.0f;this.mirror=-1; }
+    }
+}
+namespace ViscoLines (int capacity)
+{
+    struct Line
+    {
+        float[capacity+4] data;
+        int length,write;
+        float gain,gainStep,targetGain;
+        void reset(int length) { this.data=0.0f;this.length=clamp(length,1,capacity);this.write=0;this.gain=1.0f; }
+        void push(float x) { this.data.at(this.write)=x;if(this.write<4)this.data.at(this.length+this.write)=x;this.write=(this.write+1)%this.length; }
+        float peek(int delay) { return this.data.at((this.write+this.length-clamp(delay,0,this.length))%this.length); }
+        void beginGain(int delay,float decay,int count) { this.targetGain=ViscoEffects::decayGain(float(delay)*decay);this.gainStep=(this.targetGain-this.gain)/float(count); }
+        float<2> scatter(float<2> x,int delay)
+        {
+            let d=this.gain*this.peek(delay);this.push(x[1]);this.gain+=this.gainStep;
+            return float<2>((d+x[0])*0.7071067690849304f,(x[0]-d)*0.7071067690849304f);
+        }
+        float allpass(float x,int delay,float coefficient)
+        {
+            let d=this.gain*this.peek(delay),v=d*coefficient+x;
+            this.push(v);this.gain+=this.gainStep;return d-v*coefficient;
+        }
+        void beginRead(ViscoEffects::ReadHead& head,float delay,float decay,int count)
+        {
+            if(head.position<0.0f){if(head.mirror<0)head.mirror=this.write;let d=min(delay,float(this.length)-32.0f);head.position=float((float(head.mirror+1)<d)?this.length:0)+(float(head.mirror)-d);}
+            let distance=float(float(head.mirror)<head.position?this.length:0)+(float(head.mirror)-head.position);
+            let target=clamp(1.0f-(delay-distance)*0.001f,0.5f,2.0f);
+            head.speedStep=clamp((target-head.speed)/(float(count)*1.5f),-0.001f,0.001f);
+            head.remaining=count;head.count=count;
+            this.targetGain=ViscoEffects::decayGain(delay*decay);this.gainStep=(this.targetGain-this.gain)/float(count);
+        }
+        float read(ViscoEffects::ReadHead& head)
+        {
+            if(head.position>=float(this.length))head.position-=float(this.length);
+            let i=int(head.position),t=head.position-float(i);
+            let a=this.data.at(i),b=this.data.at(i+1),c=this.data.at(i+2),d=this.data.at(i+3)*0.5f;
+            var v=((b*1.5f-a*0.5f)-c*1.5f)+d;
+            v=(((v*t+a)-b*2.5f)+c+c)-d;v=(v*t+(c-a)*0.5f)*t+b;
+            let y=v*this.gain;this.gain+=this.gainStep;head.position+=head.speed;
+            if(--head.remaining==0){head.mirror=(head.mirror+head.count)%this.length;head.speed=float(head.count)*head.speedStep+head.speed;}
+            return y;
+        }
+    }
+}
+namespace ViscoEffects
+{
+    namespace Small=ViscoLines(65536);
+    namespace Short=ViscoLines(8192);
+    namespace Long=ViscoLines(800000);
+
+    struct Predelay
+    {
+        float<2>[65536] data;
+        int write,oldDelay,newDelay,fade;
+        void reset() { this.data=0.0f;this.write=0;this.oldDelay=-1;this.newDelay=-1;this.fade=0; }
+        void set(int delay) { delay=clamp(delay,0,65535);if(this.oldDelay<0)this.oldDelay=delay;else if(this.newDelay<0&&this.oldDelay!=delay){this.newDelay=delay;this.fade=0;} }
+        float<2> process(float<2> x)
+        {
+            this.data.at(this.write)=x;
+            var y=this.data.at((this.write+65536-this.oldDelay)%65536);
+            if(this.newDelay>=0){let t=float(this.fade)/64.0f;y=y*(1.0f-t)+this.data.at((this.write+65536-this.newDelay)%65536)*t;if(++this.fade>=64){this.oldDelay=this.newDelay;this.newDelay=-1;}}
+            this.write=(this.write+1)%65536;return y;
+        }
+    }
+    struct StateFilter
+    {
+        float<2> low,velocity;
+        float coefficient,damping,coefficientStep,dampingStep;bool enabled;
+        void reset() { this=(); }
+        void beginBlock(float frequency,float damping,int count)
+        {
+            this.enabled=damping>=0.001f;if(!this.enabled)return;
+            this.coefficientStep=clamp(((frequency*3.0f*frequency)/(frequency*frequency+0.07699999958276749f)-this.coefficient)/float(count),-0.01f,0.01f);
+            this.dampingStep=clamp((damping-this.damping)/float(count),-0.01f,0.01f);
+        }
+        float<2> process(float<2> x)
+        {
+            if(!this.enabled)return x;
+            let scale=1.0f-this.damping*this.damping;
+            for(int c=0;c<2;++c){let v=(scale*x[c]+this.damping*this.velocity[c])-this.low[c];this.velocity[c]=v;this.low[c]=this.coefficient*v+this.low[c];}
+            this.coefficient+=this.coefficientStep;this.damping+=this.dampingStep;return this.velocity;
+        }
+    }
+    struct Shelf
+    {
+        float[3] target,coefficient,step;float<2> state;
+        void reset() { this=(); }
+        void configure(float frequency,float lowGain,float highGain)
+        {
+            let a=1.0f-clamp(frequency,0.0001f,0.4950000047683716f)*4.0f,b=1.0f-a;
+            lowGain=max(lowGain,highGain*0.001f+1.0000000180025095e-35f);
+            let g=(highGain/lowGain)*(a+1.0f),q=(g-b)/(g+b),c=(b*lowGain)/(1.0f-q);
+            this.target[0]=c;this.target[1]=(-c)*q;this.target[2]=-a;
+        }
+        void beginBlock(int count) { for(int i=0;i<3;++i)this.step[i]=clamp((this.target[i]-this.coefficient[i])/float(count),-0.001f,0.001f); }
+        float<2> process(float<2> x)
+        {
+            let y=x*this.coefficient[0]+this.state;this.state=x*this.coefficient[1]-y*this.coefficient[2];
+            for(int i=0;i<3;++i)this.coefficient[i]+=this.step[i];return y;
+        }
+    }
+    // Chorus, RVA 0xdfa50. Two modulated delays, two allpasses, three stereo scattering stages.
+    struct Chorus
+    {
+        Small::Line[2] delays;ReadHead[2] heads;
+        Short::Line[2] allpasses;Short::Line[3] scatter;
+        float rate,depth,speed,phase;int cursor;bool ready;
+        void reset() { this.ready=false;this.phase=0.0f;this.cursor=0; }
+        void configure(float rate,float depth,float speed)
+        {
+            if(!this.ready||rate!=this.rate){for(int c=0;c<2;++c){this.delays[c].reset(max(512,int(rate*0.25f)));this.heads[c].reset();this.allpasses[c].reset(int(pow(2.0f,-float(c)/7.0f)*(rate*0.012000000104308128f)));}for(int i=0;i<3;++i)this.scatter[i].reset(int(pow(2.0f,-float(i)*0.30000001192092896f)*(rate*0.009999999776482582f)));this.ready=true;}
+            this.rate=rate;this.depth=depth;this.speed=speed;
+        }
+        void beginBlock()
+        {
+            let base=max(this.rate*0.009999999776482582f,36.0f);
+            let depth=min((1.0f/(max(0.0f,this.speed)*1.5f*3.140000104904175f+0.009999999776482582f)+0.1f)*this.rate*(max(0.0f,this.depth)/1700.0f),float(this.delays[0].length/3)-base);
+            this.phase=((32.0f/this.rate)*max(0.0f,this.speed)-floor(this.phase))+this.phase;
+            for(int c=0;c<2;++c){let p=float(c)*0.3499999940395355f+this.phase;let d=(sineCycle(p)+float(c)*0.05000000074505806f+1.3300000429153442f)*depth+base;this.delays[c].beginRead(this.heads[c],d,0.0f,32);this.allpasses[c].beginGain(this.allpasses[c].length,0.0f,32);}
+            for(int i=0;i<3;++i)this.scatter[i].beginGain(this.scatter[i].length,0.0f,32);
+        }
+        float<2> process(float<2> x)
+        {
+            if(this.cursor==0)this.beginBlock();
+            var y=float<2>(this.delays[0].read(this.heads[0]),this.delays[1].read(this.heads[1]));
+            for(int c=0;c<2;++c)y[c]=this.allpasses[c].allpass(y[c],this.allpasses[c].length,-0.6179999709129333f);
+            for(int i=0;i<3;++i)y=this.scatter[i].scatter(y,this.scatter[i].length);
+            this.delays[0].push(y[1]*0.15000000596046448f+x[0]);this.delays[1].push(y[0]*0.15000000596046448f+x[1]);
+            this.cursor=(this.cursor+1)%32;return y;
+        }
+    }
+    // Diffuser, RVA 0xe0d90. Eight variable stereo delay stages.
+    struct Diffuser
+    {
+        Small::Line[8] lines;int[8] delays;
+        Predelay pre;float<2> low;
+        float rate,length,preMs,lowCoefficient;int cursor;bool ready;
+        void reset() { this.ready=false;this.cursor=0;this.low=0.0f;this.delays=0;this.pre.reset(); }
+        void configure(float rate,float length,float preMs)
+        {
+            if(!this.ready||rate!=this.rate){for(int i=0;i<8;++i)this.lines[i].reset(int(pow(2.0f,-float(i)*0.5839999914169312f)*(rate*0.20000000298023224f)));this.ready=true;}
+            this.rate=rate;this.length=length;this.preMs=preMs;this.lowCoefficient=min(1.0f,343.0f/(rate*0.17000000178813934f));
+        }
+        float<2> process(float<2> x)
+        {
+            if(this.cursor==0){this.pre.set(int(this.rate*0.001f*this.preMs+0.5f));let scale=clamp(this.length/100.0f,0.0f,1.0f)*0.8999999761581421f+0.1f;for(int i=0;i<8;++i){let target=int(float(this.lines[i].length)*scale);this.delays[i]=clamp(target,this.delays[i]-1,this.delays[i]+1);this.lines[i].beginGain(this.delays[i],0.0f,16);}}
+            var y=this.pre.process(x);for(int i=0;i<8;++i)y=this.lines[i].scatter(y,this.delays[i]);
+            for(int c=0;c<2;++c)this.low[c]=(y[c]-this.low[c])*this.lowCoefficient+this.low[c];
+            let mono=(this.low[0]+0.0f+this.low[1])*0.5f;
+            y=float<2>((y[0]-this.low[0])+mono,(y[1]-this.low[1])+mono);this.cursor=(this.cursor+1)%16;return y;
+        }
+    }
+    // Plate Reverb, RVA 0xe15f0. Four feedback paths and eight stereo scattering stages.
+    struct Plate
+    {
+        Small::Line[4] feedback;Short::Line[8] scatter;
+        float[4] low,decay,damping,decayStep,dampingStep,targetDecay,targetDamping;
+        float rate,length,brightness,inputGain,inputStep,currentInput,targetInput;
+        int cursor;bool ready;
+        void reset() { this.ready=false;this.cursor=0;this.low=0.0f;this.decay=0.0f;this.damping=0.0f;this.inputGain=0.0f; }
+        void configure(float rate,float length,float brightness)
+        {
+            if(!this.ready||rate!=this.rate){for(int i=0;i<4;++i)this.feedback[i].reset(int(pow(2.0f,float(i)*0.7300000190734863f)*0.012000000104308128f*rate+0.5f));for(int i=0;i<8;++i)this.scatter[i].reset(int(pow(2.0f,float(i)*0.5299999713897705f)*0.001449999981559813f*rate+0.5f));this.ready=true;}
+            this.rate=rate;this.length=length;this.brightness=brightness;
+            let decayFrames=pow(2.0f,(length/100.0f)*4.0f-2.0f)*rate*0.25f,colour=(1.0f-clamp(brightness/100.0f,0.0f,1.0f))*32.0f;
+            for(int i=0;i<4;++i){let d=decayFrames/float(this.feedback[i].length),f=(float(this.feedback[i].length)*colour)/rate;this.targetDecay[i]=d/(abs(d)+1.0f);this.targetDamping[i]=1.0f-f/(abs(f)+1.0f);}
+            let average=this.targetDecay[0]*0.25f+0.0f+this.targetDecay[1]*0.25f+this.targetDecay[2]*0.25f+this.targetDecay[3]*0.25f;
+            let g=sqrt(1.0f-average*average);this.targetInput=g+g;
+        }
+        void beginBlock()
+        {
+            this.inputStep=clamp((this.targetInput-this.inputGain)/64.0f,-0.01f,0.01f);this.currentInput=this.inputGain;
+            for(int i=0;i<4;++i){this.decayStep[i]=clamp((this.targetDecay[i]-this.decay[i])/64.0f,-0.01f,0.01f);this.dampingStep[i]=clamp((this.targetDamping[i]-this.damping[i])/64.0f,-0.01f,0.01f);}
+            for(int i=0;i<8;++i)this.scatter[i].beginGain(this.scatter[i].length,0.0f,64);
+        }
+        float<2> process(float<2> x)
+        {
+            if(this.cursor==0)this.beginBlock();
+            float[4] y;
+            for(int i=0;i<4;++i){let injection=(float(i&1)-0.5f)*x[1]+(float(i>>1)-0.5f)*x[0];let v=((injection*this.currentInput+this.decay[i]*this.feedback[i].peek(this.feedback[i].length))-this.low[i])*this.damping[i]+this.low[i];this.low[i]=v;y[i]=v;this.decay[i]+=this.decayStep[i];this.damping[i]+=this.dampingStep[i];}
+            for(int i=0;i<8;++i){let a=i%4,b=(i+1)%4;let pair=this.scatter[i].scatter(float<2>(y[a],y[b]),this.scatter[i].length);y[a]=pair[0];y[b]=pair[1];}
+            let result=float<2>(y[0],y[1]);
+            this.feedback[0].push(y[0]*0.5f+0.0f+y[1]*0.5f+y[2]*0.5f+y[3]*0.5f);
+            this.feedback[1].push(y[0]*0.5f+0.0f+y[1]*(-0.5f)+y[2]*0.5f+y[3]*(-0.5f));
+            this.feedback[2].push(y[0]*0.5f+0.0f+y[1]*0.5f+y[2]*(-0.5f)+y[3]*(-0.5f));
+            this.feedback[3].push(y[0]*0.5f+0.0f+y[1]*(-0.5f)+y[2]*(-0.5f)+y[3]*0.5f);
+            this.currentInput+=this.inputStep;if(++this.cursor==64){this.cursor=0;this.inputGain=64.0f*this.inputStep+this.inputGain;}return result;
+        }
+    }
+    // Room Reverb, RVAs 0xe1420 and 0xe2360.
+    struct Room
+    {
+        Small::Line[2] modulated;ReadHead[2] heads;
+        Small::Line[6] scatter,allpasses;
+        Predelay pre;Shelf shelf;StateFilter filter;
+        float rate,length,color,phase,decay,inputGain,totalDelay,allpassDelay,filterFrequency,filterDamping;
+        int cursor;bool ready;
+        void reset() { this.ready=false;this.cursor=0;this.phase=0.0f;this.pre.reset();this.shelf.reset();this.filter.reset(); }
+        void configure(float rate,float length,float color)
+        {
+            if(!this.ready||rate!=this.rate){this.totalDelay=0.0f;this.allpassDelay=0.0f;for(int c=0;c<2;++c){this.modulated[c].reset(8256);this.heads[c].reset();this.totalDelay=rate*0.05000000074505806f+this.totalDelay;}for(int i=0;i<12;++i){let lengthSamples=pow(1.4900000095367432f,float(i))*0.0015999999595806003f*rate;if(i<6)this.scatter[i].reset(int(lengthSamples));else this.allpasses[i-6].reset(int(lengthSamples));this.allpassDelay=lengthSamples+this.allpassDelay;}this.totalDelay=this.allpassDelay+this.totalDelay;this.ready=true;}
+            this.rate=rate;this.length=length;this.color=color;
+            let l=max(0.0f,length/100.0f)+0.5f,duration=l*0.6000000238418579f*l*l*l,c=clamp(color/100.0f,0.0f,1.0f),scaled=c*4.0f;
+            let damp=clamp(2.5f-scaled,0.0f,1.0f)*100.0f;
+            let h=max(0.0f,scaled-3.0f),frequency=(h*h*4.0f+0.30000001192092896f)-max(0.0f,1.0f-scaled)*0.25f;
+            let a=abs(c-0.5f),amount=(a+a+1.0f)*60.0f+20.0f;
+            this.decay=3.450000047683716f/(rate*duration);
+            let half=this.totalDelay*0.5f,allHalf=this.allpassDelay*0.5f;
+            let t=(this.decay+0.00009999999747378752f)*half;
+            let z=(damp*0.009999999776482582f)*(damp*0.009999999776482582f)*(t+t),g=decayGain(z);
+            this.shelf.configure(g*0.5f,1.0f,g*g);
+            let direct=decayGain(half*this.decay),inverse=1.0f/(allHalf*this.decay);
+            this.inputGain=(sqrt(1.0f-direct*direct)*1.2999999523162842f*(inverse+0.30000001192092896f))/(inverse+0.00009999999747378752f);
+            this.filterFrequency=min(0.44999998807907104f,(frequency*1000.0f)/rate);
+            this.filterDamping=(1.0f-amount*0.009999999776482582f)*0.9950000047683716f;
+        }
+        void beginBlock()
+        {
+            this.pre.set(int(5.0f*(this.rate*0.001f)+0.5f));this.phase=(64.0f/this.rate)*0.5f+this.phase-floor(this.phase);
+            for(int c=0;c<2;++c){let d=sineCycle(float(c)*0.33000001311302185f+this.phase)*(5.0f*1.2799999713897705f)+700.0f+float(c*5000);this.modulated[c].beginRead(this.heads[c],d,this.decay,64);}
+            for(int i=0;i<6;++i){this.scatter[i].beginGain(this.scatter[i].length,this.decay,64);this.allpasses[i].beginGain(this.allpasses[i].length,this.decay,64);}
+            this.shelf.beginBlock(64);this.filter.beginBlock(this.filterFrequency,this.filterDamping,64);
+        }
+        float<2> process(float<2> x)
+        {
+            if(this.cursor==0)this.beginBlock();
+            var y=float<2>(this.modulated[0].read(this.heads[0]),this.modulated[1].read(this.heads[1]));
+            y=this.shelf.process(y);let inputValue=this.pre.process(x);y=inputValue*this.inputGain+y;
+            for(int i=0;i<3;++i)y=this.scatter[i].scatter(y,this.scatter[i].length);
+            for(int i=0;i<6;++i)y[i&1]=this.allpasses[i].allpass(y[i&1],this.allpasses[i].length,-0.6179999709129333f);
+            for(int i=3;i<6;++i)y=this.scatter[i].scatter(y,this.scatter[i].length);
+            this.modulated[0].push(y[0]);this.modulated[1].push(y[1]);y=this.filter.process(y);
+            if(++this.cursor==64){this.cursor=0;for(int i=0;i<6;++i)this.scatter[i].gain=this.scatter[i].targetGain;}return y;
+        }
+    }
+    // Tempo Delay, RVA 0xe01a0. Fractional Length fades between adjacent tempo divisions.
+    struct Delay
+    {
+        Long::Line[2] lines;ReadHead[4] heads;
+        Short::Line[2] scatter;
+        float[4] tapGain,tapStep;bool[4] tapActive;
+        float<2> low,notch;
+        float rate,length,feedback,tempo,phase,currentLength,nextLength,currentFeedback,feedbackStep;
+        int cursor;bool ready;
+        void reset() { this.ready=false;this.cursor=0;this.phase=0.0f;this.currentLength=2.0f;this.currentFeedback=0.0f;this.low=0.0f;this.notch=0.0f;this.tempo=120.0f; }
+        void configure(float rate,float length,float feedback)
+        {
+            if(!this.ready||rate!=this.rate){for(int c=0;c<2;++c){this.lines[c].reset(int(float64(rate)*4.1));this.scatter[c].reset(int(pow(2.0f,-float(c)*0.30000001192092896f)*(rate*0.019999999552965164f)));}for(int i=0;i<4;++i)this.heads[i].reset();this.ready=true;}
+            this.rate=rate;this.length=length;this.feedback=feedback;
+        }
+        float weight(float length,int tap) { let a=max(0.0f,1.0f-abs(length-float(tap))*1.2000000476837158f);return ((1.0f-a)*0.8299999833106995f+1.0f)*a; }
+        void beginBlock()
+        {
+            let bpm=max(15.0f,this.tempo),unit=(this.rate*60.0f)/(bpm*4.0f),target=min(max(1.0f,this.length),floor((bpm*4.0f)/60.0f));
+            this.phase=((32.0f/this.rate)*0.6600000262260437f-floor(this.phase))+this.phase;
+            this.nextLength=this.currentLength+clamp(target-this.currentLength,-0.05f,0.05f);
+            let start=int(this.currentLength);
+            for(int tap=start;tap<start+2;++tap){let parity=tap&1,a=this.weight(this.currentLength,tap),b=this.weight(this.nextLength,tap),step=(b-a)/32.0f;var current=a;for(int c=0;c<2;++c){let i=c*2+parity;this.tapActive[i]=a!=0.0f||b!=0.0f;if(!this.tapActive[i])this.heads[i].reset();else{let p=float(c)*0.25f+this.phase+float(parity)*0.5f,d=sineCycle(p)*(this.rate*0.003000000026077032f)+float(tap)*unit;this.lines[c].beginRead(this.heads[i],d,0.0f,32);this.tapGain[i]=current;this.tapStep[i]=step;loop(32)current+=step;}}}
+            for(int c=0;c<2;++c)this.scatter[c].beginGain(this.scatter[c].length,0.0f,32);
+            this.feedbackStep=clamp((clamp(this.feedback/100.0f,0.0f,1.0f)-this.currentFeedback)/32.0f,-0.01f,0.01f);
+        }
+        float<2> process(float<2> x)
+        {
+            if(this.cursor==0)this.beginBlock();
+            float<2> y;
+            let start=int(this.currentLength);
+            for(int tap=start;tap<start+2;++tap)for(int c=0;c<2;++c){let i=c*2+(tap&1);if(this.tapActive[i]){y[c]=this.tapGain[i]*this.lines[c].read(this.heads[i])+y[c];this.tapGain[i]+=this.tapStep[i];}}
+            for(int c=0;c<2;++c)y=this.scatter[c].scatter(y,this.scatter[c].length);
+            let gain=this.currentFeedback+float(this.cursor)*this.feedbackStep;
+            for(int c=0;c<2;++c){this.notch[c]=y[c]*0.20000000298023224f-this.notch[c]*0.800000011920929f;this.low[c]=(y[c]-this.low[c])*0.009999999776482582f+this.low[c];y[c]=y[c]-(this.notch[c]+this.low[c]);this.lines[c].push(saturate(y[c]*gain)+x[c]);}
+            if(++this.cursor==32){this.cursor=0;this.currentFeedback=32.0f*this.feedbackStep+this.currentFeedback;this.currentLength=this.nextLength;}return y;
+        }
+    }
+}
