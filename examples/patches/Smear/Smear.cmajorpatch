@@ -7,14 +7,14 @@
     "category":         "effect",
     "manufacturer":     "Cmajor Software Ltd",
     "isInstrument":     false,
-    "latencySamples":   8528,
+    "latencySamples":   2304,
 
-    "source":           ["Smear.cmajor", "SmearClassic.cmajor"],
+    "source":           ["Smear.cmajor", "SmearClassic.cmajor", "SmearModulation.cmajor"],
 
     "view":             {
                             "src": "view/index.js",
                             "width": 1040,
-                            "height": 640,
+                            "height": 780,
                             "resizable": true
                         }
 }

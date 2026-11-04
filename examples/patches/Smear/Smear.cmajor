@@ -10,26 +10,38 @@
     edges, and each band is reshaped on its own: Freeze holds it and keeps playing it, Smear
     blurs every bin's level over time, Shift moves it up or down, Peaks throws away all but
     its loudest bins, Scatter randomises its phases so it turns breathy and diffuse, and
-    Level sets how loud it comes back. Pull tunes each note to the nearest note of the
-    chosen key and scale: its pitch centre moves, so vibrato and drift come through as they
+    Level sets how loud it comes back. Scale switches Pull on or off and defaults to Off.
+    Pull Strength sets how strongly each note moves towards the chosen key and scale.
+    Its pitch centre moves, so vibrato and drift come through as they
     were, its overtones move with it, and noise is left where it was. Tilt then leans the
     whole balance towards the lows or highs without changing the loudness.
 
-    Everything below 1kHz runs on 2048-sample frames at a quarter of the sample rate, which
-    last as long as 8192 samples would at the full rate, and everything above on 2048-sample
-    frames at the full rate. A bass note's harmonics, and a chord's partials, are closer
-    together than a short frame can tell apart, so the long frames are what let them be
-    shifted and pulled one by one (the long frames also work out where every partial up to
-    about 4kHz belongs, for the short frames to follow); the short frames keep everything
-    above them quick.
+    An LFO and an envelope follower move Smear, Shift and Scatter around their knob settings
+    in all three bands. Depth sets the LFO's movement. Shape blends between sine, triangle,
+    ramp down and square, with Snap choosing one shape at a time.
+    Randomize mixes in repeatable random movement, and Spread carries it from band to band.
+    Sync follows the host's tempo and playing position, or Rate sets the speed in Hz.
+    The envelope follows the louder input channel, with Attack and Release setting how
+    quickly it rises and falls. Sensitivity adjusts the level that drives it, from no
+    movement at -48 dB to full movement at 0 dB. Its three amounts set how far each target
+    moves, equally in all bands, with no separate depth control.
+    Envelope switches its movement on or off with a short fade, while the follower keeps
+    tracking. With zero LFO Depth, the knobs are fully manual when Envelope is off or its
+    amounts are zero. Switching off finishes the fade before returning to manual control.
+
+    Both engines use 2048-sample frames at the full sample rate, with a split at 1kHz.
+    The low engine analyses the sound, and the upper engine follows its moves.
+    At 48kHz, each bin spans about 23Hz, compared with about 6Hz at the previous quarter rate.
+    Close bass harmonics and chord notes are less well separated, in exchange for less delay.
 
     Alongside them runs a short 256-sample FFT that picks out onsets as they arrive.
     Transients sets how much of them goes around the long frames and is added back untouched,
     so hits stay sharp however smeared or frozen the rest is. Phase on Minimum makes any
     ringing from the reshaping come after a hit instead of before it.
 
-    With everything at neutral it passes the sound straight through, 8528 samples late (the
-    dry signal is delayed to match, so Mix doesn't comb-filter).
+    With neutral settings, the sound passes through with a 2304-sample delay (48ms at 48kHz).
+    This includes the 2048-sample frames and the 256-sample transient splitter.
+    The dry signal has the same delay, so Mix does not cause comb filtering.
 
     Pull Mode picks between this way of working (Precise) and the one Smear had before it
     (Classic, in SmearClassic.cmajor), which pulls every partial on its own on 2048-sample
@@ -43,6 +55,7 @@ graph Smear  [[ main ]]
     input stream float<2> in;
     output stream float<2> out;
     output event smear::Spectrum spectrumOut;   // the output's spectrum, about 45 times a second, for the GUI
+    output event SmearModulation::ModulationDisplay modulationOut;   // modulation and input peaks, delayed to match the audio, about 60 times a second
 
     input value float lowCross     [[ name: "Low Crossover",  min: 40,  max: 1000,  init: 200,  unit: "Hz" ]];
     input value float highCross    [[ name: "High Crossover", min: 500, max: 10000, init: 2500, unit: "Hz" ]];
@@ -68,9 +81,10 @@ graph Smear  [[ main ]]
     input value float highScatter  [[ name: "High Scatter",   min: 0,   max: 1,     init: 0 ]];
     input value float highLevel    [[ name: "High Level",     min: -36, max: 12,    init: 0,    unit: "dB" ]];
 
-    input value float magnet       [[ name: "Pull",           min: 0,   max: 1,     init: 0 ]];
+    input value float magnet       [[ name: "Pull Strength",  min: 0,   max: 1,     init: 0 ]];
     input value int   key          [[ name: "Key",            min: 0,   max: 11,    init: 0,    text: "C|C#|D|D#|E|F|F#|G|G#|A|A#|B" ]];
     input value int   scale        [[ name: "Scale",          min: 0,   max: 11,    init: 1,    text: "Major|Minor|Dorian|Phrygian|Lydian|Mixolydian|Harm Minor|Pent Major|Pent Minor|Whole Tone|Fifths|Octaves" ]];
+    input value int   scaleEnabled [[ name: "Scale",          min: 0,   max: 1,     init: 0,    text: "Off|On" ]];
 
     input value float transients   [[ name: "Transients",     min: 0,   max: 1,     init: 0.5 ]];
     input value int   phaseMode    [[ name: "Phase",          min: 0,   max: 1,     init: 1,    text: "Original|Minimum" ]];
@@ -79,36 +93,73 @@ graph Smear  [[ main ]]
     input value float volume       [[ name: "Output",         min: -24, max: 12,    init: 0,    unit: "dB" ]];
     input value int   pullMode     [[ name: "Pull Mode",      min: 0,   max: 1,     init: 0,    text: "Precise|Classic" ]];
 
+    input value float lfoDepth     [[ name: "LFO Depth",      min: 0,    max: 1,   init: 0 ]];
+    input value float lfoRate      [[ name: "LFO Rate",       min: 0.02, max: 20,  init: 0.5, unit: "Hz" ]];
+    input value int   lfoSync      [[ name: "LFO Sync",       min: 0,    max: 1,   init: 0,   text: "Off|On" ]];
+    input value int   lfoDivision  [[ name: "LFO Sync Rate",  min: 0,    max: 13,  init: 3,   text: "8 Bars|4 Bars|2 Bars|1 Bar|1/2|1/4|1/8|1/16|1/2T|1/4T|1/8T|1/16T|1/4D|1/8D" ]];
+    input value float lfoShape     [[ name: "LFO Shape",      min: 0,    max: 3,   init: 0 ]];
+    input value int   lfoSnap      [[ name: "Shape Snap",     min: 0,    max: 1,   init: 0,   text: "Off|On" ]];
+    input value float lfoRandom    [[ name: "LFO Randomize",  min: 0,    max: 1,   init: 0 ]];
+    input value float lfoSpread    [[ name: "Band Spread",    min: -180, max: 180, init: 0,   unit: "deg" ]];
+    input value float lfoToSmear   [[ name: "LFO > Smear",    min: -1,   max: 1,   init: 0.5 ]];
+    input value float lfoToShift   [[ name: "LFO > Shift",    min: -24,  max: 24,  init: 0,   unit: "st" ]];
+    input value float lfoToScatter [[ name: "LFO > Scatter",  min: -1,   max: 1,   init: 0 ]];
+
+    input value int   envEnabled     [[ name: "Envelope",        min: 0,   max: 1,    init: 0,   text: "Off|On" ]];
+    input value float envAttack      [[ name: "Env Attack",      min: 0.1, max: 200,  init: 5,   unit: "ms" ]];
+    input value float envRelease     [[ name: "Env Release",     min: 5,   max: 2000, init: 150, unit: "ms" ]];
+    input value float envSensitivity [[ name: "Env Sensitivity", min: -24, max: 24,   init: 0,   unit: "dB" ]];
+    input value float envToSmear     [[ name: "Env > Smear",      min: -1,  max: 1,    init: 0 ]];
+    input value float envToShift     [[ name: "Env > Shift",      min: -24, max: 24,   init: 0,   unit: "st" ]];
+    input value float envToScatter   [[ name: "Env > Scatter",    min: -1,  max: 1,    init: 0 ]];
+
+    input event std::timeline::Tempo tempoIn;
+    input event std::timeline::TransportState transportIn;
+    input event std::timeline::Position positionIn;
+
+    node modulation = SmearModulation;
     node precise = SmearPrecise;
     node classic = SmearClassic;
 
     connection
     {
-        in -> precise.in, classic.in;
+        in -> precise.in, classic.in, modulation.in;
         precise.out, classic.out -> out;
         precise.spectrumOut, classic.spectrumOut -> spectrumOut;
+        modulation.modulationOut -> modulationOut;
 
         lowCross -> precise.lowCross, classic.lowCross;
         highCross -> precise.highCross, classic.highCross;
         lowFreeze -> precise.lowFreeze, classic.lowFreeze;
-        lowSmear -> precise.lowSmear, classic.lowSmear;
-        lowShift -> precise.lowShift, classic.lowShift;
+        lowSmear -> modulation.lowSmear;
+        modulation.lowSmearOut -> precise.lowSmear, classic.lowSmear;
+        lowShift -> modulation.lowShift;
+        modulation.lowShiftOut -> precise.lowShift, classic.lowShift;
         lowPeaks -> precise.lowPeaks, classic.lowPeaks;
-        lowScatter -> precise.lowScatter, classic.lowScatter;
+        lowScatter -> modulation.lowScatter;
+        modulation.lowScatterOut -> precise.lowScatter, classic.lowScatter;
         lowLevel -> precise.lowLevel, classic.lowLevel;
         midFreeze -> precise.midFreeze, classic.midFreeze;
-        midSmear -> precise.midSmear, classic.midSmear;
-        midShift -> precise.midShift, classic.midShift;
+        midSmear -> modulation.midSmear;
+        modulation.midSmearOut -> precise.midSmear, classic.midSmear;
+        midShift -> modulation.midShift;
+        modulation.midShiftOut -> precise.midShift, classic.midShift;
         midPeaks -> precise.midPeaks, classic.midPeaks;
-        midScatter -> precise.midScatter, classic.midScatter;
+        midScatter -> modulation.midScatter;
+        modulation.midScatterOut -> precise.midScatter, classic.midScatter;
         midLevel -> precise.midLevel, classic.midLevel;
         highFreeze -> precise.highFreeze, classic.highFreeze;
-        highSmear -> precise.highSmear, classic.highSmear;
-        highShift -> precise.highShift, classic.highShift;
+        highSmear -> modulation.highSmear;
+        modulation.highSmearOut -> precise.highSmear, classic.highSmear;
+        highShift -> modulation.highShift;
+        modulation.highShiftOut -> precise.highShift, classic.highShift;
         highPeaks -> precise.highPeaks, classic.highPeaks;
-        highScatter -> precise.highScatter, classic.highScatter;
+        highScatter -> modulation.highScatter;
+        modulation.highScatterOut -> precise.highScatter, classic.highScatter;
         highLevel -> precise.highLevel, classic.highLevel;
-        magnet -> precise.magnet, classic.magnet;
+        magnet -> modulation.magnet;
+        scaleEnabled -> modulation.scaleEnabled;
+        modulation.magnetOut -> precise.magnet, classic.magnet;
         key -> precise.key, classic.key;
         scale -> precise.scale, classic.scale;
         transients -> precise.transients, classic.transients;
@@ -117,6 +168,28 @@ graph Smear  [[ main ]]
         mix -> precise.mix, classic.mix;
         volume -> precise.volume, classic.volume;
         pullMode -> precise.pullMode, classic.pullMode;
+
+        lfoDepth -> modulation.lfoDepth;
+        lfoRate -> modulation.lfoRate;
+        lfoSync -> modulation.lfoSync;
+        lfoDivision -> modulation.lfoDivision;
+        lfoShape -> modulation.lfoShape;
+        lfoSnap -> modulation.lfoSnap;
+        lfoRandom -> modulation.lfoRandom;
+        lfoSpread -> modulation.lfoSpread;
+        lfoToSmear -> modulation.lfoToSmear;
+        lfoToShift -> modulation.lfoToShift;
+        lfoToScatter -> modulation.lfoToScatter;
+        envEnabled -> modulation.envEnabled;
+        envAttack -> modulation.envAttack;
+        envRelease -> modulation.envRelease;
+        envSensitivity -> modulation.envSensitivity;
+        envToSmear -> modulation.envToSmear;
+        envToShift -> modulation.envToShift;
+        envToScatter -> modulation.envToScatter;
+        tempoIn -> modulation.tempoIn;
+        transportIn -> modulation.transportIn;
+        positionIn -> modulation.positionIn;
     }
 }
 
@@ -170,14 +243,12 @@ processor SmearPrecise
     //==============================================================================
     namespace frames = smear::stft (smear::fftSize);
 
-    frames::Engine lowEngine;     // everything below smear::engineSplit, at a quarter of the sample rate
+    frames::Engine lowEngine;     // below smear::engineSplit, at sample rate / decimation
     frames::Engine upperEngine;   // everything above it
     smear::Controls controls;
 
-    // The low engine's trip down to a quarter of the sample rate and back up: the same
-    // lowpass filter takes out what would alias on the way down and the images on the way
-    // up. Going up, only every fourth sample of the stuffed signal isn't zero, so each
-    // output sample only needs one tap in four.
+    // Resample only when decimation > 1. The same lowpass filter removes aliases and images.
+    // Interpolation uses one filter phase per output sample.
     let decimation = smear::decimation;
     let filterLength = smear::filterLength;
     let interpolatorLength = (filterLength + decimation - 1) / decimation;
@@ -192,15 +263,15 @@ processor SmearPrecise
     // low engine's output, and so that its frames are never ahead of the low engine's, whose
     // moves it follows
     let upperDelay = smear::lowLatency - smear::fftSize;
-    smear::Delayed[upperDelay] upperDelayLine;
-    wrap<upperDelay> upperDelayPosition;
+    smear::Delayed[max (1, upperDelay)] upperDelayLine;
+    wrap<max (1, upperDelay)> upperDelayPosition;
 
     // The sample each of the low engine's last three frames was made on (the upper engine
     // keeps their moves), so the upper engine can blend between the two either side of its
     // own frame. The middle of the upper engine's frame is this much further back in the
     // input than the middle of a low frame made on the same sample (both frames' middles
     // are half their length, less a sample, behind their newest sample).
-    let lowMovesLag = (upperDelay + smear::fftSize / 2 - 1) - ((filterLength - 1) / 2 + decimation * (smear::fftSize / 2 - 1));
+    let lowMovesLag = (upperDelay + smear::fftSize / 2 - 1) - (smear::resamplingDelay / 2 + decimation * (smear::fftSize / 2 - 1));
     int64[3] lowMovesMadeAt;
     wrap<3> newestLowMoves;
     int64 sampleCount;
@@ -235,11 +306,13 @@ processor SmearPrecise
         frames::initialise (lowEngine, true, 777L, float (processor.frequency) / float (decimation));
         frames::initialise (upperEngine, false, 778L, float (processor.frequency));
 
-        // the low engine's frames fall halfway between the upper one's, so the two never
-        // land on the same sample
-        lowEngine.hopCountdown = frames::hopSize / (2 * decimation);
+        // At full rate, render the low frame first and use its moves for the same upper frame.
+        // At reduced rates, keep the previous offset between frame calculations.
+        if const (decimation > 1)
+            lowEngine.hopCountdown = frames::hopSize / (2 * decimation);
 
-        designResamplingFilter();
+        if const (decimation > 1)
+            designResamplingFilter();
 
         for (wrap<shortSize> i)
             shortWindow[i] = 0.5f - 0.5f * cos (float (twoPi) * float (i) / float (shortSize));
@@ -275,10 +348,17 @@ processor SmearPrecise
             // The upper engine works on the input held back by upperDelay, and gives back the
             // dry signal too (what went into it fftSize samples ago), so both line up with the
             // low engine's output
-            let held = upperDelayLine[upperDelayPosition];
-            upperDelayLine[upperDelayPosition].steady = steady;
-            upperDelayLine[upperDelayPosition].kept = kept;
-            ++upperDelayPosition;
+            smear::Delayed held;
+            held.steady = steady;
+            held.kept = kept;
+
+            if const (upperDelay > 0)
+            {
+                held = upperDelayLine[upperDelayPosition];
+                upperDelayLine[upperDelayPosition].steady = steady;
+                upperDelayLine[upperDelayPosition].kept = kept;
+                ++upperDelayPosition;
+            }
 
             let steadyDry = frames::getDueInput (upperEngine);
             let keptDry = frames::getDueKept (upperEngine);
@@ -354,6 +434,17 @@ processor SmearPrecise
     // between them it is
     void chooseLowMoves()
     {
+        if const (decimation == 1)
+        {
+            // Both frames have the same centre. No interpolation or phase advance is needed.
+            controls.earlierLowMoves = newestLowMoves;
+            controls.laterLowMoves = newestLowMoves;
+            controls.lowMovesBlend = 1.0f;
+            controls.secondsAfterEarlier = 0.0f;
+            controls.secondsBeforeLater = 0.0f;
+            return;
+        }
+
         let wanted = sampleCount - int64 (lowMovesLag);
         wrap<3> previous = newestLowMoves;
         --previous;
@@ -371,12 +462,13 @@ processor SmearPrecise
     }
 
     //==============================================================================
-    // Takes one sample of what goes through the long frames down to the low engine (every
-    // fourth sample), and gives back the low engine's output brought back up to the full
-    // rate. Both filters are linear-phase, so it comes out filterLength - 1 samples later
-    // than the engine alone would make it.
+    // Full-rate samples go directly through the low engine.
+    // At reduced rates, the two filters add filterLength - 1 samples of delay.
     float<2> runLowEngine (float<2> steady)
     {
+        if const (decimation == 1)
+            return exchangeLowSample (steady);
+
         decimatorHistory[decimatorPosition] = steady;
 
         if (samplesSinceDecimation == 0)
@@ -391,17 +483,7 @@ processor SmearPrecise
             }
 
             ++interpolatorPosition;
-            interpolatorHistory[interpolatorPosition] = frames::exchange (lowEngine, down, float<2>());
-
-            if (frames::isFrameDue (lowEngine))
-            {
-                gatherControls();
-                frames::renderFrame (lowEngine, controls);
-
-                ++newestLowMoves;
-                upperEngine.recentLowMoves[newestLowMoves] = lowEngine.moves;
-                lowMovesMadeAt[newestLowMoves] = sampleCount;
-            }
+            interpolatorHistory[interpolatorPosition] = exchangeLowSample (down);
         }
 
         float<2> up;
@@ -423,28 +505,54 @@ processor SmearPrecise
         return up * float (decimation);
     }
 
-    // A Kaiser-windowed lowpass at an eighth of the sample rate (the quarter rate's highest
-    // frequency): flat to within 0.001dB up to 9% of the sample rate, and at least 80dB down
-    // from 16%, scaled to a gain of exactly 1 at DC
-    void designResamplingFilter()
+    float<2> exchangeLowSample (float<2> sample)
     {
-        let beta = 7.857f;
-        let middle = float (filterLength - 1) / 2.0f;
-        float sum;
+        let wet = frames::exchange (lowEngine, sample, float<2>());
 
-        for (wrap<filterLength> i)
+        if (frames::isFrameDue (lowEngine))
         {
-            let t = float (int (i)) - middle;
-            let x = float (pi) * t / float (decimation);
-            let sinc = abs (t) < 0.5f ? 1.0f : sin (x) / x;
-            let r = t / middle;
+            gatherControls();
+            frames::renderFrame (lowEngine, controls);
 
-            resamplingFilter[i] = sinc * smear::besselI0 (beta * sqrt (max (0.0f, 1.0f - r * r))) / smear::besselI0 (beta);
-            sum += resamplingFilter[i];
+            ++newestLowMoves;
+            upperEngine.recentLowMoves[newestLowMoves] = lowEngine.moves;
+            lowMovesMadeAt[newestLowMoves] = sampleCount;
         }
 
-        for (wrap<filterLength> i)
-            resamplingFilter[i] /= sum;
+        return wet;
+    }
+
+    // A Kaiser-windowed lowpass at the reduced rate's Nyquist frequency, with unity gain at DC.
+    // With 81 taps and decimation 4, it stays within 0.001dB through 9% of the input rate.
+    // Attenuation reaches 80dB from 16% of that rate.
+    void designResamplingFilter()
+    {
+        if const (decimation == 1 || filterLength == 1)
+        {
+            // A single tap needs no window. Full-rate processing bypasses this filter.
+            resamplingFilter = 0.0f;
+            resamplingFilter[0] = 1.0f;
+        }
+        else
+        {
+            let beta = 7.857f;
+            let middle = float (filterLength - 1) / 2.0f;
+            float sum;
+
+            for (wrap<filterLength> i)
+            {
+                let t = float (int (i)) - middle;
+                let x = float (pi) * t / float (decimation);
+                let sinc = abs (t) < 0.5f ? 1.0f : sin (x) / x;
+                let r = t / middle;
+
+                resamplingFilter[i] = sinc * smear::besselI0 (beta * sqrt (max (0.0f, 1.0f - r * r))) / smear::besselI0 (beta);
+                sum += resamplingFilter[i];
+            }
+
+            for (wrap<filterLength> i)
+                resamplingFilter[i] /= sum;
+        }
     }
 
     //==============================================================================
@@ -605,9 +713,12 @@ namespace smear
 {
     let fftSize = 2048;           // both engines' frames
     let engineSplit = 1000.0f;    // the low engine renders everything below this many Hz, and the upper engine everything above
-    let decimation = 4;           // the low engine runs at a quarter of the sample rate
+    let decimation = 1;           // set to 4 to restore the previous quarter-rate processing and delay
+                                 // Keep the patch manifest's latencySamples equal to lowLatency + shortSize.
     let filterLength = 81;        // the taps in the low engine's resampling filter
-    let lowLatency = decimation * fftSize + filterLength - 1;
+    static_assert (decimation > 0 && filterLength > 0);
+    let resamplingDelay = decimation == 1 ? 0 : filterLength - 1;
+    let lowLatency = decimation * fftSize + resamplingDelay;
     let shortSize = 256;          // the transient splitter's frames
     let numBands = 3;
     let numDisplayBands = 64;
@@ -736,10 +847,9 @@ namespace smear
         return s;
     }
 
-    /// How the low engine moved each of its bins in one frame, in each band (as a ratio of
-    /// frequencies). Its frames are four times as long as the upper engine's, so it can tell
-    /// apart a chord's partials (and see which note each belongs to) where the upper engine
-    /// can't; the upper engine moves anything below highestFrequency the same way.
+    /// The low engine's frequency shifts and phases for each band and bin.
+    /// The upper engine follows these moves below highestFrequency.
+    /// At full rate, both engines use the same frame centres and bin widths.
     struct LowMoves
     {
         float[numBands, fftSize / 2 + 1] shift, phase;   // how far each bin moved (in Hz), and how far its phases had been turned by the middle of the frame
@@ -973,9 +1083,9 @@ namespace smear
             e.centreCoefficient = 1.0f - exp (-float (hopSize) / (0.1f * sampleRate));
             e.rng.seed (seed);
 
-            // the resampling filter is flat up to 36% of this rate
+            // Full-rate analysis reaches Nyquist. The quarter-rate filter is flat through 36% of its output rate.
             e.moves.binWidth = sampleRate / float (fftSize);
-            e.moves.highestFrequency = 0.36f * sampleRate;
+            e.moves.highestFrequency = (decimation == 1 ? 0.5f : 0.36f) * sampleRate;
             e.moves.isValid = isAnalyser;
         }
 
@@ -1198,8 +1308,7 @@ namespace smear
 
         // The analyser follows each peak on from the last frame (through whichever peak's
         // region its bin was in), and works out the pitch it's centred on: its last four
-        // frames' pitches averaged (a long frame catches more of one end of a vibrato's swing
-        // than the other, by turns, and four of them in a row nearly even that out), then
+        // frames' pitches averaged to reduce changes between frames, then
         // smoothed twice over about 100ms, which together let through hardly any vibrato but
         // follow a slow drift, and catch up quickly with a pitch that's clearly moved on. Its
         // tonality it takes up over a couple of frames but only lets go of over about 300ms:
@@ -1398,8 +1507,8 @@ namespace smear
         // moved that frequency, blending between its frames either side, with the phases turned
         // as far as the analyser's had been by the middle of this frame, so a partial the two
         // engines share comes out of both in step. It goes bin by bin rather than by its own
-        // peaks, which can lump several of a low note's harmonics together. Above the
-        // analyser's reach, its harmonics follow their roots again.
+        // peaks. At reduced rates, the analyser can separate closer harmonics than the upper engine.
+        // Above the analyser's reach, its harmonics follow their roots again.
         void planShifts (Engine& e, wrap<numBands> b, const Controls& c)
         {
             let binWidth = e.sampleRate / float (fftSize);

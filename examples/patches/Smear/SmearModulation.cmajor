@@ -1,0 +1,295 @@
+/**
+    SmearModulation moves Smear, Shift and Scatter before either spectral engine reads them.
+    The LFO's Depth scales its movement, and each source has an amount for each target.
+    Spread moves each band further along the same cycle, including its random values.
+
+    The envelope follows the louder input channel, with Attack and Release setting how
+    quickly it rises and falls. Sensitivity adjusts the level that drives it, from no
+    movement at -48 dB to full movement at 0 dB.
+    The envelope moves all three bands together, with no spread or separate depth control.
+    Envelope switches its movement on or off with a two millisecond fade, while the follower
+    keeps tracking. Zero LFO Depth leaves the controls manual when Envelope is off or its
+    amounts are zero. Switching off finishes the fade before returning to manual control.
+
+    Scale gates Pull Strength every sample. Neither source modulates its value.
+
+    The host's position sets the cycle while Sync is on and the transport is playing.
+    Between positions it runs at the host tempo, so sparse updates do not stop the movement.
+    Random values come from the cycle number, so returning to a position repeats the same sequence.
+*/
+processor SmearModulation
+{
+    input stream float<2> in;
+
+    input value float lowSmear, midSmear, highSmear;
+    input value float lowShift, midShift, highShift;
+    input value float lowScatter, midScatter, highScatter;
+    input value float magnet;
+    input value int scaleEnabled;
+
+    input value float lfoDepth, lfoRate;
+    input value int lfoSync, lfoDivision;
+    input value float lfoShape;
+    input value int lfoSnap;
+    input value float lfoRandom, lfoSpread;
+    input value float lfoToSmear, lfoToShift, lfoToScatter;
+
+    input value int envEnabled;
+    input value float envAttack, envRelease, envSensitivity;
+    input value float envToSmear, envToShift, envToScatter;
+
+    input event std::timeline::Tempo tempoIn;
+    input event std::timeline::TransportState transportIn;
+    input event std::timeline::Position positionIn;
+
+    output value float lowSmearOut, midSmearOut, highSmearOut;
+    output value float lowShiftOut, midShiftOut, highShiftOut;
+    output value float lowScatterOut, midScatterOut, highScatterOut;
+    output value float magnetOut;
+    output event ModulationDisplay modulationOut;
+
+    struct ModulationDisplay
+    {
+        float[3] lfoPhase;
+        float[3] lfoValue;
+        float envelope;
+        float inputLevel;
+    }
+
+    float hostTempo = 120.0f;
+    bool isHostPlaying, hasNewPosition;
+    float64 hostQuarterNote, phase;
+    float[3] movement;
+    float envelope, env, envGate;
+
+    event tempoIn (std::timeline::Tempo t)
+    {
+        if (t.bpm > 0.0f)
+            hostTempo = t.bpm;
+    }
+
+    event transportIn (std::timeline::TransportState t)
+    {
+        isHostPlaying = t.isPlaying();
+    }
+
+    event positionIn (std::timeline::Position p)
+    {
+        hostQuarterNote = p.quarterNote;
+        hasNewPosition = true;
+    }
+
+    // The bar choices use four quarters per bar, independent of the host's time signature.
+    float64 cycleQuarters()
+    {
+        let quarters = float64[14] (32.0, 16.0, 8.0, 4.0, 2.0, 1.0, 0.5, 0.25,
+                                   4.0 / 3.0, 2.0 / 3.0, 1.0 / 3.0, 1.0 / 6.0, 1.5, 0.75);
+        return quarters.at (clamp (lfoDivision, 0, 13));
+    }
+
+    // Each cycle has one value, even when playback jumps over other cycles or runs before zero.
+    // The products fit in int64 before masking, so the hash does not depend on signed overflow.
+    float randomAt (int64 cycle)
+    {
+        var bits = ((cycle & 0xffffffffL) ^ ((cycle >>> 32) * 0x45d9f3bL)) & 0xffffffffL;
+        bits = (bits + 0x9e3779b9L) & 0xffffffffL;
+        bits = (((bits >>> 16) ^ bits) * 0x45d9f3bL) & 0xffffffffL;
+        bits = (((bits >>> 16) ^ bits) * 0x45d9f3bL) & 0xffffffffL;
+        bits = (bits >>> 16) ^ bits;
+        return float (bits & 0xffffffL) * (2.0f / 16777215.0f) - 1.0f;
+    }
+
+    float shapeAt (float p, float shape)
+    {
+        let triangle = 1.0f - 4.0f * abs (p - 0.5f);
+        let ramp = 1.0f - 2.0f * p;
+
+        if (shape < 1.0f)
+        {
+            let sine = sin (float (twoPi) * p);
+            return sine + (triangle - sine) * shape;
+        }
+
+        if (shape < 2.0f)
+            return triangle + (ramp - triangle) * (shape - 1.0f);
+
+        let square = p < 0.5f ? 1.0f : -1.0f;
+        return ramp + (square - ramp) * (shape - 2.0f);
+    }
+
+    float valueAt (float64 bandPhase, float shape, float randomAmount)
+    {
+        let cycle = floor (bandPhase);
+        let p = float (bandPhase - cycle);
+        let shaped = shapeAt (p, shape);
+
+        if (randomAmount == 0.0f)
+            return shaped;
+
+        let from = randomAt (int64 (cycle));
+        let to = randomAt (int64 (cycle) + 1L);
+        let blend = p * p * (3.0f - 2.0f * p);
+        let smooth = from + (to - from) * blend;
+        let squareAmount = max (0.0f, shape - 2.0f);
+        let random = smooth + (from - smooth) * squareAmount;
+        return shaped + (random - shaped) * randomAmount;
+    }
+
+    float modulate (float base, float amount, float value, float envAmount, float low, float high)
+    {
+        return clamp (base + amount * value + envAmount * env * envGate, low, high);
+    }
+
+    void writeManual()
+    {
+        lowSmearOut <- lowSmear;
+        midSmearOut <- midSmear;
+        highSmearOut <- highSmear;
+        lowShiftOut <- lowShift;
+        midShiftOut <- midShift;
+        highShiftOut <- highShift;
+        lowScatterOut <- lowScatter;
+        midScatterOut <- midScatter;
+        highScatterOut <- highScatter;
+    }
+
+    void writeModulated()
+    {
+        let depth = clamp (lfoDepth, 0.0f, 1.0f);
+        let smearAmount = depth * lfoToSmear;
+        let shiftAmount = depth * lfoToShift;
+        let scatterAmount = depth * lfoToScatter;
+
+        lowSmearOut <- modulate (lowSmear, smearAmount, movement[0], envToSmear, 0.0f, 1.0f);
+        midSmearOut <- modulate (midSmear, smearAmount, movement[1], envToSmear, 0.0f, 1.0f);
+        highSmearOut <- modulate (highSmear, smearAmount, movement[2], envToSmear, 0.0f, 1.0f);
+        lowShiftOut <- modulate (lowShift, shiftAmount, movement[0], envToShift, -24.0f, 24.0f);
+        midShiftOut <- modulate (midShift, shiftAmount, movement[1], envToShift, -24.0f, 24.0f);
+        highShiftOut <- modulate (highShift, shiftAmount, movement[2], envToShift, -24.0f, 24.0f);
+        lowScatterOut <- modulate (lowScatter, scatterAmount, movement[0], envToScatter, 0.0f, 1.0f);
+        midScatterOut <- modulate (midScatter, scatterAmount, movement[1], envToScatter, 0.0f, 1.0f);
+        highScatterOut <- modulate (highScatter, scatterAmount, movement[2], envToScatter, 0.0f, 1.0f);
+    }
+
+    void main()
+    {
+        let controlSamples = 16;
+        let displaySamples = max (controlSamples, int (processor.frequency / 60));
+        let displayLatency = smear::lowLatency + smear::shortSize;
+        let displayTicks = (displayLatency + controlSamples - 1) / controlSamples;
+        ModulationDisplay[displayTicks] displayHistory;
+        wrap<displayTicks> displayPosition;
+        float inputPeak, delayedInputPeak;
+        int samplesUntilDisplay;
+        // Two milliseconds soften square and random steps without making the movement sluggish.
+        let smoothing = 1.0f - exp (-float (controlSamples) / (0.002f * float (processor.frequency)));
+        let gateSamples = max (1, int (0.002 * processor.frequency));
+        int gatePosition;
+        float attackCoefficient, releaseCoefficient;
+        float64 increment;
+        int countdown;
+
+        loop
+        {
+            magnetOut <- scaleEnabled != 0 ? magnet : 0.0f;
+
+            // Apply positions on their sample, before the next control update reads the phase.
+            // Stopped positions are discarded, so they cannot reset the free-running movement later.
+            if (hasNewPosition)
+            {
+                if (lfoSync != 0 && isHostPlaying)
+                    phase = hostQuarterNote / cycleQuarters();
+
+                hasNewPosition = false;
+            }
+
+            let isControlTick = --countdown <= 0;
+
+            if (isControlTick)
+            {
+                countdown = controlSamples;
+                attackCoefficient = 1.0f - exp (-1.0f / (0.001f * clamp (envAttack, 0.1f, 200.0f) * float (processor.frequency)));
+                releaseCoefficient = 1.0f - exp (-1.0f / (0.001f * clamp (envRelease, 5.0f, 2000.0f) * float (processor.frequency)));
+            }
+
+            // Follow each sample, so a short peak between control ticks still reaches the envelope.
+            let peak = max (abs (in[0]), abs (in[1]));
+            inputPeak = max (inputPeak, peak);
+            let coefficient = peak > envelope ? attackCoefficient : releaseCoefficient;
+            envelope += (peak - envelope) * coefficient;
+
+            // A sample-by-sample fade reaches exact zero, so Off can return to raw manual controls.
+            let previousGate = envGate;
+            gatePosition = envEnabled != 0 ? min (gateSamples, gatePosition + 1) : max (0, gatePosition - 1);
+            envGate = float (gatePosition) / float (gateSamples);
+
+            let hasEnvAmounts = envToSmear != 0.0f || envToShift != 0.0f || envToScatter != 0.0f;
+            let isManual = lfoDepth == 0.0f && (envEnabled == 0 || ! hasEnvAmounts);
+            let isFadingOut = envEnabled == 0 && gatePosition != 0 && hasEnvAmounts;
+
+            if (isControlTick)
+            {
+                let rate = lfoSync != 0 ? float64 (hostTempo) / (60.0 * cycleQuarters())
+                                        : float64 (clamp (lfoRate, 0.02f, 20.0f));
+                increment = rate * processor.period;
+
+                let morph = clamp (lfoShape, 0.0f, 3.0f);
+                let shape = lfoSnap != 0 ? floor (morph + 0.5f) : morph;
+                let randomAmount = clamp (lfoRandom, 0.0f, 1.0f);
+                let spread = float64 (clamp (lfoSpread, -180.0f, 180.0f)) / 360.0;
+
+                for (wrap<3> b)
+                {
+                    let target = valueAt (phase + float64 (int (b)) * spread, shape, randomAmount);
+                    movement[b] += (target - movement[b]) * smoothing;
+                }
+
+                // Silence stays below the mapping range, even at the highest sensitivity.
+                let decibels = 20.0f * log10 (max (envelope, 1.0e-9f)) + envSensitivity;
+                let targetEnv = clamp ((decibels + 48.0f) / 48.0f, 0.0f, 1.0f);
+                env += (targetEnv - env) * smoothing;
+
+                // Store each control tick, with every input sample covered by its peak.
+                // The fixed ring follows the same latency as the audio at every sample rate.
+                ModulationDisplay display;
+
+                for (wrap<3> b)
+                {
+                    let bandPhase = phase + float64 (int (b)) * spread;
+                    display.lfoPhase[b] = float (bandPhase - floor (bandPhase));
+                    display.lfoValue[b] = movement[b];
+                }
+
+                display.envelope = env;
+                display.inputLevel = inputPeak;
+                inputPeak = 0.0f;
+
+                var delayedDisplay = displayHistory[displayPosition];
+                displayHistory[displayPosition] = display;
+                ++displayPosition;
+
+                // Combine the delayed peaks between messages, then start a fresh display window.
+                delayedInputPeak = max (delayedInputPeak, delayedDisplay.inputLevel);
+
+                if (samplesUntilDisplay <= 0)
+                {
+                    samplesUntilDisplay += displaySamples;
+                    delayedDisplay.inputLevel = delayedInputPeak;
+                    modulationOut <- delayedDisplay;
+                    delayedInputPeak = 0.0f;
+                }
+
+                samplesUntilDisplay -= controlSamples;
+            }
+
+            // Finish any fade before bypassing, so switching Off does not cut the contribution in one step.
+            if (isManual && ! isFadingOut)
+                writeManual();
+            else if (isControlTick || (hasEnvAmounts && envGate != previousGate))
+                writeModulated();
+
+            phase += increment;
+            advance();
+        }
+    }
+}

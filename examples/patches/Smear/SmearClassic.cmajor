@@ -1,5 +1,5 @@
 /**
-    SmearClassic - Smear as it was before the long low frames, kept as the Classic Pull Mode.
+    SmearClassic - the original algorithm, kept as the Classic Pull Mode.
 
     Everything runs on one set of 2048-sample frames, and Pull drags every partial on its
     own towards the nearest note of the chosen key and scale, so even a drum loop ends up
@@ -7,8 +7,8 @@
     (the bands, Freeze, Smear, Shift, Peaks, Scatter, Level, Tilt, the transient splitter
     and minimum phase) does what it does in SmearPrecise.
 
-    Its own latency is 2304 samples, so its output is held back further to line up with
-    SmearPrecise's, and the two can be crossfaded when Pull Mode changes.
+    Its latency is 2304 samples, matching full-rate SmearPrecise without an extra delay.
+    When SmearPrecise uses a reduced rate, an extra delay keeps both modes aligned.
 */
 
 processor SmearClassic
@@ -52,11 +52,11 @@ processor SmearClassic
     input value float volume;
     input value int   pullMode;
 
-    // the output is held back this much further, so it comes out as late as SmearPrecise's
+    // Match SmearPrecise's delay. Full-rate processing needs no extra delay.
     let alignment = smear::lowLatency + smear::shortSize - (smear_classic::fftSize + smear_classic::shortSize);
     processor.latency = smear_classic::fftSize + smear_classic::shortSize + alignment;
-    float<2>[alignment] alignmentDelay;
-    wrap<alignment> alignmentPosition;
+    float<2>[max (1, alignment)] alignmentDelay;
+    wrap<max (1, alignment)> alignmentPosition;
 
     let algorithm = 1;   // which Pull Mode this is
     smear::Switcher switcher;
@@ -202,9 +202,16 @@ processor SmearClassic
 
             gain += (pow (10.0f, volume / 20.0f) - gain) * 0.001f;
             let processed = (dry * (1.0f - mix) + (matchedWet * wetLimit + keptDry) * mix) * gain;
-            out <- alignmentDelay[alignmentPosition] * switcher.gain;
-            alignmentDelay[alignmentPosition] = processed;
-            ++alignmentPosition;
+            if const (alignment > 0)
+            {
+                out <- alignmentDelay[alignmentPosition] * switcher.gain;
+                alignmentDelay[alignmentPosition] = processed;
+                ++alignmentPosition;
+            }
+            else
+            {
+                out <- processed * switcher.gain;
+            }
 
             ++shortPosition;
 
