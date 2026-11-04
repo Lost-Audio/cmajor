@@ -1,0 +1,766 @@
+/**
+    A fully synthesised drum kit - every sound is built from oscillators, noise,
+    filters and envelopes, with no samples. The kick, snare and clap expose all
+    of their building blocks so you can design your own from scratch.
+
+    Notes follow the General MIDI drum map:
+        35/36 Kick          38/40 Snare         39 Clap
+        42/44 Closed hat    46 Open hat
+        41/43 Low tom       45/47 Mid tom       48/50 High tom
+*/
+
+graph DrumSynth  [[main]]
+{
+    input event std::midi::Message midiIn;
+    output stream float<2> out;
+
+    input value float volume          [[ name: "Volume",            min: -36,   max: 6,     init: -3,    unit: "dB" ]];
+
+    input value float kickLevel       [[ name: "Kick Level",        min: 0,     max: 1,     init: 0.8 ]];
+    input value float kickKey         [[ name: "Kick Key",          min: 16,    max: 47,    init: 31,    step: 1, unit: "note" ]];
+    input value float kickSweep       [[ name: "Kick Sweep",        min: 0,     max: 48,    init: 24,    unit: "st" ]];
+    input value float kickSweepTime   [[ name: "Kick Sweep Time",   min: 0.005, max: 0.5,   init: 0.08,  unit: "s" ]];
+    input value float kickDecay       [[ name: "Kick Decay",        min: 0.05,  max: 3,     init: 0.6,   unit: "s" ]];
+    input value float kickDrive       [[ name: "Kick Drive",        min: 0,     max: 1,     init: 0.3 ]];
+    input value float kickTone        [[ name: "Kick Tone",         min: 100,   max: 20000, init: 8000,  unit: "Hz" ]];
+    input value int   kickShapeMode   [[ name: "Kick Shape Mode",   min: 0,     max: 1,     init: 0,     text: "Knobs|Drawn" ]];
+    input value int   kickClickType   [[ name: "Kick Top Type",     min: 0,     max: 3,     init: 0,     text: "Noise|Tick|Beater|Snap" ]];
+    input value float kickClick       [[ name: "Kick Top Level",    min: 0,     max: 1,     init: 0.2 ]];
+    input value float kickClickDecay  [[ name: "Kick Top Decay",    min: 0.002, max: 0.1,   init: 0.01,  unit: "s" ]];
+    input value float kickClickTone   [[ name: "Kick Top Tone",     min: 300,   max: 12000, init: 4000,  unit: "Hz" ]];
+    input value float kickSub         [[ name: "Kick Sub Level",    min: 0,     max: 1,     init: 0 ]];
+    input value float kickSubDecay    [[ name: "Kick Sub Decay",    min: 0.05,  max: 3,     init: 0.8,   unit: "s" ]];
+
+    input value int   kickModel       [[ name: "Kick Model",        min: 0,     max: 1,     init: 0,     text: "909|Custom" ]];
+    input value float kick909Tune     [[ name: "Kick 909 Tune",     min: 0,     max: 1,     init: 0.5 ]];
+    input value float kick909Attack   [[ name: "Kick 909 Attack",   min: 0,     max: 1,     init: 0.5 ]];
+    input value float kick909Decay    [[ name: "Kick 909 Decay",    min: 0,     max: 1,     init: 0.5 ]];
+    input value float kick909Click    [[ name: "Kick 909 Click Tone", min: 1000, max: 12000, init: 5000, unit: "Hz" ]];
+    input value float kick909Snap     [[ name: "Kick 909 Snap",     min: 0,     max: 1,     init: 0.5 ]];
+    input value float kick909Shape    [[ name: "Kick 909 Shape",    min: 0,     max: 1,     init: 0.8 ]];
+    input value float kick909Drive    [[ name: "Kick 909 Drive",    min: 0,     max: 1,     init: 0.2 ]];
+    input value float kick909Hold     [[ name: "Kick 909 Hold",     min: 0,     max: 0.1,   init: 0.01,  unit: "s" ]];
+
+    // The drawn amp and pitch shapes, sent by the GUI's curve editor (and restored by worker.js)
+    input value drums::Curve kickAmpCurve    [[ hidden: true ]];
+    input value drums::Curve kickPitchCurve  [[ hidden: true ]];
+
+    input value float snareLevel      [[ name: "Snare Level",       min: 0,     max: 1,     init: 0.8 ]];
+    input value float snareKey        [[ name: "Snare Key",         min: 40,    max: 71,    init: 54,    step: 1, unit: "note" ]];
+    input value float snareRatio      [[ name: "Snare Ratio",       min: 1,     max: 3,     init: 1.78 ]];
+    input value float snareSweep      [[ name: "Snare Sweep",       min: 0,     max: 24,    init: 5,     unit: "st" ]];
+    input value float snareBodyDecay  [[ name: "Snare Body Decay",  min: 0.02,  max: 1,     init: 0.15,  unit: "s" ]];
+    input value float snareBodyLevel  [[ name: "Snare Body Level",  min: 0,     max: 1,     init: 0.7 ]];
+    input value float snareNoiseFreq  [[ name: "Snare Noise Freq",  min: 200,   max: 12000, init: 1500,  unit: "Hz" ]];
+    input value float snareNoiseQ     [[ name: "Snare Noise Q",     min: 0.5,   max: 8,     init: 0.7 ]];
+    input value float snareNoiseDecay [[ name: "Snare Noise Decay", min: 0.02,  max: 1.5,   init: 0.25,  unit: "s" ]];
+    input value float snareNoiseLevel [[ name: "Snare Noise Level", min: 0,     max: 1,     init: 0.6 ]];
+    input value int   snareNoiseMode  [[ name: "Snare Noise Mode",  min: 0,     max: 2,     init: 2,     text: "LP|BP|HP" ]];
+
+    input value float clapLevel       [[ name: "Clap Level",        min: 0,     max: 1,     init: 0.8 ]];
+    input value float clapFreq        [[ name: "Clap Freq",         min: 300,   max: 8000,  init: 1200,  unit: "Hz" ]];
+    input value float clapQ           [[ name: "Clap Q",            min: 0.5,   max: 10,    init: 1.5 ]];
+    input value int   clapFilterMode  [[ name: "Clap Filter Mode",  min: 0,     max: 2,     init: 1,     text: "LP|BP|HP" ]];
+    input value int   clapBursts      [[ name: "Clap Bursts",       min: 1,     max: 8,     init: 4,     step: 1 ]];
+    input value float clapSpacing     [[ name: "Clap Spacing",      min: 0.002, max: 0.04,  init: 0.01,  unit: "s" ]];
+    input value float clapDecay       [[ name: "Clap Decay",        min: 0.05,  max: 1.5,   init: 0.3,   unit: "s" ]];
+    input value float clapReverb      [[ name: "Clap Reverb",       min: 0,     max: 1,     init: 0.5 ]];
+
+    input value float hatTune         [[ name: "Hat Tune",          min: 0.5,   max: 2.0,   init: 1.0 ]];
+    input value float closedHatDecay  [[ name: "Closed Hat Decay",  min: 0.02,  max: 0.3,   init: 0.06,  unit: "s" ]];
+    input value float openHatDecay    [[ name: "Open Hat Decay",    min: 0.1,   max: 1.5,   init: 0.5,   unit: "s" ]];
+    input value float hatTone         [[ name: "Hat Tone",          min: 3000,  max: 12000, init: 7000,  unit: "Hz" ]];
+    input value float hatMetal        [[ name: "Hat Metal",         min: 0,     max: 1,     init: 0.7 ]];
+    input value float tomDecay        [[ name: "Tom Decay",         min: 0.1,   max: 1.5,   init: 0.5,   unit: "s" ]];
+
+    node
+    {
+        router  = NoteRouter;
+        kick    = Kick;
+        snare   = Snare;
+        clap    = Clap;
+        hats    = HiHat;
+        lowTom  = Tom (90.0f);
+        midTom  = Tom (130.0f);
+        highTom = Tom (180.0f);
+        mixer   = Mixer;
+    }
+
+    connection
+    {
+        midiIn -> std::midi::MPEConverter -> router;
+
+        router.kickOut      -> kick.triggerIn;
+        router.snareOut     -> snare.triggerIn;
+        router.clapOut      -> clap.triggerIn;
+        router.closedHatOut -> hats.closedIn;
+        router.openHatOut   -> hats.openIn;
+        router.lowTomOut    -> lowTom.triggerIn;
+        router.midTomOut    -> midTom.triggerIn;
+        router.highTomOut   -> highTom.triggerIn;
+
+        kickLevel       -> kick.level;
+        kickKey         -> kick.key;
+        kickSweep       -> kick.sweep;
+        kickSweepTime   -> kick.sweepTime;
+        kickDecay       -> kick.decay;
+        kickDrive       -> kick.drive;
+        kickShapeMode   -> kick.shapeMode;
+        kickClickType   -> kick.clickType;
+        kickClickDecay  -> kick.clickDecay;
+        kickClickTone   -> kick.clickTone;
+        kickSub         -> kick.sub;
+        kickSubDecay    -> kick.subDecay;
+        kickModel       -> kick.model;
+        kick909Tune     -> kick.tune909;
+        kick909Attack   -> kick.attack909;
+        kick909Decay    -> kick.decay909;
+        kick909Click    -> kick.clickTone909;
+        kick909Snap     -> kick.snap909;
+        kick909Shape    -> kick.shape909;
+        kick909Drive    -> kick.drive909;
+        kick909Hold     -> kick.hold909;
+        kickAmpCurve    -> kick.ampCurve;
+        kickPitchCurve  -> kick.pitchCurve;
+        kickClick       -> kick.click;
+        kickTone        -> kick.tone;
+
+        snareLevel      -> snare.level;
+        snareKey        -> snare.key;
+        snareRatio      -> snare.ratio;
+        snareSweep      -> snare.sweep;
+        snareBodyDecay  -> snare.bodyDecay;
+        snareBodyLevel  -> snare.bodyLevel;
+        snareNoiseFreq  -> snare.noiseFreq;
+        snareNoiseQ     -> snare.noiseQ;
+        snareNoiseDecay -> snare.noiseDecay;
+        snareNoiseLevel -> snare.noiseLevel;
+        snareNoiseMode  -> snare.noiseMode;
+
+        clapLevel       -> clap.level;
+        clapFreq        -> clap.freq;
+        clapQ           -> clap.q;
+        clapFilterMode  -> clap.filterMode;
+        clapBursts      -> clap.bursts;
+        clapSpacing     -> clap.spacing;
+        clapDecay       -> clap.decay;
+        clapReverb      -> clap.reverb;
+
+        hatTune         -> hats.tune;
+        openHatDecay    -> hats.openDecay;
+        closedHatDecay  -> hats.closedDecay;
+        hatTone         -> hats.tone;
+        hatMetal        -> hats.metal;
+        tomDecay        -> lowTom.decay, midTom.decay, highTom.decay;
+        volume          -> mixer.volume;
+
+        kick.out    -> mixer.kickIn;
+        snare.out   -> mixer.snareIn;
+        clap.out    -> mixer.clapIn;
+        hats.out    -> mixer.hatsIn;
+        lowTom.out  -> mixer.lowTomIn;
+        midTom.out  -> mixer.midTomIn;
+        highTom.out -> mixer.highTomIn;
+
+        mixer.out -> out;
+    }
+}
+
+//==============================================================================
+namespace drums
+{
+    /// Returns a per-sample multiplier that makes an envelope fall by 60dB over the given time
+    float decayCoefficient (float seconds, float64 sampleRate)
+    {
+        return float (exp (-6.9 / (float64 (max (seconds, 0.001f)) * sampleRate)));
+    }
+
+    /// A simple TPT state-variable filter
+    struct SVF
+    {
+        void setup (float cutoff, float q, float64 sampleRate)
+        {
+            let g = float (tan (pi * min (float64 (cutoff), sampleRate * 0.45) / sampleRate));
+            this.k  = 1.0f / q;
+            this.a1 = 1.0f / (1.0f + g * (g + this.k));
+            this.a2 = g * this.a1;
+            this.a3 = g * this.a2;
+        }
+
+        void process (float x)
+        {
+            let v3 = x - this.ic2;
+            let v1 = this.a1 * this.ic1 + this.a2 * v3;
+            let v2 = this.ic2 + this.a2 * this.ic1 + this.a3 * v3;
+            this.ic1 = 2.0f * v1 - this.ic1;
+            this.ic2 = 2.0f * v2 - this.ic2;
+            this.lp = v2;
+            this.bp = v1 * this.k;   // normalised to unity gain at the centre frequency
+            this.hp = x - this.k * v1 - v2;
+        }
+
+        /// Returns the most recent output for mode 0 = low-pass, 1 = band-pass, 2 = high-pass
+        float get (int mode)
+        {
+            if (mode == 0)  return this.lp;
+            if (mode == 1)  return this.bp;
+            return this.hp;
+        }
+
+        float lp, bp, hp;
+        float ic1, ic2, a1, a2, a3, k;
+    }
+
+    /// A breakpoint curve drawn in the GUI. Points have x in 0..1 (ascending) and y in 0..1;
+    /// each segment's tension bends it (0 = straight, negative = fast start, positive = slow start).
+    struct Curve
+    {
+        float[16] x;
+        float[16] y;
+        float[16] tension;
+        int count;
+    }
+
+    /// Returns the curve's value at position t (0..1)
+    float evaluateCurve (Curve c, float t)
+    {
+        if (c.count < 1)
+            return 0.0f;
+
+        let last = c.count - 1;
+
+        if (t <= c.x.at (0))     return c.y.at (0);
+        if (t >= c.x.at (last))  return c.y.at (last);
+
+        for (int i = 0; i < last; ++i)
+        {
+            let x1 = c.x.at (i + 1);
+
+            if (t < x1)
+            {
+                let x0 = c.x.at (i);
+                let p = (t - x0) / max (x1 - x0, 1.0e-6f);
+                let k = c.tension.at (i);
+                let shaped = abs (k) < 0.001f ? p : (exp (k * p) - 1.0f) / (exp (k) - 1.0f);
+                return c.y.at (i) + (c.y.at (i + 1) - c.y.at (i)) * shaped;
+            }
+        }
+
+        return c.y.at (last);
+    }
+}
+
+//==============================================================================
+// Turns incoming notes into trigger events (carrying the velocity) for each drum
+processor NoteRouter
+{
+    input event std::notes::NoteOn eventIn;
+
+    output event float kickOut;
+    output event float snareOut;
+    output event float clapOut;
+    output event float closedHatOut;
+    output event float openHatOut;
+    output event float lowTomOut;
+    output event float midTomOut;
+    output event float highTomOut;
+
+    event eventIn (std::notes::NoteOn e)
+    {
+        let note = int (e.pitch + 0.5f);
+        let v = e.velocity;
+
+        if (note == 35 || note == 36)       kickOut <- v;
+        else if (note == 38 || note == 40)  snareOut <- v;
+        else if (note == 39)                clapOut <- v;
+        else if (note == 42 || note == 44)  closedHatOut <- v;
+        else if (note == 46)                openHatOut <- v;
+        else if (note == 41 || note == 43)  lowTomOut <- v;
+        else if (note == 45 || note == 47)  midTomOut <- v;
+        else if (note == 48 || note == 50)  highTomOut <- v;
+    }
+}
+
+//==============================================================================
+// The kick has two models:
+//
+//  909: modelled on the classic analogue drum-machine kick. A triangle oscillator is
+//    rounded towards a sine by a waveshaper, with a very fast "snap" pitch transient and
+//    a slower pitch bend down to the key. The amp holds briefly then decays, and the
+//    attack is a short pulse plus a burst of filtered noise.
+//
+//  Custom: a layered kick
+//    - body: a sine that starts `sweep` semitones above `key` and glides down to it, with
+//      drive and a low-pass tone control
+//    - sub: a plain sine an octave below the key, with its own decay
+//    - top: a short attack layer, chosen from noise, a tick, a beater or a snap
+//
+// In either model the amp and pitch envelopes can be replaced by the curves drawn in the
+// GUI's shape editor, which are stretched over the kick's length.
+processor Kick
+{
+    input event float triggerIn;
+    input value float level;
+    input value float key;      // MIDI note number
+    input value int model;      // 0 = 909, 1 = custom
+    input value int shapeMode;  // 0 = knobs, 1 = drawn curves
+    input value drums::Curve ampCurve;
+    input value drums::Curve pitchCurve;
+
+    input value float tune909;
+    input value float attack909;
+    input value float decay909;
+    input value float clickTone909;
+    input value float snap909;
+    input value float shape909;
+    input value float drive909;
+    input value float hold909;
+
+    input value float sweep;
+    input value float sweepTime;
+    input value float decay;
+    input value float drive;
+    input value float tone;
+    input value int clickType;  // 0 = noise, 1 = tick, 2 = beater, 3 = snap
+    input value float click;
+    input value float clickDecay;
+    input value float clickTone;
+    input value float sub;
+    input value float subDecay;
+    output stream float out;
+
+    void init()
+    {
+        rng.seed (42);
+    }
+
+    event triggerIn (float v)
+    {
+        velocity = v;
+        time = 0.0f;
+        ampEnv = 1.0f;
+        pitchEnv = 1.0f;
+        snapEnv = 1.0f;
+        clickEnv = 1.0f;
+        beaterEnv = 1.0f;
+        subEnv = 1.0f;
+        phase = 0.0f;
+        subPhase = 0.0f;
+        clickPhase = 0.0f;
+    }
+
+    std::random::RNG rng;
+    drums::SVF clickFilter, toneFilter;
+    float velocity, time = 100.0f;
+    float ampEnv, pitchEnv, snapEnv, clickEnv, beaterEnv, subEnv;
+    float phase, subPhase, clickPhase;
+
+    void main()
+    {
+        loop
+        {
+            out <- level * velocity * (model == 0 ? render909() : renderCustom());
+            time += float (processor.period);
+            advance();
+        }
+    }
+
+    // Returns the drawn amp curve's value if it's in use, or the given knob envelope otherwise
+    float getAmp (float length, float knobEnvelope)
+    {
+        if (shapeMode != 0 && ampCurve.count >= 2)
+        {
+            let position = time / max (length, 0.001f);
+            return position < 1.0f ? drums::evaluateCurve (ampCurve, position) : 0.0f;
+        }
+
+        return knobEnvelope;
+    }
+
+    // Returns the drawn pitch curve's value (0..1) if it's in use, or the given knob envelope otherwise
+    float getPitch (float length, float knobEnvelope)
+    {
+        if (shapeMode != 0 && pitchCurve.count >= 2)
+            return drums::evaluateCurve (pitchCurve, min (time / max (length, 0.001f), 1.0f));
+
+        return knobEnvelope;
+    }
+
+    //==============================================================================
+    float render909()
+    {
+        let decayTime = 0.1f + 1.4f * decay909 * decay909;
+        let length = hold909 + decayTime;
+        let bendDepth = 6.0f + 30.0f * tune909;
+
+        let amp = getAmp (length, ampEnv);
+        let semitones = snap909 * 24.0f * snapEnv + bendDepth * getPitch (length, pitchEnv);
+
+        // triangle, rounded towards a sine by the shape control, then driven
+        let shifted = phase + 0.75f;
+        let triangle = 4.0f * abs (shifted - floor (shifted) - 0.5f) - 1.0f;
+        let wave = triangle + (sin (triangle * float (pi) * 0.5f) - triangle) * shape909;
+        let driveGain = 1.0f + drive909 * 6.0f;
+        let body = tanh (driveGain * wave * amp) / tanh (driveGain);
+
+        // the attack: a short pulse plus a burst of low-passed noise
+        clickFilter.setup (clickTone909, 0.707f, processor.frequency);
+        clickFilter.process (rng.getBipolar());
+        let pulse = time < 0.0007f ? 1.0f : 0.0f;
+        let attack = attack909 * (0.9f * pulse + 1.2f * clickFilter.lp * clickEnv);
+
+        phase += std::notes::noteToFrequency (key) * pow (2.0f, semitones / 12.0f) * float (processor.period);
+
+        if (phase >= 1.0f)
+            phase -= 1.0f;
+
+        if (time >= hold909)
+            ampEnv *= drums::decayCoefficient (decayTime, processor.frequency);
+
+        snapEnv  *= drums::decayCoefficient (0.006f, processor.frequency);
+        pitchEnv *= drums::decayCoefficient (0.03f + 0.12f * tune909, processor.frequency);
+        clickEnv *= drums::decayCoefficient (0.012f, processor.frequency);
+
+        return body + attack;
+    }
+
+    //==============================================================================
+    float getTop()
+    {
+        let noise = rng.getBipolar();
+
+        if (clickType == 0)
+        {
+            clickFilter.setup (clickTone, 0.8f, processor.frequency);
+            clickFilter.process (noise);
+            return 2.0f * clickFilter.bp;
+        }
+
+        if (clickType == 3)
+        {
+            clickFilter.setup (clickTone, 0.7f, processor.frequency);
+            clickFilter.process (noise);
+            return 1.5f * clickFilter.hp;
+        }
+
+        // tick is a pure sine burst; the beater adds a fast pitch drop and a little noise
+        let isBeater = clickType == 2;
+        let freq = isBeater ? clickTone * (1.0f + beaterEnv) : clickTone;
+        clickPhase += freq * float (processor.period);
+
+        if (clickPhase >= 1.0f)
+            clickPhase -= 1.0f;
+
+        let sine = sin (clickPhase * float (twoPi));
+        return isBeater ? 0.8f * sine + 0.3f * noise : sine;
+    }
+
+    float renderCustom()
+    {
+        let amp = getAmp (decay, ampEnv);
+        let semitones = sweep * getPitch (decay, pitchEnv);
+
+        let driveGain = 1.0f + drive * 9.0f;
+        let body = tanh (driveGain * sin (phase * float (twoPi))) / tanh (driveGain);
+        let subTone = sin (subPhase * float (twoPi));
+
+        toneFilter.setup (tone, 0.707f, processor.frequency);
+        toneFilter.process (body * amp + sub * subTone * subEnv);
+
+        let result = toneFilter.lp + click * clickEnv * getTop();
+
+        let keyFrequency = std::notes::noteToFrequency (key);
+        phase    += keyFrequency * pow (2.0f, semitones / 12.0f) * float (processor.period);
+        subPhase += keyFrequency * 0.5f * float (processor.period);
+
+        if (phase >= 1.0f)     phase -= 1.0f;
+        if (subPhase >= 1.0f)  subPhase -= 1.0f;
+
+        ampEnv    *= drums::decayCoefficient (decay, processor.frequency);
+        pitchEnv  *= drums::decayCoefficient (sweepTime, processor.frequency);
+        clickEnv  *= drums::decayCoefficient (clickDecay, processor.frequency);
+        beaterEnv *= drums::decayCoefficient (0.004f, processor.frequency);
+        subEnv    *= drums::decayCoefficient (subDecay, processor.frequency);
+
+        return result;
+    }
+}
+
+//==============================================================================
+// Two sine "body" tones with a pitch drop, plus filtered noise for the snares
+processor Snare
+{
+    input event float triggerIn;
+    input value float level;
+    input value float key;      // MIDI note number
+    input value float ratio;
+    input value float sweep;
+    input value float bodyDecay;
+    input value float bodyLevel;
+    input value float noiseFreq;
+    input value float noiseQ;
+    input value float noiseDecay;
+    input value float noiseLevel;
+    input value int noiseMode;
+    output stream float out;
+
+    void init()
+    {
+        rng.seed (1234);
+    }
+
+    event triggerIn (float v)
+    {
+        velocity = v;
+        bodyEnv = 1.0f;
+        noiseEnv = 1.0f;
+        pitchEnv = 1.0f;
+        phase1 = 0.0f;
+        phase2 = 0.0f;
+    }
+
+    std::random::RNG rng;
+    drums::SVF noiseFilter;
+    float velocity, bodyEnv, noiseEnv, pitchEnv, phase1, phase2;
+
+    void main()
+    {
+        loop
+        {
+            noiseFilter.setup (noiseFreq, noiseQ, processor.frequency);
+            noiseFilter.process (rng.getBipolar());
+
+            let body = 0.6f * sin (phase1 * float (twoPi)) + 0.4f * sin (phase2 * float (twoPi));
+            out <- level * velocity * (bodyLevel * body * bodyEnv
+                                        + noiseLevel * noiseFilter.get (noiseMode) * noiseEnv);
+
+            let freq = std::notes::noteToFrequency (key) * pow (2.0f, sweep * pitchEnv / 12.0f) * float (processor.period);
+            phase1 += freq;
+            phase2 += freq * ratio;
+
+            if (phase1 >= 1.0f)  phase1 -= 1.0f;
+            if (phase2 >= 1.0f)  phase2 -= 1.0f;
+
+            bodyEnv  *= drums::decayCoefficient (bodyDecay, processor.frequency);
+            noiseEnv *= drums::decayCoefficient (noiseDecay, processor.frequency);
+            pitchEnv *= drums::decayCoefficient (0.05f, processor.frequency);
+            advance();
+        }
+    }
+}
+
+//==============================================================================
+// A 909-style clap: filtered noise played as a few rapid bursts, the last of which
+// rings out as the tail, plus a separate softer, darker noise "reverb" behind it
+processor Clap
+{
+    input event float triggerIn;
+    input value float level;
+    input value float freq;
+    input value float q;
+    input value int filterMode;
+    input value int bursts;
+    input value float spacing;
+    input value float decay;
+    input value float reverb;
+    output stream float out;
+
+    void init()
+    {
+        rng.seed (5678);
+    }
+
+    event triggerIn (float v)
+    {
+        velocity = v;
+        time = 0.0f;
+        reverbEnv = 0.0f;
+    }
+
+    std::random::RNG rng;
+    drums::SVF filter, reverbFilter;
+    float velocity, reverbEnv, time = 100.0f;
+
+    void main()
+    {
+        loop
+        {
+            let noise = rng.getBipolar();
+            filter.setup (freq, q, processor.frequency);
+            filter.process (noise);
+            reverbFilter.setup (freq * 0.8f, 0.9f, processor.frequency);
+            reverbFilter.process (noise);
+
+            let burstLength = max (spacing, 0.001f);
+            let tailStart = burstLength * float (max (bursts, 1) - 1);
+            float env;
+
+            if (time < tailStart)
+                env = exp (-(time - burstLength * floor (time / burstLength)) / (burstLength * 0.3f));
+            else
+                env = exp (-6.9f * (time - tailStart) / max (decay, 0.001f));
+
+            // the reverb swells in over a few milliseconds, then dies away twice as slowly as the tail
+            let reverbTarget = exp (-6.9f * time / max (decay * 2.0f, 0.001f));
+            reverbEnv += (reverbTarget - reverbEnv) * 0.01f;
+
+            out <- level * velocity * (1.8f * env * filter.get (filterMode) + reverb * 2.0f * reverbEnv * reverbFilter.bp);
+
+            time += float (processor.period);
+            advance();
+        }
+    }
+}
+
+//==============================================================================
+// 909-style hats: six detuned square waves, ring-modulated in pairs for a metallic
+// sizzle and blended with noise, then band-passed and high-passed. A closed hat
+// chokes a ringing open hat.
+processor HiHat
+{
+    input event float closedIn;
+    input event float openIn;
+    input value float tune;
+    input value float closedDecay;
+    input value float openDecay;
+    input value float tone;     // high-pass cutoff
+    input value float metal;    // 0 = all noise, 1 = all metallic
+    output stream float out;
+
+    let oscFrequencies = float[6] (330.0f, 487.0f, 591.0f, 836.0f, 864.0f, 1280.0f);
+
+    void init()
+    {
+        rng.seed (9090);
+        bandFilter.setup (10000.0f, 0.8f, processor.frequency);
+    }
+
+    event closedIn (float velocity)
+    {
+        level = velocity;
+        env = 1.0f;
+        isOpen = false;
+    }
+
+    event openIn (float velocity)
+    {
+        level = velocity;
+        env = 1.0f;
+        isOpen = true;
+    }
+
+    std::random::RNG rng;
+    float[6] phases;
+    drums::SVF bandFilter, highFilter;
+    float level, env;
+    bool isOpen;
+
+    float square (int index)
+    {
+        return phases.at (index) < 0.5f ? 1.0f : -1.0f;
+    }
+
+    void main()
+    {
+        loop
+        {
+            let metallic = (square (0) * square (1) + square (2) * square (3) + square (4) * square (5)) / 3.0f;
+            let source = metal * metallic + (1.0f - metal) * rng.getBipolar();
+
+            for (wrap<6> i)
+            {
+                phases[i] += oscFrequencies[i] * tune * float (processor.period);
+
+                if (phases[i] >= 1.0f)
+                    phases[i] -= 1.0f;
+            }
+
+            bandFilter.process (source);
+            highFilter.setup (tone, 0.7f, processor.frequency);
+            highFilter.process (bandFilter.bp);
+
+            out <- level * 3.0f * env * highFilter.hp;
+
+            env *= drums::decayCoefficient (isOpen ? openDecay : closedDecay, processor.frequency);
+            advance();
+        }
+    }
+}
+
+//==============================================================================
+// Sine with a gentle pitch drop, tuned by the specialisation parameter
+processor Tom (float baseFrequency)
+{
+    input event float triggerIn;
+    input value float decay;
+    output stream float out;
+
+    event triggerIn (float velocity)
+    {
+        level = velocity;
+        ampEnv = 1.0f;
+        pitchEnv = 1.0f;
+        phase = 0.0f;
+    }
+
+    float level, ampEnv, pitchEnv, phase;
+
+    void main()
+    {
+        loop
+        {
+            out <- level * ampEnv * sin (phase * float (twoPi));
+
+            phase += baseFrequency * (1.0f + 0.6f * pitchEnv) * float (processor.period);
+
+            if (phase >= 1.0f)
+                phase -= 1.0f;
+
+            ampEnv   *= drums::decayCoefficient (decay, processor.frequency);
+            pitchEnv *= drums::decayCoefficient (0.25f, processor.frequency);
+            advance();
+        }
+    }
+}
+
+//==============================================================================
+// Pans each drum into a stereo mix, applies the volume and soft-clips the result
+processor Mixer
+{
+    input stream float kickIn;
+    input stream float snareIn;
+    input stream float clapIn;
+    input stream float hatsIn;
+    input stream float lowTomIn;
+    input stream float midTomIn;
+    input stream float highTomIn;
+    input value float volume;
+    output stream float<2> out;
+
+    float<2> pan (float x, float position)
+    {
+        let angle = (position + 1.0f) * float (pi) * 0.25f;
+        return float<2> (x * cos (angle), x * sin (angle));
+    }
+
+    float gain;
+
+    void main()
+    {
+        loop
+        {
+            gain += (pow (10.0f, volume / 20.0f) - gain) * 0.001f;
+
+            let mix = pan (kickIn,    0.0f)
+                    + pan (snareIn,   0.05f)
+                    + pan (clapIn,   -0.1f)
+                    + pan (hatsIn,    0.35f)
+                    + pan (lowTomIn, -0.4f)
+                    + pan (midTomIn, -0.1f)
+                    + pan (highTomIn, 0.25f);
+
+            out <- float<2> (tanh (mix[0] * gain), tanh (mix[1] * gain));
+            advance();
+        }
+    }
+}

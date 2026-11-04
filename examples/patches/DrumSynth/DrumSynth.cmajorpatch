@@ -1,0 +1,19 @@
+{
+    "CmajorVersion":    1,
+    "ID":               "dev.cmajor.examples.drumsynth",
+    "version":          "1.0",
+    "name":             "DrumSynth",
+    "description":      "A fully synthesised drum kit - kick, snare, clap, hi-hats and toms, with no samples",
+    "manufacturer":     "Cmajor Software Ltd",
+    "isInstrument":     true,
+
+    "source":           "DrumSynth.cmajor",
+    "worker":           "worker.js",
+
+    "view":             {
+                            "src": "view/index.js",
+                            "width": 1040,
+                            "height": 840,
+                            "resizable": true
+                        }
+}
