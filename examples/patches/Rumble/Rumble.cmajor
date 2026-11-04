@@ -1,0 +1,628 @@
+/**
+    Rumble - the low, ducked roar under a techno kick.
+
+    Each trigger fires a ghost kick (a sine with a fast pitch drop and a burst of noise)
+    into a long, dark feedback-delay-network reverb. The reverb's tail is driven hard so
+    its low tone breaks up into harmonics, then a steep low cut takes away the sub and a
+    resonant high cut keeps it all under a couple of hundred hertz. Finally every trigger
+    restarts a drawn shape that sets the level over a tempo-synced length (and can close
+    the high cut with it), so the rumble ducks and breathes in the gaps between kicks.
+    The default shape is a sidechain-style duck. A second drawn curve bends the pitch over
+    the same length, moving the kick and the filters together, and Width spreads the two
+    uncorrelated sides of the reverb across the stereo field.
+
+    The ghost kick can be mixed in too, but by default you only hear the rumble.
+    Triggers come from MIDI notes (the note sets the pitch) or from the built-in 16-step
+    sequencer, which follows the host's tempo and, while Run is on, plays only while the
+    host is playing, locked to its beat position.
+*/
+
+graph Rumble  [[main]]
+{
+    input event std::midi::Message midiIn;
+    input event std::timeline::Tempo tempoIn;
+    input event std::timeline::TransportState transportIn;
+    input event std::timeline::Position positionIn;
+    output stream float<2> out;
+    output event int currentStep;
+    output event float levelOut;     // the rumble's level, about 60 times a second, for the GUI
+    output event float shapePhase;   // how far through the shape it is (0 to 1), for the GUI
+
+    input value float note        [[ name: "Note",         min: 21,    max: 45,    init: 25,    step: 1, unit: "note" ]];
+    input value float punch       [[ name: "Punch",        min: 0,     max: 48,    init: 12,    unit: "st" ]];
+    input value float body        [[ name: "Body",         min: 0.05,  max: 1.5,   init: 0.8,   unit: "s" ]];
+
+    input value float preDelay    [[ name: "Pre-delay",    min: 0,     max: 0.5,   init: 0.12,  unit: "s" ]];
+    input value float space       [[ name: "Space",        min: 0,     max: 1,     init: 0.25 ]];
+    input value float tail        [[ name: "Tail",         min: 0.3,   max: 8,     init: 4,     unit: "s" ]];
+    input value float size        [[ name: "Size",         min: 0.3,   max: 1.5,   init: 1 ]];
+    input value float damp        [[ name: "Damp",         min: 200,   max: 8000,  init: 1200,  unit: "Hz" ]];
+    input value float width       [[ name: "Width",        min: 0,     max: 1.5,   init: 0 ]];
+
+    input value float drive       [[ name: "Drive",        min: 0,     max: 1,     init: 0.85 ]];
+
+    input value float lowCut      [[ name: "Low Cut",      min: 20,    max: 200,   init: 80,    unit: "Hz" ]];
+    input value float highCut     [[ name: "High Cut",     min: 80,    max: 2000,  init: 165,   unit: "Hz" ]];
+    input value float resonance   [[ name: "Resonance",    min: 0,     max: 1,     init: 0.4 ]];
+
+    // the shape: drawn in the GUI (and sent by the worker on load), played from each trigger
+    input value rumble::Curve shape;
+    input value float shapeDepth  [[ name: "Shape Depth",  min: 0,     max: 1,     init: 1 ]];
+    input value int   shapeLength [[ name: "Shape Length", min: 0,     max: 4,     init: 2,     text: "1/16|1/8|1/4|1/2|1 bar" ]];
+    input value float shapeFilter [[ name: "Shape Filter", min: 0,     max: 1,     init: 0 ]];
+
+    // the pitch curve: drawn and played the same way as the shape. Above its middle the kick
+    // and the filters bend up, below it they bend down, by up to `pitchBend` semitones
+    input value rumble::Curve pitch;
+
+    // a step's own shape and pitch curves, used instead of the ones above when that step
+    // triggers. A curve with fewer than two points goes back to the ones above.
+    input event rumble::StepCurve stepShape, stepPitch;
+    input value float pitchBend   [[ name: "Pitch Bend",   min: 0,     max: 24,    init: 12,    unit: "st" ]];
+
+    input value int   run         [[ name: "Run",          min: 0,     max: 1,     init: 0,     text: "Stop|Run" ]];
+    input value float bpm         [[ name: "BPM",          min: 100,   max: 160,   init: 140,   step: 1 ]];
+    input value int   pattern     [[ name: "Pattern",      min: 0,     max: 65535, init: 4369 ]];
+
+    input value float kickLevel   [[ name: "Kick",         min: 0,     max: 1,     init: 0 ]];
+    input value float volume      [[ name: "Volume",       min: -36,   max: 6,     init: -3.5,  unit: "dB" ]];
+
+    node
+    {
+        sequencer = Sequencer;
+        rumble    = RumbleVoice;
+    }
+
+    connection
+    {
+        midiIn -> std::midi::MPEConverter -> rumble.eventIn;
+        sequencer.triggerOut -> rumble.eventIn;
+
+        tempoIn     -> sequencer.tempoIn;
+        transportIn -> sequencer.transportIn;
+        positionIn  -> sequencer.positionIn;
+        run         -> sequencer.run;
+        bpm         -> sequencer.bpm;
+        pattern     -> sequencer.pattern;
+        note        -> sequencer.note;
+        sequencer.stepOut -> currentStep;
+
+        punch       -> rumble.punch;
+        body        -> rumble.body;
+        preDelay    -> rumble.preDelay;
+        space       -> rumble.space;
+        tail        -> rumble.tail;
+        size        -> rumble.size;
+        damp        -> rumble.damp;
+        width       -> rumble.width;
+        drive       -> rumble.drive;
+        lowCut      -> rumble.lowCut;
+        highCut     -> rumble.highCut;
+        resonance   -> rumble.resonance;
+        shape       -> rumble.shape;
+        shapeDepth  -> rumble.shapeDepth;
+        shapeLength -> rumble.shapeLength;
+        shapeFilter -> rumble.shapeFilter;
+        pitch       -> rumble.pitch;
+        pitchBend   -> rumble.pitchBend;
+        stepShape   -> rumble.stepShape;
+        stepPitch   -> rumble.stepPitch;
+        sequencer.tempoOut -> rumble.tempo;
+        kickLevel   -> rumble.kickLevel;
+        volume      -> rumble.volume;
+
+        rumble.out -> out;
+        rumble.levelOut -> levelOut;
+        rumble.shapePhaseOut -> shapePhase;
+    }
+}
+
+//==============================================================================
+namespace rumble
+{
+    /// Returns a per-sample multiplier that makes an envelope fall by 60dB over the given time
+    float decayCoefficient (float seconds, float64 sampleRate)
+    {
+        return float (exp (-6.9 / (float64 (max (seconds, 0.001f)) * sampleRate)));
+    }
+
+    /// Leaves anything below 0.8 untouched, and bends the rest smoothly towards 1. Unlike a
+    /// plain tanh, it adds no harmonics to the rumble at normal levels.
+    float safetyClip (float x)
+    {
+        let a = abs (x);
+
+        if (a <= 0.8f)
+            return x;
+
+        return (0.8f + 0.2f * tanh ((a - 0.8f) / 0.2f)) * (x < 0.0f ? -1.0f : 1.0f);
+    }
+
+    /// A shape drawn in the GUI: up to 16 points with x and y in 0..1, joined by segments
+    /// that bend by their tension (0 is straight)
+    struct Curve
+    {
+        float[16] x;
+        float[16] y;
+        float[16] tension;
+        int count;
+    }
+
+    /// The shape used until one has been drawn: a sidechain-style duck that falls to
+    /// nothing a fifth of the way through and is back to full level before halfway.
+    /// The GUI's default is the same list of points.
+    Curve getDefaultShape()
+    {
+        Curve c;
+        c.count = 6;
+        c.x[0] = 0.0f;    c.y[0] = 1.0f;   c.tension[0] = 2.0f;
+        c.x[1] = 0.111f;  c.y[1] = 0.5f;   c.tension[1] = -2.0f;
+        c.x[2] = 0.222f;  c.y[2] = 0.0f;   c.tension[2] = 2.0f;
+        c.x[3] = 0.332f;  c.y[3] = 0.5f;   c.tension[3] = -2.0f;
+        c.x[4] = 0.443f;  c.y[4] = 1.0f;
+        c.x[5] = 1.0f;    c.y[5] = 1.0f;
+        return c;
+    }
+
+    /// A curve for one of the 16 steps
+    struct StepCurve
+    {
+        int step;
+        Curve curve;
+    }
+
+    /// The sequencer triggers step n on this channel plus n
+    let firstStepChannel = 200;
+
+    /// The pitch curve used until one has been drawn: flat along the middle, so no bend.
+    /// The GUI's default is the same.
+    Curve getDefaultPitch()
+    {
+        Curve c;
+        c.count = 2;
+        c.x[0] = 0.0f;    c.y[0] = 0.5f;
+        c.x[1] = 1.0f;    c.y[1] = 0.5f;
+        return c;
+    }
+
+    /// Returns the curve's value at position t (0..1)
+    float evaluateCurve (Curve c, float t)
+    {
+        let last = c.count - 1;
+
+        if (t <= c.x.at (0))     return c.y.at (0);
+        if (t >= c.x.at (last))  return c.y.at (last);
+
+        for (int i = 0; i < last; ++i)
+        {
+            let x1 = c.x.at (i + 1);
+
+            if (t < x1)
+            {
+                let x0 = c.x.at (i);
+                let p = (t - x0) / max (x1 - x0, 1.0e-6f);
+                let k = c.tension.at (i);
+                let shaped = abs (k) < 0.001f ? p : (exp (k * p) - 1.0f) / (exp (k) - 1.0f);
+                return c.y.at (i) + (c.y.at (i + 1) - c.y.at (i)) * shaped;
+            }
+        }
+
+        return c.y.at (last);
+    }
+
+    /// A TPT state-variable filter, which stays stable with fast cutoff sweeps and high resonance
+    struct SVF
+    {
+        void setup (float cutoff, float q, float64 sampleRate)
+        {
+            let g = float (tan (pi * min (float64 (cutoff), sampleRate * 0.45) / sampleRate));
+            this.k  = 1.0f / q;
+            this.a1 = 1.0f / (1.0f + g * (g + this.k));
+            this.a2 = g * this.a1;
+            this.a3 = g * this.a2;
+        }
+
+        void process (float x)
+        {
+            let v3 = x - this.ic2;
+            let v1 = this.a1 * this.ic1 + this.a2 * v3;
+            let v2 = this.ic2 + this.a2 * this.ic1 + this.a3 * v3;
+            this.ic1 = 2.0f * v1 - this.ic1;
+            this.ic2 = 2.0f * v2 - this.ic2;
+            this.lp = v2;
+            this.hp = x - this.k * v1 - v2;
+        }
+
+        float lp, hp;
+        float ic1, ic2, a1, a2, a3, k;
+    }
+
+    /// The rumble's band: a very steep low cut and high cut (eight poles each), with
+    /// resonance on the last stage of the high cut
+    struct FilterChain
+    {
+        void setup (float lowCut, float highCut, float resonance, float64 sampleRate)
+        {
+            this.low1.setup (lowCut, 0.707f, sampleRate);
+            this.low2.setup (lowCut, 0.707f, sampleRate);
+            this.low3.setup (lowCut, 0.707f, sampleRate);
+            this.low4.setup (lowCut, 0.707f, sampleRate);
+            this.high1.setup (highCut, 0.707f, sampleRate);
+            this.high2.setup (highCut, 0.707f, sampleRate);
+            this.high3.setup (highCut, 0.707f, sampleRate);
+            this.high4.setup (highCut, 0.707f + resonance * 5.0f, sampleRate);
+        }
+
+        float process (float x)
+        {
+            this.low1.process (x);
+            this.low2.process (this.low1.hp);
+            this.low3.process (this.low2.hp);
+            this.low4.process (this.low3.hp);
+            this.high1.process (this.low4.hp);
+            this.high2.process (this.high1.lp);
+            this.high3.process (this.high2.lp);
+            this.high4.process (this.high3.lp);
+            return this.high4.lp;
+        }
+
+        SVF low1, low2, low3, low4, high1, high2, high3, high4;
+    }
+
+    /// The drive: lopsided, so it adds even harmonics as well as odd ones
+    float driveUp (float x, float driveGain, float drive)
+    {
+        return tanh (x * driveGain + 0.15f * drive) - tanh (0.15f * drive);
+    }
+}
+
+//==============================================================================
+// A 16-step trigger sequencer. Each set bit in `pattern` fires the ghost kick at `note`.
+// Uses the host's tempo if one arrives, otherwise `bpm`.
+processor Sequencer
+{
+    input event std::timeline::Tempo tempoIn;
+    input event std::timeline::TransportState transportIn;
+    input event std::timeline::Position positionIn;
+    input value int run;
+    input value float bpm;
+    input value int pattern;
+    input value float note;
+
+    output event (std::notes::NoteOn, std::notes::NoteOff) triggerOut;
+    output event int stepOut;
+    output value float tempoOut;
+
+    event tempoIn (std::timeline::Tempo t)
+    {
+        if (t.bpm > 0.0f)
+        {
+            hostTempo = t.bpm;
+            hasHostTempo = true;
+        }
+    }
+
+    // Once a host has told us about its transport, Run only plays while the host does.
+    // A standalone player never sends one, so there Run alone starts and stops it.
+    event transportIn (std::timeline::TransportState t)
+    {
+        hasHostTransport = true;
+        isHostPlaying = t.isPlaying();
+    }
+
+    event positionIn (std::timeline::Position p)
+    {
+        hostSixteenths = p.quarterNote * 4.0;
+        hasNewPosition = true;
+    }
+
+    // each step triggers on its own channel, from this one up, so the voice knows which
+    // step it was and can play that step's own curves
+    let sequencerChannel = rumble::firstStepChannel;
+
+    float hostTempo;
+    bool hasHostTempo, hasHostTransport, isHostPlaying, hasNewPosition;
+    float64 hostSixteenths;
+
+    void main()
+    {
+        float64 sixteenths;   // position in 16th notes; each whole number is a step
+        int64 lastIndex;
+        bool wasRunning;
+
+        loop
+        {
+            let tempo = hasHostTempo ? hostTempo : bpm;
+            tempoOut <- tempo;
+            let shouldPlay = run != 0 && (! hasHostTransport || isHostPlaying);
+
+            if (hasHostTransport && hasNewPosition)
+            {
+                sixteenths = hostSixteenths;
+                hasNewPosition = false;
+            }
+
+            if (shouldPlay)
+            {
+                if (! wasRunning)
+                {
+                    wasRunning = true;
+
+                    if (! hasHostTransport)
+                        sixteenths = 0;
+
+                    // start on the step we're at if it's exactly on it, otherwise wait for the next one
+                    lastIndex = int64 (ceil (sixteenths)) - 1;
+                }
+
+                let index = int64 (floor (sixteenths));
+
+                // the host's position can nudge us back a hair, which mustn't retrigger a step,
+                // but a bigger jump backwards (a loop, or relocating) starts from there
+                if (index > lastIndex || index < lastIndex - 1)
+                {
+                    lastIndex = index;
+                    let step = int (((index % 16) + 16) % 16);
+                    stepOut <- step;
+
+                    if (((pattern >> step) & 1) != 0)
+                    {
+                        triggerOut <- std::notes::NoteOn (sequencerChannel + step, note, 1.0f);
+                        triggerOut <- std::notes::NoteOff (sequencerChannel + step, note, 0.0f);
+                    }
+                }
+            }
+            else if (wasRunning)
+            {
+                wasRunning = false;
+                stepOut <- -1;
+            }
+
+            sixteenths += float64 (max (tempo, 20.0f)) * (4.0 / 60.0) * processor.period;
+            advance();
+        }
+    }
+}
+
+//==============================================================================
+// The whole sound: ghost kick -> reverb -> drive -> low and high cut -> shape.
+processor RumbleVoice
+{
+    input event (std::notes::NoteOn, std::notes::NoteOff) eventIn;
+    input value float punch, body, preDelay, space, tail, size, damp, width, drive;
+    input value float lowCut, highCut, resonance;
+    input value rumble::Curve shape, pitch;
+    input event rumble::StepCurve stepShape, stepPitch;
+    input value float shapeDepth, shapeFilter, pitchBend, tempo;
+    input value int shapeLength;
+    input value float kickLevel, volume;
+
+    output stream float<2> out;
+    output event float levelOut, shapePhaseOut;
+
+    event eventIn (std::notes::NoteOn e)
+    {
+        frequency = std::notes::noteToFrequency (e.pitch);
+        velocity = e.velocity;
+        kickEnv = 1.0f;
+        pitchEnv = 1.0f;
+        clickEnv = 1.0f;
+        kickPhase = 0.0f;
+        shapeClock = 0.0f;
+
+        // a note from MIDI rather than a step plays the shared curves
+        let step = e.channel - rumble::firstStepChannel;
+        triggeredStep = step >= 0 && step < 16 ? step : -1;
+    }
+
+    event eventIn (std::notes::NoteOff e) {}
+
+    event stepShape (rumble::StepCurve c)    { stepShapes.at (c.step) = c.curve; }
+    event stepPitch (rumble::StepCurve c)    { stepPitches.at (c.step) = c.curve; }
+
+    void init()
+    {
+        rng.seed (4242L);
+    }
+
+    //==============================================================================
+    // The reverb: eight delay lines whose outputs are mixed through a Hadamard matrix
+    // and fed back, each with its own damping and a decay set so all of them fall by
+    // 60dB in `tail` seconds.
+    let numLines = 8;
+    let maxLineLength = 65536;
+    let baseLengths = int[numLines] (3001, 3923, 4801, 5711, 6599, 7417, 8513, 9461);   // in samples at 48kHz: long, so the low resonances are dense enough to keep the kick's pitch
+
+    float[maxLineLength] line0, line1, line2, line3, line4, line5, line6, line7;
+    wrap<maxLineLength> writePos;
+    float[numLines] damped;
+
+    float readLine (int lineIndex, int delay)
+    {
+        let pos = wrap<maxLineLength> (int (writePos) - delay + maxLineLength);
+
+        if (lineIndex == 0) return line0[pos];
+        if (lineIndex == 1) return line1[pos];
+        if (lineIndex == 2) return line2[pos];
+        if (lineIndex == 3) return line3[pos];
+        if (lineIndex == 4) return line4[pos];
+        if (lineIndex == 5) return line5[pos];
+        if (lineIndex == 6) return line6[pos];
+        return line7[pos];
+    }
+
+    float reverb (float source)
+    {
+        let rateScale = float (processor.frequency / 48000.0) * size;
+        let dampCoeff = 1.0f - exp (-float (twoPi) * damp * float (processor.period));
+
+        float[numLines] v;
+
+        for (wrap<numLines> i)
+        {
+            let delay = clamp (int (float (baseLengths[i]) * rateScale), 16, maxLineLength - 1);
+            let gain = pow (10.0f, -3.0f * float (delay) / (tail * float (processor.frequency)));
+            damped[i] += (readLine (int (i), delay) - damped[i]) * dampCoeff;
+            v[i] = damped[i] * gain;
+        }
+
+        // two output taps whose sign patterns are orthogonal, so the sides are uncorrelated
+        let tap = (v[0] - v[1] + v[2] - v[3] + v[4] - v[5] + v[6] - v[7]) * 0.35f;
+        reverbRight = (v[0] + v[1] - v[2] - v[3] + v[4] + v[5] - v[6] - v[7]) * 0.35f;
+
+        // an 8-point Hadamard mix, done as three rounds of sums and differences
+        for (int span = 1; span < numLines; span *= 2)
+        {
+            for (int start = 0; start < numLines; start += span * 2)
+            {
+                for (int j = start; j < start + span; ++j)
+                {
+                    let a = v.at (j), b = v.at (j + span);
+                    v.at (j) = a + b;
+                    v.at (j + span) = a - b;
+                }
+            }
+        }
+
+        let norm = 0.35355339f;   // 1 / sqrt(8), so the mix keeps the energy it's given
+
+        line0[writePos] = v[0] * norm + source;
+        line1[writePos] = v[1] * norm - source;
+        line2[writePos] = v[2] * norm + source;
+        line3[writePos] = v[3] * norm - source;
+        line4[writePos] = v[4] * norm + source;
+        line5[writePos] = v[5] * norm - source;
+        line6[writePos] = v[6] * norm + source;
+        line7[writePos] = v[7] * norm - source;
+        ++writePos;
+
+        return tap;
+    }
+
+    //==============================================================================
+    // the gap before the reverb hears the kick, which makes the rumble swell late in the beat
+    let maxPreDelay = 131072;
+    float[maxPreDelay] preDelayLine;
+    wrap<maxPreDelay> preDelayPos;
+
+    std::random::RNG rng;
+    rumble::FilterChain filtersL, filtersR;
+    float reverbRight;   // the reverb's second output, set by reverb() alongside the first
+    float frequency = 34.65f, velocity, kickEnv, pitchEnv, clickEnv, kickPhase;
+    float shapeClock = 1000.0f;   // seconds since the last trigger
+    let defaultShape = rumble::getDefaultShape();
+    let defaultPitch = rumble::getDefaultPitch();
+    rumble::Curve[16] stepShapes, stepPitches;   // each step's own curves; empty ones aren't used
+    int triggeredStep = -1;                      // the step that fired the last trigger, or -1
+
+    // Where the curves are now: the triggering step's own if it has one, otherwise the
+    // shared one, otherwise the default
+    float evaluateShape (float phase)
+    {
+        if (triggeredStep >= 0 && stepShapes.at (triggeredStep).count >= 2)
+            return rumble::evaluateCurve (stepShapes.at (triggeredStep), phase);
+
+        return rumble::evaluateCurve (shape.count >= 2 ? shape : defaultShape, phase);
+    }
+
+    float evaluatePitch (float phase)
+    {
+        if (triggeredStep >= 0 && stepPitches.at (triggeredStep).count >= 2)
+            return rumble::evaluateCurve (stepPitches.at (triggeredStep), phase);
+
+        return rumble::evaluateCurve (pitch.count >= 2 ? pitch : defaultPitch, phase);
+    }
+
+    // How far through the shape we are, from 0 at a trigger to 1 at the end of its length
+    float getShapePhase()
+    {
+        let sixteenths = float (1 << clamp (shapeLength, 0, 4));
+        let seconds = sixteenths * 15.0f / max (tempo, 20.0f);
+        return min (shapeClock / seconds, 1.0f);
+    }
+
+    void main()
+    {
+        float gain, peak, shapeLevel = 1.0f, bend;
+        int samplesUntilLevel;
+
+        loop
+        {
+            // where the shape and pitch curves are now. The bend is smoothed a little, like the
+            // level below, so a sheer step in the curve doesn't click.
+            let phase = getShapePhase();
+            let pitchCurve = evaluatePitch (phase);
+            bend += ((pitchCurve - 0.5f) * 2.0f * pitchBend - bend) * (1.0f - exp (-1.0f / (0.002f * float (processor.frequency))));
+            let bendRatio = pow (2.0f, bend / 12.0f);
+
+            // the ghost kick: a sine falling into its note, with a little noise for grit
+            let freq = frequency * bendRatio * pow (2.0f, punch * pitchEnv / 12.0f);
+            let kick = (sin (kickPhase * float (twoPi)) * kickEnv + rng.getBipolar() * clickEnv * 0.3f) * velocity;
+
+            kickPhase += freq * float (processor.period);
+
+            if (kickPhase >= 1.0f)
+                kickPhase -= 1.0f;
+
+            kickEnv  *= rumble::decayCoefficient (body, processor.frequency);
+            pitchEnv *= rumble::decayCoefficient (0.06f, processor.frequency);
+            clickEnv *= rumble::decayCoefficient (0.008f, processor.frequency);
+
+            // the kick's own body and its reverb, blended by `space`, then driven until it breaks up.
+            // The body keeps the note clean; the reverb adds the churning texture and the late swell.
+            preDelayLine[preDelayPos] = kick;
+            let delayedKick = preDelayLine[wrap<maxPreDelay> (int (preDelayPos) - clamp (int (preDelay * float (processor.frequency)), 0, maxPreDelay - 1) + maxPreDelay)];
+            ++preDelayPos;
+
+            // the reverb has two outputs that don't correlate, one for each side; everything after
+            // it runs once per side, so the two sides break up and churn differently
+            let wetL = reverb (delayedKick * 0.5f);
+            let wetR = reverbRight;
+            let driveGain = 1.0f + drive * drive * 60.0f;
+            let drivenL = rumble::driveUp (kick * (1.0f - space) + wetL * space * 2.0f, driveGain, drive);
+            let drivenR = rumble::driveUp (kick * (1.0f - space) + wetR * space * 2.0f, driveGain, drive);
+
+            // the shape: where the drawn curve is now, smoothed a little so a sheer step in it
+            // doesn't click. Where it dips, the level drops by `shapeDepth`, and the high cut
+            // closes by up to five octaves times `shapeFilter`.
+            let curve = evaluateShape (phase);
+            shapeLevel += (curve - shapeLevel) * (1.0f - exp (-1.0f / (0.002f * float (processor.frequency))));
+            shapeClock += float (processor.period);
+
+            let shapeGain = 1.0f - shapeDepth * (1.0f - shapeLevel);
+            let shapedHighCut = highCut * bendRatio * pow (2.0f, -5.0f * shapeFilter * (1.0f - shapeLevel));
+            let bentLowCut = lowCut * bendRatio;   // the band follows the bend, so the rumble itself bends
+
+            filtersL.setup (bentLowCut, shapedHighCut, resonance, processor.frequency);
+            filtersR.setup (bentLowCut, shapedHighCut, resonance, processor.frequency);
+            let rumbleL = filtersL.process (drivenL) * shapeGain * 1.3f;
+            let rumbleR = filtersR.process (drivenR) * shapeGain * 1.3f;
+
+            // width, as mid and side: at 0 both speakers get the mid (mono), at 100% each side
+            // gets its own channel, and above that the difference between them is pushed further
+            // the two sides barely correlate, so their mid is 3dB down on either one: this keeps
+            // the level the same whether the width is at 0 or 100%
+            let narrowness = 1.0f - min (width, 1.0f);
+            let widthGain = sqrt (2.0f / (1.0f + (1.0f - narrowness) * (1.0f - narrowness)));
+            let mid = (rumbleL + rumbleR) * 0.5f * widthGain;
+            let side = (rumbleL - rumbleR) * 0.5f * width * widthGain;
+            let kickOut = kick * kickLevel * 0.9f;
+
+            gain += (pow (10.0f, volume / 20.0f) - gain) * 0.001f;
+            out <- float<2> (rumble::safetyClip ((mid + side + kickOut) * gain),
+                             rumble::safetyClip ((mid - side + kickOut) * gain));
+
+            peak = max (peak, abs (mid) + abs (side));
+
+            if (--samplesUntilLevel <= 0)
+            {
+                samplesUntilLevel = int (processor.frequency / 60.0);
+                levelOut <- peak;
+                shapePhaseOut <- phase;
+                peak = 0.0f;
+            }
+
+            advance();
+        }
+    }
+}

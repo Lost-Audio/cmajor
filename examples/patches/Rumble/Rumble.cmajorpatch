@@ -1,0 +1,19 @@
+{
+    "CmajorVersion":    1,
+    "ID":               "dev.cmajor.examples.rumble",
+    "version":          "1.0",
+    "name":             "Rumble",
+    "description":      "Techno rumble: a ghost kick fed into a long dark reverb, distorted, squeezed between a low and a high cut, and ducked on every kick by a built-in step sequencer",
+    "manufacturer":     "Cmajor Software Ltd",
+    "isInstrument":     true,
+
+    "source":           "Rumble.cmajor",
+    "worker":           "worker.js",
+
+    "view":             {
+                            "src": "view/index.js",
+                            "width": 1040,
+                            "height": 702,
+                            "resizable": true
+                        }
+}
