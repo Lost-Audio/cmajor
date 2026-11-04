@@ -1,0 +1,18 @@
+{
+    "CmajorVersion":    1,
+    "ID":               "dev.cmajor.examples.bile",
+    "version":          "1.0",
+    "name":             "Bile",
+    "description":      "A gross acid bass: a sliding monosynth through a screaming resonant ladder filter and heavy distortion, with a 16-step sequencer of notes, accents and slides",
+    "manufacturer":     "Cmajor Software Ltd",
+    "isInstrument":     true,
+
+    "source":           "Bile.cmajor",
+
+    "view":             {
+                            "src": "view/index.js",
+                            "width": 1040,
+                            "height": 551,
+                            "resizable": true
+                        }
+}
